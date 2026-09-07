@@ -1,0 +1,64 @@
+# 第一版离线闭环。这里的参数不代表最终实验设置，只用于验证代码链路。
+
+project:
+  random_seed: 20260904
+
+scene:
+  source: synthetic_room
+  name: offline_room
+  bounds_m: [0.0, 20.0, 0.0, 14.0]
+  fixed_height_m: 1.5
+  bev_resolution_m: 0.05
+  max_reflections: 2
+
+radio:
+  carrier_hz: 3.5e9
+  bandwidth_hz: 400.0e6
+  num_subcarriers: 96
+  num_bs_antennas: 12
+  antenna_spacing_wavelength: 0.5
+  bs_boresight_deg: 0.0
+  front_facing_only: true
+  num_snapshots: 1
+  snr_db: 35.0
+
+simulation:
+  bs_position_m: [2.0, 7.0]
+  ue_position_m: [14.0, 4.0]
+  clock_bias_s: 25.0e-9
+  path_amplitudes: [1.0, 0.75, 0.55]
+
+music:
+  num_paths: 3
+  # 离线生成器明确只合成 3 条正面路径，因此信号子空间阶数也是 3。
+  signal_subspace_rank: 3
+  angle_min_deg: -89.0
+  angle_max_deg: 89.0
+  angle_step_deg: 1.0
+  delay_min_s: 0.0
+  delay_max_s: 160.0e-9
+  delay_step_s: 1.0e-9
+  min_angle_separation_deg: 5.0
+  min_delay_separation_s: 3.0e-9
+  # 峰集合整体配对：允许虚假峰不配对，漏检惩罚更高。
+  association_max_normalized_distance: 3.0
+  false_peak_penalty: 4.0
+  missed_peak_penalty: 9.0
+  uncertainty_repeats: 12
+  uncertainty_extra_peaks: 2
+  uncertainty_min_relative_height: 0.01
+  uncertainty_noise_scale: 0.35
+  spatial_subarray_size: 8
+  frequency_subarray_size: 32
+  diagonal_loading: 1.0e-8
+
+localization:
+  bias_min_s: -80.0e-9
+  bias_max_s: 80.0e-9
+  candidate_cluster_radius_m: 1.5
+  candidate_direction_radius_deg: 5.0
+  huber_delta_m: 0.75
+  max_iterations: 20
+
+output:
+  root: outputs/offline_demo

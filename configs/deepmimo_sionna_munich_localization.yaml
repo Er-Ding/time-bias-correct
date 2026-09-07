@@ -1,0 +1,58 @@
+# Munich 正式实验的定位专用配置。不包含 UE 位置、注入偏差或射线生成参数。
+
+project:
+  random_seed: 20260904
+
+scene:
+  source: sionna_builtin
+  name: munich
+  bounds_m: [-100.0, 160.0, -80.0, 180.0]
+  localization_bounds_m: [-100.0, 160.0, -80.0, 180.0]
+  fixed_height_m: 1.5
+  bev_resolution_m: 0.10
+  max_reflections: 2
+
+radio:
+  carrier_hz: 3.5e9
+  bandwidth_hz: 400.0e6
+  num_subcarriers: 512
+  num_bs_antennas: 12
+  antenna_spacing_wavelength: 0.5
+  # BS 是已知接收端先验；UE 位置与注入时钟偏差不在此文件中。
+  bs_position_m: [20.0, 50.0]
+  bs_boresight_deg: -45.0
+  front_facing_only: true
+  num_snapshots: 1
+
+music:
+  num_paths: 3
+  signal_subspace_rank: 6
+  angle_min_deg: -89.0
+  angle_max_deg: 89.0
+  angle_step_deg: 1.0
+  delay_min_s: 0.0
+  delay_max_s: 1150.0e-9
+  delay_step_s: 1.0e-9
+  min_angle_separation_deg: 5.0
+  min_delay_separation_s: 3.0e-9
+  association_max_normalized_distance: 3.0
+  false_peak_penalty: 4.0
+  missed_peak_penalty: 9.0
+  uncertainty_repeats: 12
+  uncertainty_extra_peaks: 2
+  uncertainty_min_relative_height: 1.0e-5
+  uncertainty_noise_scale: 0.35
+  spatial_subarray_size: 8
+  frequency_subarray_size: 64
+  diagonal_loading: 1.0e-8
+
+localization:
+  bias_min_s: -80.0e-9
+  bias_max_s: 80.0e-9
+  candidate_cluster_radius_m: 1.5
+  candidate_direction_radius_deg: 5.0
+  huber_delta_m: 0.75
+  max_iterations: 20
+
+output:
+  root: outputs/deepmimo_sionna_munich
