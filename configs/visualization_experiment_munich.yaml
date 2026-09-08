@@ -1,0 +1,11 @@
+# 路径相对本配置所在目录；定位参数沿用现有 Munich 配置。
+generation_config: deepmimo_sionna_munich.yaml
+scene_json: ../outputs/deepmimo_sionna_smoke_run11/scene/scene_2d.json
+# 以已有 UE (50,50) 所在空旷区域为起点，先做局部 20m × 20m 实验。
+# 这是声明的可通行矩形，不代表全城覆盖。程序保守拒绝与墙段包围盒重叠的区域。
+sampling_bounds_m: [40.0, 60.0, 40.0, 60.0]
+ue_count: 30
+noise_repeats: 5
+random_seed: 20260907
+wall_clearance_m: 0.5
+bs_clearance_m: 2.0

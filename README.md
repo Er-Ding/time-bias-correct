@@ -221,7 +221,7 @@ cd /data/zhujun/differt_projects/time-bias-correct
 ./run_tests.sh
 ```
 
-当前共有 271 项测试，覆盖偏差符号、二维 MUSIC 恢复、场景投影、反向轨迹、候选
+测试覆盖偏差符号、二维 MUSIC 恢复、场景投影、反向轨迹、候选
 互斥、多路径稳健求解、协方差半正定、上下行互易、绝对时延保护、固定地图范围、
 严格输入字段与几何、产物防覆盖、批次混用拒绝、并发锁、原子写入、完整历史归档、
 定位回执以及端到端真值隔离。
@@ -250,3 +250,23 @@ cd /data/zhujun/differt_projects/time-bias-correct
   多随机种子、不同信噪比和偏差、路径漏检/虚警扫掠、与基线比较以及真实 CSI 验证。
 
 更细的数据边界和模块关系见 [docs/architecture.md](docs/architecture.md)。
+
+## 结果图表与多 UE 小实验
+
+运行 `./run_visualize_results.sh` 可直接绘制已有 Munich run11 结果。输出按
+`samples/UE编号/repeat编号/00–08步骤/` 组织，每步保存图及原始数据，包括 CSI、
+MUSIC、扰动峰、反向候选、聚类、原始峰联合解、扰动求解和最终评估。
+`summary/` 单独保存全部 sample 的定位误差 CDF、Med/P90 图和逐次、逐 UE 汇总表。
+不包含候选簇之间的联系图；绘图独立读取已有评估产物，不修改定位结果。
+
+`./run_visualization_experiment.sh` 提供一个 BS、30 个 UE、每点 5 次独立噪声的
+实验入口。设置 `PLAN_ONLY=1` 只生成固定采样计划和示意图；正式执行时每个 UE
+复用同一份无噪声信道生成重复，失败项也计入总数。默认采样范围是已有 UE 附近的
+20 m × 20 m 局部空旷区域。参数、路径、恢复运行和图表含义见
+[结果可视化说明](docs/visualization_experiments.md)。
+
+GPU 批量实验使用 `./run_gpu_experiment.sh`；例如
+`GPU_IDS=0,1 ./run_gpu_experiment.sh` 会启动两个常驻进程，每卡处理不同 UE，
+并在每个 UE 内批量计算 MUSIC 扰动。默认仍为 30 UE × 5 次噪声，逐步骤图表与
+Med/P90/CDF 输出保持原目录结构。安装、单卡/多卡命令、执行记录及对照验证见
+[GPU 运行说明](docs/gpu_execution.md)。

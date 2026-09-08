@@ -12,6 +12,7 @@ import os
 from pathlib import Path
 import shutil
 import tempfile
+import time
 from typing import Any, Sequence
 from uuid import uuid4
 
@@ -51,6 +52,7 @@ from .provenance import (
     verify_generation_artifact,
 )
 from .scene import Scene2D, make_synthetic_room
+from .music_stage import estimate_batched_peak_samples, get_music_computer
 from .signal import (
     MusicPeak2D,
     MusicPeakSamples,
@@ -1153,6 +1155,7 @@ def _bootstrap_joint_solutions(
         zip(per_repetition, associations, strict=True)
     ):
         association_diagnostics = {
+            "observation_samples": [asdict(sample) for sample in samples],
             "association_cost": association.total_cost,
             "distribution_weight": association.distribution_weight,
             "matched_peak_count": len(association.matches),
@@ -1196,6 +1199,10 @@ def _bootstrap_joint_solutions(
             position_radius_m=position_radius_m,
             direction_radius_deg=direction_radius_deg,
         )
+        association_diagnostics.update({
+            "raw_reverse_candidates": [_raw_candidate_dict(item) for item in raw],
+            "clustered_candidates": [_clustered_candidate_dict(item) for item in clustered],
+        })
         try:
             result = solve_position_and_bias(clustered, solver_config)
         except SolverError as error:
@@ -1220,6 +1227,12 @@ def _bootstrap_joint_solutions(
                 "position_m": result.mu,
                 "beta_m": result.beta,
                 "sigma_m2": result.sigma,
+                "selected_candidates": {
+                    str(key): _clustered_candidate_dict(value)
+                    for key, value in result.selected_candidates.items()
+                },
+                "residuals_m": result.residuals,
+                "solver_diagnostics": asdict(result.diagnostics),
                 "selected_topologies": {
                     str(observation_id): candidate.metadata.get("topology_id")
                     for observation_id, candidate in result.selected_candidates.items()
@@ -1428,6 +1441,15 @@ def _localize_locked(
 ) -> dict[str, Any]:
     """在输出根目录排他锁已持有时执行完整定位。"""
 
+    stage_timings: dict[str, float] = {}
+    stage_started = time.perf_counter()
+
+    def mark_stage(name: str) -> None:
+        nonlocal stage_started
+        now = time.perf_counter()
+        stage_timings[name] = now - stage_started
+        stage_started = now
+
     root = output_root
     scene_path = Path(scene_json).expanduser().resolve()
     online_path = Path(online_input).expanduser().resolve()
@@ -1479,6 +1501,16 @@ def _localize_locked(
     )
     music_config = config["music"]
     localization_config = config["localization"]
+    compute_config = config.get("compute", {})
+    compute_backend = compute_config.get("backend", "numpy")
+    computer = None
+    if compute_backend == "cuda":
+        computer = get_music_computer(
+            compute_backend, int(compute_config.get("device_id", 0)),
+            int(compute_config.get("batch_size", 4)), int(compute_config.get("angle_chunk_size", 32)),
+        )
+    compute_before = computer.metadata() if computer is not None else {}
+    mark_stage("input_validation_and_device_setup")
     unambiguous_delay_period_s = _validate_unambiguous_delay_window(
         music_config, measurement.subcarrier_frequencies_hz
     )
@@ -1487,8 +1519,7 @@ def _localize_locked(
         music_config.get("signal_subspace_rank", num_paths)
     )
     aoa_grid, delay_grid = _make_grids(music_config)
-    spectrum = music_2d_spectrum(
-        measurement.csi_observed,
+    spectrum_parameters = dict(
         subcarrier_frequencies_hz=measurement.subcarrier_frequencies_hz,
         carrier_frequency_hz=measurement.carrier_frequency_hz,
         antenna_spacing_m=measurement.antenna_spacing_m,
@@ -1499,6 +1530,8 @@ def _localize_locked(
         frequency_subarray_size=int(music_config["frequency_subarray_size"]),
         diagonal_loading=float(music_config["diagonal_loading"]),
     )
+    spectrum_function = computer.spectrum if computer is not None else music_2d_spectrum
+    spectrum = spectrum_function(measurement.csi_observed, **spectrum_parameters)
     separation = _separation_bins(music_config)
     nominal_peaks = extract_local_music_peaks(
         spectrum,
@@ -1510,12 +1543,13 @@ def _localize_locked(
     )
     if len(nominal_peaks) < 2:
         raise RuntimeError(f"二维 MUSIC 只找到 {len(nominal_peaks)} 条路径，无法联合求解")
+    mark_stage("music_nominal")
 
     estimated_noise_std = estimate_noise_std_from_observed_csi(
         measurement.csi_observed, signal_subspace_rank
     )
-    peak_samples = estimate_music_peak_samples(
-        measurement.csi_observed,
+    mark_stage("noise_estimation")
+    perturbation_parameters = dict(
         subcarrier_frequencies_hz=measurement.subcarrier_frequencies_hz,
         carrier_frequency_hz=measurement.carrier_frequency_hz,
         antenna_spacing_m=measurement.antenna_spacing_m,
@@ -1536,6 +1570,14 @@ def _localize_locked(
         ),
         minimum_separation_bins=separation,
     )
+    if computer is None:
+        peak_samples = estimate_music_peak_samples(measurement.csi_observed, **perturbation_parameters)
+    else:
+        peak_samples = estimate_batched_peak_samples(
+            computer, measurement.csi_observed,
+            batch_size=int(compute_config.get("batch_size", 4)), **perturbation_parameters,
+        )
+    mark_stage("music_perturbations")
     associations = associate_perturbed_peaks(
         nominal_peaks,
         peak_samples,
@@ -1552,6 +1594,7 @@ def _localize_locked(
         associations,
         bs_boresight_rad=measurement.bs_boresight_rad,
     )
+    mark_stage("peak_association")
     beta_interval_m = (
         float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
         float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S,
@@ -1563,13 +1606,16 @@ def _localize_locked(
         max_reflections=int(config["scene"]["max_reflections"]),
         beta_interval_m=beta_interval_m,
     )
+    mark_stage("reverse_candidates")
     clustered_candidates = cluster_reverse_candidates(
         raw_candidates,
         position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
         direction_radius_deg=float(localization_config["candidate_direction_radius_deg"]),
     )
+    mark_stage("first_clustering")
     solver_config = _solver_config(localization_config)
     central = solve_position_and_bias(clustered_candidates, solver_config)
+    mark_stage("central_solution")
     (
         bootstrap_positions,
         bootstrap_betas,
@@ -1589,6 +1635,7 @@ def _localize_locked(
             localization_config["candidate_direction_radius_deg"]
         ),
     )
+    mark_stage("perturbation_solutions")
     mu, sigma, beta_m, covariance_source = _distribution_statistics(
         central.mu,
         central.sigma,
@@ -1599,6 +1646,18 @@ def _localize_locked(
         bootstrap_weights,
         len(per_repetition),
     )
+    mark_stage("distribution")
+
+    compute_report = computer.metadata() if computer is not None else {
+        "backend": "numpy", "actual_device": "cpu", "dtype": "complex128",
+        "batch_size": 1, "requested_batch_size": int(compute_config.get("batch_size", 4)),
+    }
+    if computer is not None:
+        compute_report["counter_scope"] = "worker_lifetime"
+        compute_report["this_localization"] = {
+            name: compute_report[name] - compute_before[name]
+            for name in ("completed_batches", "completed_csi", "steering_cache_hits", "steering_cache_misses")
+        }
 
     selected = {
         str(observation_id): _clustered_candidate_dict(candidate)
@@ -1625,6 +1684,9 @@ def _localize_locked(
             nominal_count=len(nominal_peaks),
         ),
         "diagnostics": {
+            "compute": compute_report,
+            "stage_timings_s": stage_timings,
+            "stage_timing_scope": "输入验证到分布计算；不包含之后的压缩、归档、文件发布及独立评估",
             **asdict(central.diagnostics),
             "estimated_noise_std_from_observed_csi": estimated_noise_std,
             "music_signal_subspace_rank": signal_subspace_rank,
@@ -1675,6 +1737,10 @@ def _localize_locked(
             {
                 "note": "spectrum_value 仅用于谱内排序，不是概率",
                 "nominal": [asdict(peak) for peak in nominal_peaks],
+                "nominal_observation_samples": [asdict(sample) for sample in nominal_samples],
+                "perturbed_observation_samples": [
+                    [asdict(sample) for sample in repetition] for repetition in per_repetition
+                ],
                 "associations": [
                     {
                         **asdict(association),

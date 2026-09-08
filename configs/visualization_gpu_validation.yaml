@@ -1,0 +1,10 @@
+# GPU 架构验证：与正式 Munich 实验共用全部物理及定位参数，仅减少样本数。
+# 使用方式：EXPERIMENT_CONFIG="${PWD}/configs/visualization_gpu_validation.yaml" GPU_IDS=0,1 ./run_gpu_experiment.sh
+generation_config: deepmimo_sionna_munich.yaml
+scene_json: ../outputs/deepmimo_sionna_smoke_run11/scene/scene_2d.json
+sampling_bounds_m: [40.0, 60.0, 40.0, 60.0]
+ue_count: 4
+noise_repeats: 2
+random_seed: 20260907
+wall_clearance_m: 0.5
+bs_clearance_m: 2.0

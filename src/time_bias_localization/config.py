@@ -13,6 +13,7 @@ import yaml
 
 DEFAULT_CONFIG: dict[str, Any] = {
     "project": {"random_seed": 20260904},
+    "compute": {"backend": "numpy", "device_id": 0, "batch_size": 4, "angle_chunk_size": 32},
     "scene": {
         "source": "synthetic_room",
         "name": "offline_room",
@@ -76,6 +77,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 
 _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
     "project": frozenset({"random_seed"}),
+    "compute": frozenset({"backend", "device_id", "batch_size", "angle_chunk_size"}),
     "scene": frozenset(
         {
             "source",
@@ -264,7 +266,8 @@ def validate_localization_config(config: Mapping[str, Any]) -> None:
     unsupported = sorted(str(name) for name in config if name not in allowed_top_level)
     if unsupported:
         raise ValueError(f"定位专用配置包含不支持的顶层字段：{unsupported}")
-    missing = sorted(set(_LOCALIZATION_SECTION_NAMES).difference(config))
+    # 计算设备属于可选的执行设置；旧的公开定位配置继续使用 NumPy。
+    missing = sorted((set(_LOCALIZATION_SECTION_NAMES) - {"compute"}).difference(config))
     if missing:
         raise ValueError(f"定位专用配置缺少必需段：{missing}")
     _validate_localization_input_fields(config)
@@ -348,6 +351,15 @@ def validate_config(config: dict[str, Any]) -> None:
 
 def _validate_localization_sections(config: dict[str, Any]) -> None:
     """校验生成和定位共同使用、且不含仿真真值的配置段。"""
+
+    compute = config.get("compute", DEFAULT_CONFIG["compute"])
+    if not isinstance(compute, Mapping):
+        raise ValueError("compute 必须是键值映射")
+    if compute.get("backend", "numpy") not in ("numpy", "cuda"):
+        raise ValueError("compute.backend 只能是 numpy 或 cuda")
+    _nonnegative_integer("compute.device_id", compute.get("device_id", 0))
+    _positive_integer("compute.batch_size", compute.get("batch_size", 4))
+    _positive_integer("compute.angle_chunk_size", compute.get("angle_chunk_size", 32))
 
     radio = config["radio"]
     scene = config["scene"]

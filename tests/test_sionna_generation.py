@@ -57,6 +57,29 @@ def _sionna_test_config() -> dict[str, object]:
     return config
 
 
+def test_local_deepmimo_missing_output_never_calls_download_loader(tmp_path):
+    def forbidden_load(name):
+        raise AssertionError("本地文件缺失时不允许调用 DeepMIMO load")
+    deepmimo = SimpleNamespace(load=forbidden_load)
+    with pytest.raises(FileNotFoundError, match="不尝试在线下载"):
+        sionna_generation_module._load_local_deepmimo_scene(deepmimo, "Mixed_UE001", tmp_path)
+    (tmp_path / "mixed_ue001").mkdir()
+    with pytest.raises(FileNotFoundError, match="params.json"):
+        sionna_generation_module._load_local_deepmimo_scene(deepmimo, "Mixed_UE001", tmp_path)
+
+
+def test_local_deepmimo_loader_uses_canonical_name(tmp_path):
+    directory = tmp_path / "mixed_ue001"
+    directory.mkdir()
+    (directory / "params.json").write_text("{}")
+    received = []
+    def load(name):
+        received.append(name)
+        return SimpleNamespace(scene=object())
+    sionna_generation_module._load_local_deepmimo_scene(SimpleNamespace(load=load), "Mixed_UE001", tmp_path)
+    assert received == ["mixed_ue001"]
+
+
 def _generate_in_child(config, output_root: str, messages) -> None:
     messages.put("started")
     try:
@@ -245,10 +268,12 @@ def test_sionna_failure_keeps_residue_but_does_not_publish_manifest(
     assert not (output_root / "generation_manifest.json").exists()
 
 
+@pytest.mark.parametrize("scenario_name", ["fake_scenario", "Experiment_20260907T092242_UE001"])
 def test_sionna_generation_publishes_manifest_after_all_core_artifacts(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, scenario_name
 ) -> None:
     config = _sionna_test_config()
+    config["simulation"]["deepmimo_scenario_name"] = scenario_name
     output_root = tmp_path / "complete_generation"
     events: list[str] = []
 
@@ -274,6 +299,10 @@ def test_sionna_generation_publishes_manifest_after_all_core_artifacts(
 
     def fake_convert(source_dir, *, scenario_name, overwrite, **kwargs):
         assert overwrite is False
+        assert scenario_name == scenario_name.lower()
+        directory = Path.cwd() / "deepmimo_scenarios" / scenario_name
+        directory.mkdir(parents=True)
+        (directory / "params.json").write_text("{}")
         events.append("deepmimo")
         return scenario_name
 

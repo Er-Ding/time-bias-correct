@@ -467,25 +467,25 @@ def extract_local_music_peaks(
         separation.append(int(item))
 
     threshold = float(np.max(values)) * relative_height
-    candidates: list[tuple[float, int, int]] = []
-    for angle_index in range(values.shape[0]):
-        angle_start = max(0, angle_index - 1)
-        angle_stop = min(values.shape[0], angle_index + 2)
-        for delay_index in range(values.shape[1]):
-            value = float(values[angle_index, delay_index])
-            if value < threshold:
+    # 同时比较全部网格的八个邻居。边界外填 -inf，与原来的截断邻域相同；
+    # 使用 >= 保留平台上的全部候选，交给后面的确定性距离抑制处理。
+    padded = np.pad(values, 1, constant_values=-np.inf)
+    local_maximum = values >= threshold
+    for angle_offset in range(3):
+        for delay_offset in range(3):
+            if angle_offset == 1 and delay_offset == 1:
                 continue
-            delay_start = max(0, delay_index - 1)
-            delay_stop = min(values.shape[1], delay_index + 2)
-            neighborhood = values[
-                angle_start:angle_stop, delay_start:delay_stop
+            local_maximum &= values >= padded[
+                angle_offset : angle_offset + values.shape[0],
+                delay_offset : delay_offset + values.shape[1],
             ]
-            if value >= float(np.max(neighborhood)):
-                candidates.append((-value, angle_index, delay_index))
-
-    candidates.sort()
+    angle_indices, delay_indices = np.nonzero(local_maximum)
+    candidate_values = values[angle_indices, delay_indices]
+    order = np.lexsort((delay_indices, angle_indices, -candidate_values))
     selected: list[MusicPeak2D] = []
-    for negative_value, angle_index, delay_index in candidates:
+    for candidate_index in order:
+        angle_index = int(angle_indices[candidate_index])
+        delay_index = int(delay_indices[candidate_index])
         overlaps = any(
             abs(angle_index - peak.aoa_index) <= separation[0]
             and abs(delay_index - peak.delay_index) <= separation[1]
@@ -497,7 +497,7 @@ def extract_local_music_peaks(
             MusicPeak2D(
                 aoa_rad=float(aoa_grid[angle_index]),
                 delay_s=float(delay_grid[delay_index]),
-                spectrum_value=-negative_value,
+                spectrum_value=float(candidate_values[candidate_index]),
                 aoa_index=angle_index,
                 delay_index=delay_index,
             )

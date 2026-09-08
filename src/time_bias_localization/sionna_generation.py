@@ -69,12 +69,35 @@ def _write_json_atomic(path: Path, data: Any) -> str:
     return str(path)
 
 
+def _sionna_runtime_info(*, require_cuda: bool) -> dict[str, Any]:
+    """记录射线计算实际使用的设备；GPU 实验不允许静默退回 CPU。"""
+    try:
+        mitsuba = importlib.import_module("mitsuba")
+        variant = getattr(mitsuba, "variant", lambda: None)()
+    except ImportError:
+        variant = None
+    using_cuda = isinstance(variant, str) and variant.startswith("cuda_")
+    if require_cuda and not using_cuda:
+        raise RuntimeError(
+            f"GPU 实验要求 Sionna 使用 CUDA，但当前 Mitsuba variant={variant!r}。"
+            "请检查驱动及 Sionna 环境；本次不自动改用 CPU。"
+        )
+    return {
+        "mitsuba_variant": variant,
+        "uses_cuda": using_cuda,
+        "cuda_required": require_cuda,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "process_id": os.getpid(),
+    }
+
+
 def _ensure_fresh_generation_targets(root: Path) -> None:
     """一次检查 Sionna 生成拥有的所有固定目标，拒绝覆盖任何旧内容。"""
 
     targets = (
         root / "generation_manifest.json",
         root / "provenance" / "generation_config.json",
+        root / "provenance" / "generation_runtime.json",
         root / "deepmimo_source",
         root / "deepmimo_scenarios",
         root / "scene",
@@ -482,6 +505,26 @@ def _dataset_with_scene(dataset: Any) -> Any:
     return first
 
 
+def _local_scenario_name(name: str) -> str:
+    """DeepMIMO 加载器会转小写，转换和保存阶段必须使用同一个名字。"""
+    normalized = str(name).strip().lower()
+    if not normalized or normalized in {".", ".."} or "/" in normalized or "\\" in normalized:
+        raise ValueError("DeepMIMO 场景名必须是非空的单个目录名")
+    return normalized
+
+
+def _load_local_deepmimo_scene(deepmimo: Any, converted_name: str, scenario_store: Path) -> Any:
+    """只加载已转换的本地场景；缺失时不调用会询问下载的加载器。"""
+    name = _local_scenario_name(converted_name)
+    local_directory = scenario_store / name
+    if not local_directory.is_dir() or not (local_directory / "params.json").is_file():
+        raise FileNotFoundError(
+            f"DeepMIMO 本地转换产物不完整：{local_directory}；"
+            "需要该目录及 params.json。已停止，不尝试在线下载。"
+        )
+    return _dataset_with_scene(deepmimo.load(name))
+
+
 def _finalize_generation_manifest(manifest: dict[str, Any]) -> dict[str, Any]:
     """为新生成清单补齐版本和由三个核心产物决定的批次号。"""
 
@@ -606,6 +649,8 @@ def _generate_sionna_deepmimo_bundle_locked(
         "file_sha256": file_sha256(config_snapshot_path),
     }
     sionna_rt = load_sionna_rt_module()
+    runtime_info = _sionna_runtime_info(require_cuda=os.environ.get("TBC_REQUIRE_CUDA") == "1")
+    _write_json_atomic(root / "provenance" / "generation_runtime.json", runtime_info)
     deepmimo = load_deepmimo_module()
     exporter_module = importlib.import_module("deepmimo.exporters.sionna_exporter")
     sionna_exporter = getattr(exporter_module, "sionna_exporter")
@@ -672,7 +717,7 @@ def _generate_sionna_deepmimo_bundle_locked(
     if int(paths.tau.shape[-1]) == 0:
         raise RuntimeError("Sionna RT 没有找到传播路径")
 
-    scenario_name = str(simulation["deepmimo_scenario_name"])
+    scenario_name = _local_scenario_name(simulation["deepmimo_scenario_name"])
     export_dir = root / "deepmimo_source" / scenario_name
     if export_dir.exists() and any(export_dir.iterdir()):
         raise FileExistsError(
@@ -700,7 +745,7 @@ def _generate_sionna_deepmimo_bundle_locked(
             raise RuntimeError("DeepMIMO 转换没有返回场景名")
         # 转换结果仍作为 DeepMIMO V4 数据产物保留并做一次加载校验；定位地图不能
         # 使用 dataset.scene，因为该转换器会先把连通组件简化为二维凸包。
-        _dataset_with_scene(deepmimo.load(str(converted_name)))
+        _load_local_deepmimo_scene(deepmimo, str(converted_name), scenario_store)
 
     frequencies = build_subcarrier_frequencies(
         bandwidth_hz=float(radio["bandwidth_hz"]),
