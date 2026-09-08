@@ -19,7 +19,7 @@ import numpy as np
 import yaml
 
 from .config import load_config, load_localization_config, localization_config_view
-from .pipeline import generate_data, localize, evaluate
+from .pipeline import WORKFLOW, generate_data, localize, evaluate
 from .provenance import (artifact_record, exclusive_output_root_lock, generation_bundle_id,
                          load_generation_manifest, verify_generation_artifact)
 from .scene import Scene2D
@@ -82,7 +82,7 @@ def prepare_experiment(config_path: Path, output: Path) -> dict:
     generation_snapshot = output / "generation_template.yaml"
     generation_snapshot.write_text(yaml.safe_dump(generation, allow_unicode=True, sort_keys=False), encoding="utf-8")
     # 采样计划在任何信道生成或定位之前固定，所有未执行项也进入统计分母。
-    plan = dict(schema_version=1, scene=artifact_record(scene_path), generation_template=artifact_record(generation_snapshot),
+    plan = dict(schema_version=1, workflow=WORKFLOW, scene=artifact_record(scene_path), generation_template=artifact_record(generation_snapshot),
                 source_experiment_config=artifact_record(config_path), source_generation_config=artifact_record(generation_path),
                 sampling_bounds_m=spec["sampling_bounds_m"], random_seed=spec["random_seed"], noise_repeats=spec["noise_repeats"],
                 bs_position_m=generation["simulation"]["bs_position_m"], bs_boresight_rad=math.radians(generation["radio"]["bs_boresight_deg"]),
@@ -217,7 +217,10 @@ def _run_point(output: Path, point: dict, noise_repeats: int, template: dict,
             write_json(status_path, dict(worker=worker, status="success", run_id=result["localization_run_id"], localization_seconds=elapsed, noise_seed=seed))
         except Exception as error:
             (root / "failure.txt").write_text(traceback.format_exc(), encoding="utf-8")
-            write_json(status_path, dict(worker=worker, status=f"{stage}_failed", error=f"{type(error).__name__}: {error}", noise_seed=seed))
+            failure = dict(worker=worker, status=f"{stage}_failed", error=f"{type(error).__name__}: {error}", noise_seed=seed)
+            if getattr(error, "failure_progress", None):
+                failure["failure_progress"] = error.failure_progress
+            write_json(status_path, failure)
             stage_label = {"generation": "噪声生成", "localization": "定位", "evaluation": "评估"}[stage]
             print(f"{point['ue_id']} / {repeat + 1}: {stage_label}失败：{error}；详细日志：{root / 'failure.txt'}", flush=True)
 
@@ -312,6 +315,8 @@ def _experiment_worker(task_queue, event_queue, output: Path, run_root: Path,
             computer = MusicComputer(ComputeSettings(**compute))
             worker["compute_device"] = computer.metadata()
         plan = read_json(output / "experiment_plan.json")
+        if plan.get("workflow") != WORKFLOW:
+            raise ValueError("旧实验计划不是谱面采样流程，不能混入新结果；请新建实验输出目录")
         template = load_config(checked_record(plan["generation_template"]))
         scene_path = checked_record(plan["scene"])
         write_json(workdir / "worker.json", worker)

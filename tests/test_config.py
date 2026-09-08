@@ -17,6 +17,44 @@ from time_bias_localization.config import (
 )
 
 
+@pytest.mark.parametrize("field", [
+    "uncertainty_repeats", "uncertainty_noise_scale", "uncertainty_extra_peaks",
+    "uncertainty_min_relative_height", "association_max_normalized_distance",
+    "false_peak_penalty", "missed_peak_penalty",
+])
+def test_removed_csi_perturbation_settings_fail_explicitly(field):
+    config = deepcopy(DEFAULT_CONFIG)
+    config["music"][field] = 1
+    with pytest.raises(ValueError, match="CSI 重复加噪流程已移除"):
+        validate_config(config)
+    with pytest.raises(ValueError, match="CSI 重复加噪流程已移除"):
+        localization_config_view(config)
+
+
+def test_nested_sampling_config_rejects_unknown_fields_and_merges_partial_yaml(tmp_path):
+    path = tmp_path / "sampling.yaml"
+    path.write_text("radio:\n  bs_position_m: [2, 7]\nmusic:\n  spectrum_sampling:\n    samples_per_peak: 17\n")
+    config = load_localization_config(path)
+    assert config["music"]["spectrum_sampling"]["samples_per_peak"] == 17
+    assert config["music"]["spectrum_sampling"]["uniform_mixture"] == 0.1
+    config["music"]["spectrum_sampling"]["true_ue_position"] = [14, 4]
+    with pytest.raises(ValueError, match="未定义"):
+        validate_localization_config(config)
+
+
+@pytest.mark.parametrize("field,value", [
+    ("samples_per_peak", 0), ("samples_per_peak", True),
+    ("local_grid_points_per_axis", 1), ("uniform_mixture", 1.1),
+    ("aoa_half_width_grid_steps", 0), ("delay_half_width_grid_steps", float("nan")),
+    ("spectrum_power", 0), ("include_nominal", "true"),
+])
+def test_invalid_spectrum_sampling_parameters(field, value):
+    config = deepcopy(DEFAULT_CONFIG)
+    config["music"]["spectrum_sampling"][field] = value
+    with pytest.raises(ValueError, match=field):
+        validate_config(config)
+
+
 def test_config_rejects_nonfinite_and_invalid_music_ranges() -> None:
     config = deepcopy(DEFAULT_CONFIG)
     config["music"]["delay_max_s"] = float("nan")

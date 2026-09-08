@@ -9,7 +9,21 @@ from .constants import SPEED_OF_LIGHT_M_S
 from .visualization import _save, _scene_axes, read_json, write_csv, write_json
 
 
+WORKFLOW = "music_spectrum_sampling_v1"
+
 STEPS = [
+    ("00_scene_truth", "场景与仿真真值（仅作参照）", "generate_synthetic_measurement / extract_planar_uplink_csi"),
+    ("01_csi_input", "一份带噪 CSI 输入", "load_online_measurement_bytes"),
+    ("02_music", "二维 MUSIC 谱与原始峰", "music_2d_spectrum / MusicComputer.spectrum → extract_local_music_peaks"),
+    ("03_spectrum_sampling", "各峰附近的连续角度与时延采样", "sample_music_spectrum"),
+    ("04_reverse_candidates", "全部谱面样本的反向候选轨迹", "generate_reverse_candidates"),
+    ("05_first_clustering", "候选聚类、成员与代表", "cluster_reverse_candidates"),
+    ("06_joint_solution", "代表候选的位置与共同偏差联合解", "solve_position_and_bias"),
+    ("07_forward_check", "预测路径与输入观测的检查", "forward_check"),
+    ("08_final_evaluation", "独立真值评价", "evaluate"),
+]
+
+LEGACY_STEPS = [
     ("00_scene_truth", "场景与仿真真值（仅作参照）", "generate_synthetic_measurement / extract_planar_uplink_csi"),
     ("01_csi_input", "定位输入 CSI", "load_online_measurement_bytes"),
     ("02_music", "二维 MUSIC 谱与原始峰", "CPU: music_2d_spectrum / GPU: MusicComputer.spectrum → extract_local_music_peaks"),
@@ -52,7 +66,8 @@ def _trajectories(plt, run, candidates, directory, *, clustered, title):
         order = len(metadata["reflection_wall_ids"])
         label = f"{'C' if clustered else 'R'}{index + 1}"
         ax.plot(*endpoints.T, color=colors[item["observation_id"]], ls=["-", "--", "-."][order], lw=1.5 if clustered else .9, alpha=.8)
-        ax.annotate(label, endpoints.mean(axis=0), fontsize=6, xytext=(3, 3), textcoords="offset points")
+        if len(candidates) <= (8 if clustered else 30):
+            ax.annotate(label, endpoints.mean(axis=0), fontsize=6, xytext=(3, 3), textcoords="offset points")
         rows.append(dict(label=label, observation_id=item["observation_id"],
                          candidate_id=item.get("candidate_id", ""), sample_id=item.get("sample_id", ""),
                          reflection_order=order, reflection_wall_ids=" | ".join(metadata["reflection_wall_ids"]),
@@ -80,8 +95,11 @@ def _position(plt, run, solution, directory, title):
         raise ValueError("位置协方差不是半正定矩阵")
     radii = np.sqrt(5.991 * np.maximum(eigenvalues, 0))
     angle = np.degrees(np.arctan2(eigenvectors[1, 1], eigenvectors[0, 1]))
+    ellipse_label = ("几何残差近似椭圆（未校准，非采样置信区间）"
+                     if run.get("result", {}).get("workflow") == WORKFLOW
+                     else "名义 95% 椭圆（未校准）")
     ax.add_patch(Ellipse(estimate, 2 * radii[1], 2 * radii[0], angle=angle, fill=False,
-                        color="#4477AA", label="名义 95% 椭圆（未校准）"))
+                        color="#4477AA", label=ellipse_label))
     ax.scatter(*estimate, marker="x", s=50, color="#4477AA", label="本步骤位置输出", zorder=9)
     ax.plot([true[0], estimate[0]], [true[1], estimate[1]], color="0.45", lw=.8)
     margin = max(1., np.linalg.norm(estimate - true), radii.max()) * 1.5
@@ -92,12 +110,12 @@ def _position(plt, run, solution, directory, title):
     _save(plt, fig, directory, "position")
 
 
-def export_steps(plt, run, directory: Path, row: dict) -> None:
+def _export_legacy_steps(plt, run, directory: Path, row: dict) -> None:
     """每一步保存原始数据、图及函数说明，旧产物缺失处明确标注。"""
     directory.mkdir(parents=True, exist_ok=False)
     folders = {}
     index = []
-    for name, title, function in STEPS:
+    for name, title, function in LEGACY_STEPS:
         folder = directory / name
         folder.mkdir()
         folders[name] = folder
@@ -109,7 +127,8 @@ def export_steps(plt, run, directory: Path, row: dict) -> None:
     write_json(directory / "step_index.json", index)
     (directory / "README.md").write_text(
         "# 按执行步骤查看本次定位\n\n"
-        + "\n".join(f"- [{title}]({name}/README.md)" for name, title, _ in STEPS)
+        + "旧流程（legacy）：CSI 额外扰动后分别求解，再汇总。不是谱面采样主流程。\n\n"
+        + "\n".join(f"- [{title}]({name}/README.md)" for name, title, _ in LEGACY_STEPS)
         + "\n\n00 是仿真参照，不是定位器输入。03 的扰动样本进入 07；04–06 使用原始峰。"
         "\n07 是同一份 CSI 的内部扰动，不是 UE 的独立噪声重复。没有保存的历史中间值不重新计算来冒充原始输出。\n", encoding="utf-8")
     if run is None:
@@ -240,6 +259,303 @@ def export_steps(plt, run, directory: Path, row: dict) -> None:
     write_csv(folder / "result.csv", [row])
     _position(plt, run, run["result"], folder, "08  最终位置与误差（扰动汇总之后）")
     write_json(directory / "sources.json", run["sources"])
+
+
+def _export_scene(plt, run, folder):
+    _copy(run["input_paths"]["scene_json"], folder / "scene_2d.json")
+    _copy(run["input_paths"]["ground_truth"], folder / "ground_truth.npz")
+    write_json(folder / "retained_paths.json", run["paths"])
+    fig, ax = _map(plt, run, "00  场景、BS、UE 真值与合成路径（仅作参照）")
+    seen = set()
+    styles = ["-", "--", "-."]
+    labels = ["直射", "一次反射", "二次反射"]
+    for path in run["paths"]:
+        order = path["order"]
+        ax.plot(*np.asarray(path["points"]).T, ls=styles[min(order, 2)],
+                color=["#4477AA", "#66A89F", "#AA7799"][min(order, 2)],
+                label=labels[order] if order not in seen and order < 3 else None)
+        seen.add(order)
+    ax.legend(fontsize=7)
+    _save(plt, fig, folder, "scene_paths")
+
+
+def _export_csi(plt, run, folder):
+    _copy(run["input_paths"]["online_measurement"], folder / "measurement.npz")
+    if run.get("config_path"):
+        _copy(run["config_path"], folder / "localization_config.json")
+    with np.load(folder / "measurement.npz", allow_pickle=False) as data:
+        csi = data["csi_observed"]
+        frequencies = data["subcarrier_frequencies_hz"] / 1e6
+    if csi.ndim == 2:
+        csi = csi[None, ...]
+    write_json(folder / "input_shape.json", dict(csi_shape=list(csi.shape),
+               axes=["snapshot", "bs_antenna", "subcarrier"], truth_used=False,
+               extra_csi_noise_in_localization=False))
+    for i, snapshot in enumerate(csi):
+        fig, axes = plt.subplots(1, 2, figsize=(9, 3.5), layout="constrained")
+        for ax, values, title in zip(axes, (np.abs(snapshot), np.angle(snapshot)), ("幅度", "相位 / rad")):
+            im = ax.pcolormesh(frequencies, np.arange(snapshot.shape[0]), values, shading="auto", cmap="viridis")
+            ax.set(xlabel="子载波基带频率 / MHz", ylabel="BS 阵元编号", title=title)
+            fig.colorbar(im, ax=ax)
+        fig.suptitle(f"01  接收到的带噪 CSI，快照 {i}")
+        _save(plt, fig, folder, f"csi_snapshot_{i:03d}")
+
+
+def _export_music(plt, run, folder):
+    artifacts = run["artifacts"]
+    peaks = read_json(artifacts["music_peaks"])
+    _copy(artifacts["music_spectrum"], folder / "music_spectrum.npz")
+    _copy(artifacts["music_peaks"], folder / "music_peaks.json")
+    _table(folder / "nominal_peaks.csv", [dict(observation_id=f"music_path_{i:02d}",
+           aoa_local_deg=np.degrees(p["aoa_rad"]), delay_ns=p["delay_s"] * 1e9,
+           spectrum_value=p["spectrum_value"]) for i, p in enumerate(peaks["nominal"])])
+    with np.load(artifacts["music_spectrum"], allow_pickle=False) as data:
+        spectrum, angles, delays = data["spectrum"], np.degrees(data["aoa_grid_rad"]), data["delay_grid_s"] * 1e9
+    relative = 10 * np.log10(np.maximum(spectrum / max(float(spectrum.max()), np.finfo(float).tiny), 1e-12))
+    fig, ax = plt.subplots(figsize=(7.2, 5), layout="constrained")
+    im = ax.pcolormesh(delays, angles, relative, shading="auto", cmap="viridis", vmin=-60, vmax=0)
+    fig.colorbar(im, ax=ax, label="相对 MUSIC 谱 / dB（非概率）")
+    for i, peak in enumerate(peaks["nominal"]):
+        xy = [peak["delay_s"] * 1e9, np.degrees(peak["aoa_rad"])]
+        ax.scatter(*xy, marker="x", color="white", s=35)
+        ax.annotate(f"P{i + 1}", xy, xytext=(4, 4), textcoords="offset points", color="white")
+    ax.set(xlabel="观测时延 / ns（含未知偏差）", ylabel="阵列局部到达角 / °", title="02  同一份 CSI 的二维 MUSIC 谱")
+    _save(plt, fig, folder, "music_spectrum")
+
+
+def _export_spectrum_samples(plt, run, folder):
+    source = run["artifacts"]["spectrum_samples"]
+    _copy(source, folder / "spectrum_samples.json")
+    payload = read_json(source)
+    samples = payload.get("samples", payload.get("records", []))
+    rows = []
+    for sample in samples:
+        rows.append(dict(observation_id=sample["observation_id"], sample_id=sample["sample_id"],
+                    source=sample.get("sampling_kind", sample.get("source", "")),
+                    aoa_local_deg=float(np.degrees(sample["aoa_local_rad"])),
+                    aoa_global_deg=float(np.degrees(sample["aoa_global_rad"])),
+                    delay_ns=sample["delay_s"] * 1e9, spectrum_value=sample.get("spectrum_value")))
+    _table(folder / "spectrum_samples.csv", rows)
+    write_json(folder / "sampling_diagnostics.json", payload.get("diagnostics", {}))
+    for index, region in enumerate(payload.get("regions", [])):
+        observation_id = region["observation_id"]
+        members = [sample for sample in samples if sample["observation_id"] == observation_id]
+        spectrum = np.asarray(region["spectrum"], dtype=float)
+        angles = np.degrees(region["aoa_grid_rad"])
+        delays = np.asarray(region["delay_grid_s"]) * 1e9
+        relative = 10 * np.log10(np.maximum(spectrum / max(float(spectrum.max()), np.finfo(float).tiny), 1e-12))
+        fig, ax = plt.subplots(figsize=(7.2, 5), layout="constrained")
+        im = ax.pcolormesh(delays, angles, relative, shading="auto", cmap="viridis", vmin=-40, vmax=0)
+        fig.colorbar(im, ax=ax, label="局部 MUSIC 谱 / dB（非概率）")
+        for nominal, marker, color, label in [(False, ".", "#F2F2F2", "连续谱面采样"),
+                                               (True, "*", "#FFB000", "原始峰")]:
+            subset = [item for item in members if (item.get("sampling_kind", item.get("source")) == "nominal") == nominal]
+            if subset:
+                ax.scatter([item["delay_s"] * 1e9 for item in subset],
+                           [np.degrees(item["aoa_local_rad"]) for item in subset], marker=marker,
+                           s=75 if nominal else 10, color=color, label=label, alpha=.8)
+        unique = len({(item["aoa_local_rad"], item["delay_s"]) for item in members})
+        ax.set(xlabel="观测时延 / ns（含共同偏差）", ylabel="阵列局部到达角 / °",
+               title=f"03  观测 {index + 1}：{len(members)} 个样本，{unique} 个不同坐标")
+        ax.legend(fontsize=7)
+        fig.suptitle("样本用于候选搜索；点的分散程度不是定位置信区间", fontsize=9)
+        _save(plt, fig, folder, f"local_spectrum_{index:03d}")
+
+
+def _export_clusters(plt, run, folder):
+    clusters = read_json(run["artifacts"]["clustered_candidates"])
+    _copy(run["artifacts"]["clustered_candidates"], folder / "clustered_candidates.json")
+    _trajectories(plt, run, clusters, folder, clustered=True, title="05  第一次聚类的代表候选轨迹")
+    raw = read_json(run["artifacts"]["raw_reverse_candidates"])
+    raw_lookup = {(item["observation_id"], item["topology_id"], item["sample_id"]): item for item in raw}
+    fig, ax = _map(plt, run, "05  聚类成员（细线）与代表候选（粗线）")
+    member_rows, counts, extents = [], [], [run["true"], run["bs"]]
+    for i, cluster in enumerate(clusters):
+        color = plt.get_cmap("tab20")(i % 20)
+        metadata = cluster["metadata"]
+        topology_id = metadata.get("topology_id", cluster.get("topology_id"))
+        if topology_id is None:
+            raise ValueError(f"代表候选缺少反射路径编号：{cluster['candidate_id']}")
+        sample_ids = metadata.get("source_sample_ids", [])
+        for sample_id in sample_ids:
+            item = raw_lookup.get((cluster["observation_id"], topology_id, sample_id))
+            if item is None:
+                raise ValueError(f"聚类成员没有对应的原始候选：{sample_id}")
+            points = np.asarray(item["anchor_m"]) - np.asarray([item["beta_min_m"], item["beta_max_m"]])[:, None] * np.asarray(item["direction"])
+            ax.plot(*points.T, color=color, lw=.5, alpha=.25)
+            extents.extend(points.tolist())
+            member_rows.append(dict(candidate_id=cluster["candidate_id"], observation_id=cluster["observation_id"],
+                                    topology_id=topology_id, sample_id=sample_id,
+                                    is_representative=sample_id == metadata.get("representative_sample_id")))
+        points = np.asarray(cluster["anchor_m"]) - np.asarray(cluster["beta_interval_m"])[:, None] * np.asarray(cluster["direction"])
+        ax.plot(*points.T, color=color, lw=2., alpha=.95)
+        extents.extend(points.tolist())
+        if len(clusters) <= 8:
+            ax.annotate(f"C{i + 1} ({len(sample_ids)})", points.mean(axis=0), fontsize=6)
+        counts.append(dict(label=f"C{i + 1}", candidate_id=cluster["candidate_id"], observation_id=cluster["observation_id"],
+                           topology_id=topology_id, member_count=len(sample_ids),
+                           representative_sample_id=metadata.get("representative_sample_id", "")))
+    xy = np.asarray(extents)
+    ax.set(xlim=(xy[:, 0].min() - 3, xy[:, 0].max() + 3), ylim=(xy[:, 1].min() - 3, xy[:, 1].max() + 3))
+    ax.plot([], [], color="0.5", lw=.5, alpha=.5, label="簇内原始成员轨迹")
+    ax.plot([], [], color="0.5", lw=2., label="保留的代表候选轨迹")
+    ax.legend(fontsize=7)
+    fig.suptitle(f"{len(raw)} 条原始候选 → {len(clusters)} 个代表；成员数见簇大小图和表；未代入最终 bias", fontsize=9)
+    _save(plt, fig, folder, "members_and_representatives")
+    _table(folder / "cluster_members.csv", member_rows)
+    _table(folder / "cluster_counts.csv", counts)
+    write_json(folder / "counts.json", dict(raw_count=len(raw), representative_count=len(clusters),
+               listed_member_count=len(member_rows)))
+    fig, ax = plt.subplots(figsize=(max(7.2, .3 * len(counts)), 4.), layout="constrained")
+    if counts:
+        sizes = [item["member_count"] for item in counts]
+        bars = ax.bar([item["label"] for item in counts], sizes,
+                      color=[plt.get_cmap("tab20")(i % 20) for i in range(len(counts))])
+        ax.bar_label(bars, padding=3, fontsize=7)
+        ax.set_ylim(0., max(sizes) * 1.18)
+    ax.set(xlabel="代表候选编号（与表一致）", ylabel="簇内原始候选数",
+           title="05  聚类压缩数量；颜色与成员及代表轨迹图一致")
+    ax.tick_params(axis="x", labelsize=7, rotation=45 if len(counts) > 12 else 0)
+    fig.suptitle("成员数用于说明候选压缩，不表示独立观测数或求解权重", fontsize=9)
+    _save(plt, fig, folder, "cluster_sizes")
+
+
+def _export_forward_check(plt, run, folder):
+    source = run["artifacts"]["forward_check"]
+    _copy(source, folder / "forward_check.json")
+    diagnostics = read_json(source)
+    scalar_rows = [dict(field=key, value=value) for key, value in diagnostics.items()
+                   if not isinstance(value, (list, dict))]
+    _table(folder / "diagnostics.csv", scalar_rows)
+    paths = diagnostics.get("paths", diagnostics.get("per_path", []))
+    if paths:
+        path_rows = []
+        for item in paths:
+            prediction = item.get("prediction") or {}
+            original = item.get("original_peak_residuals") or {}
+            sampled = item.get("sample_residuals") or {}
+            path_rows.append(dict(observation_id=item.get("observation_id"), candidate_id=item.get("candidate_id"),
+                        valid=item.get("valid"), failure_reasons=" | ".join(item.get("failure_reasons", [])),
+                        predicted_aoa_global_deg=prediction.get("aoa_global_deg"),
+                        predicted_observed_delay_ns=(prediction["predicted_observed_delay_s"] * 1e9
+                                                     if prediction.get("predicted_observed_delay_s") is not None else None),
+                        original_peak_aoa_error_deg=original.get("aoa_error_deg"),
+                        original_peak_delay_error_ns=original.get("delay_error_ns"),
+                        sampled_aoa_error_deg=sampled.get("aoa_error_deg"),
+                        sampled_delay_error_ns=sampled.get("delay_error_ns")))
+        _table(folder / "path_checks.csv", path_rows)
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4), layout="constrained")
+        x = np.arange(len(paths))
+        for ax, key, title in zip(axes, ("original_peak_aoa_error_deg", "original_peak_delay_error_ns"),
+                                 ("预测 − 原始谱峰角度 / °", "预测 − 原始谱峰时延 / ns")):
+            values = [np.nan if item[key] is None else item[key] for item in path_rows]
+            ax.bar(x, values, color=["#4477AA" if item["valid"] else "#BB5566" for item in path_rows])
+            ax.axhline(0., color="0.4", lw=.7)
+            ax.set_xticks(x, [f"P{i + 1}" for i in x])
+            ax.set(xlabel="所选路径（顺序见表）", ylabel=title)
+        fig.suptitle("07  所选反射路径正向重算；与原始峰比较，未使用真值", fontsize=10)
+        _save(plt, fig, folder, "original_peak_residuals")
+        fig, ax = _map(plt, run, "07  联合解正向重算的所选路径")
+        extents = [run["true"], run["bs"]]
+        for i, item in enumerate(paths):
+            points = np.asarray(item.get("path_nodes_m", []), dtype=float)
+            if points.ndim != 2 or len(points) < 2:
+                continue
+            ax.plot(*points.T, lw=1., ls="-" if item.get("valid") else "--",
+                    label=f"P{i + 1}：{'有效' if item.get('valid') else '未通过检查'}")
+            extents.extend(points.tolist())
+        xy = np.asarray(extents)
+        ax.set(xlim=(xy[:, 0].min() - 2, xy[:, 0].max() + 2), ylim=(xy[:, 1].min() - 2, xy[:, 1].max() + 2))
+        ax.legend(fontsize=7)
+        fig.suptitle("只检查已选反射路径；不是全部路径枚举，也不是 CSI 拟合；真值星号仅供画图参照", fontsize=8)
+        _save(plt, fig, folder, "predicted_paths")
+    fig, ax = plt.subplots(figsize=(9, max(3., .28 * min(len(scalar_rows), 20) + 1.5)), layout="constrained")
+    ax.axis("off")
+    displayed = scalar_rows[:20]
+    if displayed:
+        table = ax.table(cellText=[[item["field"], str(item["value"])] for item in displayed],
+                         colLabels=["检查字段", "本次输出"], cellLoc="left", loc="center", colWidths=[.55, .45])
+        table.auto_set_font_size(False)
+        table.set_fontsize(7)
+        table.scale(1., 1.3)
+    else:
+        ax.text(.5, .5, f"已记录 {len(paths)} 条路径检查，详见 JSON 和 CSV", ha="center", transform=ax.transAxes)
+    ax.set_title("07  对原始观测的检查（不使用真实位置或真实 bias）")
+    _save(plt, fig, folder, "forward_check")
+
+
+def export_steps(plt, run, directory: Path, row: dict) -> None:
+    """按保存的工作流导出步骤；失败运行也保留已完成阶段。"""
+    workflow = (run.get("result", {}).get("workflow", run.get("workflow"))
+                if run else row.get("workflow", WORKFLOW))
+    if workflow != WORKFLOW:
+        if workflow is not None:
+            raise ValueError(f"未知的定位工作流：{workflow}")
+        return _export_legacy_steps(plt, run, directory, row)
+    directory.mkdir(parents=True, exist_ok=False)
+    artifacts = run.get("artifacts", {}) if run else {}
+    available = {name: False for name, _, _ in STEPS}
+    if run:
+        available.update({
+            "00_scene_truth": all(key in run.get("input_paths", {}) for key in ("scene_json", "ground_truth")),
+            "01_csi_input": "online_measurement" in run.get("input_paths", {}),
+            "02_music": all(key in artifacts for key in ("music_spectrum", "music_peaks")),
+            "03_spectrum_sampling": "spectrum_samples" in artifacts,
+            "04_reverse_candidates": "raw_reverse_candidates" in artifacts,
+            "05_first_clustering": all(key in artifacts for key in ("raw_reverse_candidates", "clustered_candidates")),
+            "06_joint_solution": bool(run.get("result", {}).get("central_solution")),
+            "07_forward_check": "forward_check" in artifacts,
+            "08_final_evaluation": bool(run.get("metrics")) and "result" in artifacts,
+        })
+    folders, index = {}, []
+    for name, title, function in STEPS:
+        folder = directory / name
+        folder.mkdir()
+        folders[name] = folder
+        note = ("只导出本次运行保存的输出，不重新执行定位。" if available[name] else
+                f"状态：{row['status']}。本步骤没有保存可核验的输出。{row.get('error', '')}")
+        (folder / "README.md").write_text(f"# {title}\n\n对应函数：`{function}`。\n\n{note}\n", encoding="utf-8")
+        index.append(dict(step=name, title=title, function=function,
+                          status="available" if available[name] else "not_available"))
+    write_json(directory / "attempt.json", row)
+    write_json(directory / "step_index.json", index)
+    (directory / "README.md").write_text(
+        "# 按执行步骤查看本次定位\n\n"
+        + ("未记录工作流来源；下列为当前步骤占位，不表示这些步骤已经运行。\n\n"
+           if run is None and "workflow" not in row else "")
+        + "工作流：谱面采样 → 汇集反向候选 → 聚类代表 → 一次联合求解。\n\n"
+        + "\n".join(f"- [{title}]({name}/README.md)" for name, title, _ in STEPS)
+        + "\n\n01 的 CSI 已带噪；定位器不再额外加噪。03 的所有谱面样本进入 04，05 汇集后聚类，06 联合求解共同 bias 与位置。"
+        "\n03 的散点用于候选搜索，不是独立观测或置信区间。候选轨迹保留 bias 变化，不用真值 bias 画初始位置。"
+        "\n00、08 在独立评估侧读取真值；07 只检查原始观测。失败步骤保留状态，已完成步骤照常导出。\n",
+        encoding="utf-8")
+    if run is None:
+        return
+    for name, exporter in [("00_scene_truth", _export_scene), ("01_csi_input", _export_csi),
+                           ("02_music", _export_music), ("03_spectrum_sampling", _export_spectrum_samples),
+                           ("05_first_clustering", _export_clusters), ("07_forward_check", _export_forward_check)]:
+        if available[name]:
+            exporter(plt, run, folders[name])
+    if available["04_reverse_candidates"]:
+        folder = folders["04_reverse_candidates"]
+        _copy(artifacts["raw_reverse_candidates"], folder / "raw_reverse_candidates.json")
+        _trajectories(plt, run, read_json(artifacts["raw_reverse_candidates"]), folder, clustered=False,
+                      title="04  全部谱面样本反向追踪的候选轨迹")
+    if available["06_joint_solution"]:
+        folder = folders["06_joint_solution"]
+        result = run["result"]
+        central = result["central_solution"]
+        write_json(folder / "joint_solution.json", {**central,
+                   "selected_candidates": result.get("central_selected_candidates", []),
+                   "residuals_m": result.get("central_residuals_m", []), "diagnostics": result.get("diagnostics", {})})
+        _position(plt, run, central, folder, "06  聚类代表候选的唯一联合求解结果")
+    if available["08_final_evaluation"]:
+        folder = folders["08_final_evaluation"]
+        _copy(artifacts["result"], folder / "localization_result.json")
+        write_json(folder / "metrics.json", run["metrics"])
+        write_csv(folder / "result.csv", [row])
+        _position(plt, run, run["result"], folder, "08  联合解的独立真值评价")
+    write_json(directory / "sources.json", run.get("sources", []))
 
 
 def per_sample_statistics(rows):

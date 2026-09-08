@@ -71,6 +71,8 @@ class MusicComputer:
         self._batch_count = 0
         self._csi_count = 0
         self._largest_batch = 0
+        self._covariance_count = 0
+        self._eigendecomposition_count = 0
         if self.settings.backend == "cuda":
             try:
                 cupy = importlib.import_module("cupy")
@@ -118,6 +120,8 @@ class MusicComputer:
             "completed_batches": self._batch_count,
             "completed_csi": self._csi_count,
             "largest_batch": self._largest_batch,
+            "covariance_count": self._covariance_count,
+            "eigendecomposition_count": self._eigendecomposition_count,
             "steering_cache_entries": len(self._cache),
             "steering_cache_bytes": self._cache_bytes,
             "steering_cache_hits": self._cache_hits,
@@ -125,6 +129,55 @@ class MusicComputer:
             "steering_cache_max_entries": self._CACHE_MAX_ENTRIES,
             "steering_cache_max_bytes": self._CACHE_MAX_BYTES,
         }
+
+    def prepare(
+        self, csi: np.ndarray, *,
+        subcarrier_frequencies_hz: Sequence[float] | np.ndarray,
+        carrier_frequency_hz: float,
+        antenna_spacing_m: float | None,
+        num_sources: int = 1,
+        spatial_subarray_size: int | None = None,
+        frequency_subarray_size: int | None = None,
+        diagonal_loading: float = 0.0,
+    ) -> "PreparedMusic":
+        """仅对这一份观测构造一次协方差并分解，随后复用以查询任意谱坐标。"""
+        frequencies = _validate_frequency_vector(
+            subcarrier_frequencies_hz, require_uniform_spacing=True
+        ).copy()
+        observation = _prepare_music_input(csi, frequencies.size)
+        spatial_size = _validate_subarray_size(
+            "spatial_subarray_size", spatial_subarray_size, observation.shape[-2]
+        )
+        frequency_size = _validate_subarray_size(
+            "frequency_subarray_size", frequency_subarray_size, frequencies.size
+        )
+        dimension = spatial_size * frequency_size
+        if isinstance(num_sources, bool) or int(num_sources) != num_sources:
+            raise ValueError("num_sources 必须是整数")
+        source_count = int(num_sources)
+        if source_count < 1 or source_count >= dimension:
+            raise ValueError(f"num_sources 必须位于 [1, {dimension - 1}]")
+        loading = float(diagonal_loading)
+        if not np.isfinite(loading) or loading < 0.0:
+            raise ValueError("diagonal_loading 必须是有限非负数")
+        # 在进行特征分解之前验证物理阵列参数。
+        ula_steering_vector(
+            [0.0], num_bs_antennas=spatial_size,
+            carrier_frequency_hz=carrier_frequency_hz,
+            antenna_spacing_m=antenna_spacing_m,
+        )
+        with self._device if self._device is not None else nullcontext():
+            signal_adjoint = self._prepare_subspaces(
+                self._xp.asarray(observation[None]), spatial_size,
+                frequency_size, source_count, loading,
+            )[0]
+        self._batch_count += 1
+        self._csi_count += 1
+        self._largest_batch = max(self._largest_batch, 1)
+        return PreparedMusic(
+            self, signal_adjoint, frequencies, float(carrier_frequency_hz),
+            antenna_spacing_m, spatial_size, frequency_size,
+        )
 
     def spectrum(self, csi: np.ndarray, **kwargs: Any) -> np.ndarray:
         """计算一份 ``(M,K)`` 或 ``(S,M,K)`` 观测的二维谱。"""
@@ -268,10 +321,17 @@ class MusicComputer:
         source_count: int,
         loading: float,
     ) -> Any:
+        signal_adjoint = self._prepare_subspaces(
+            observations, spatial.shape[0], frequency.shape[0], source_count, loading,
+        )
+        return self._evaluate_grid(signal_adjoint, spatial, frequency)
+
+    def _prepare_subspaces(
+        self, observations: Any, spatial_size: int, frequency_size: int,
+        source_count: int, loading: float,
+    ) -> Any:
         xp = self._xp
         batch_count, snapshot_count, antenna_count, subcarrier_count = observations.shape
-        spatial_size, angle_count = spatial.shape
-        frequency_size, delay_count = frequency.shape
         dimension = spatial_size * frequency_size
         covariance = xp.zeros((batch_count, dimension, dimension), dtype=xp.complex128)
         window_count = (
@@ -295,7 +355,16 @@ class MusicComputer:
         # CuPy 默认忽略 cuSOLVER 的失败状态；实验中必须显式报告不收敛。
         with self._cupyx.errstate(linalg="raise") if self._cupyx else nullcontext():
             _, eigenvectors = xp.linalg.eigh(covariance)
-        signal_adjoint = eigenvectors[:, :, -source_count:].conj().swapaxes(-1, -2)
+        self._covariance_count += batch_count
+        self._eigendecomposition_count += batch_count
+        return eigenvectors[:, :, -source_count:].conj().swapaxes(-1, -2)
+
+    def _evaluate_grid(self, signal_adjoint: Any, spatial: Any, frequency: Any) -> Any:
+        xp = self._xp
+        batch_count = signal_adjoint.shape[0]
+        spatial_size, angle_count = spatial.shape
+        frequency_size, delay_count = frequency.shape
+        dimension = spatial_size * frequency_size
         spectrum = xp.empty((batch_count, angle_count, delay_count), dtype=xp.float64)
         for start in range(0, angle_count, self.settings.angle_chunk_size):
             stop = min(start + self.settings.angle_chunk_size, angle_count)
@@ -310,3 +379,115 @@ class MusicComputer:
                 batch_count, stop - start, delay_count
             )
         return spectrum
+
+
+class PreparedMusic:
+    """单份 CSI 的已计算子空间；查询谱面和连续坐标均不再次分解 CSI。"""
+
+    def __init__(
+        self, computer: MusicComputer, signal_adjoint: Any, frequencies: np.ndarray,
+        carrier_frequency: float, spacing: float | None, spatial_size: int,
+        frequency_size: int,
+    ) -> None:
+        self._computer = computer
+        self._signal_adjoint = signal_adjoint
+        self._frequencies = frequencies
+        self._carrier_frequency = carrier_frequency
+        self._spacing = spacing
+        self._spatial_size = spatial_size
+        self._frequency_size = frequency_size
+        self._grid_queries = 0
+        self._paired_queries = 0
+        self._evaluated_coordinates = 0
+
+    @property
+    def diagnostics(self) -> dict[str, Any]:
+        return self.metadata()
+
+    def metadata(self) -> dict[str, Any]:
+        return {
+            "backend": self._computer.settings.backend,
+            "covariance_count": 1,
+            "eigendecomposition_count": 1,
+            "completed_csi": 1,
+            "completed_batches": 1,
+            "grid_queries": self._grid_queries,
+            "paired_queries": self._paired_queries,
+            "evaluated_coordinates": self._evaluated_coordinates,
+            "observation_reused": True,
+            "added_csi_noise": False,
+        }
+
+    def spectrum(
+        self, *, aoa_grid_rad: Sequence[float] | np.ndarray,
+        delay_grid_s: Sequence[float] | np.ndarray,
+    ) -> np.ndarray:
+        """在任意合法细网格上计算同一个 MUSIC 函数，返回角度×时延数组。"""
+        angles = _as_real_vector("aoa_grid_rad", aoa_grid_rad)
+        delays = _as_real_vector("delay_grid_s", delay_grid_s)
+        if np.any(np.diff(angles) <= 0):
+            raise ValueError("aoa_grid_rad 必须严格递增")
+        if np.any(delays < 0) or np.any(np.diff(delays) <= 0):
+            raise ValueError("delay_grid_s 必须为非负且严格递增的时延")
+        computer = self._computer
+        with computer._device if computer._device is not None else nullcontext():
+            spatial, frequency = computer._steering(
+                self._frequencies, angles, delays, self._spatial_size,
+                self._frequency_size, self._carrier_frequency, self._spacing,
+            )
+            result = computer._evaluate_grid(
+                self._signal_adjoint[None], spatial, frequency,
+            )[0]
+            host = computer._xp.asnumpy(result) if computer._device is not None else result
+        self._grid_queries += 1
+        self._evaluated_coordinates += int(angles.size * delays.size)
+        return host
+
+    def values(
+        self, *, aoa_rad: Sequence[float] | np.ndarray,
+        delay_s: Sequence[float] | np.ndarray,
+    ) -> np.ndarray:
+        """逐对精确评价连续角度、时延坐标，不进行谱插值或网格取整。"""
+        angles = _as_real_vector("aoa_rad", aoa_rad)
+        delays = _as_real_vector("delay_s", delay_s)
+        if angles.shape != delays.shape:
+            raise ValueError("aoa_rad 与 delay_s 必须为等长向量")
+        if np.any(delays < 0):
+            raise ValueError("delay_s 必须为非负时延")
+        # 与全局 MUSIC 使用同一局部角度、天线方向和相位约定。
+        spatial_host = ula_steering_vector(
+            angles, num_bs_antennas=self._spatial_size,
+            carrier_frequency_hz=self._carrier_frequency,
+            antenna_spacing_m=self._spacing,
+        )
+        computer = self._computer
+        xp = computer._xp
+        dimension = self._spatial_size * self._frequency_size
+        result = np.empty(angles.size, dtype=np.float64)
+        chunk_size = computer.settings.angle_chunk_size * 256
+        with computer._device if computer._device is not None else nullcontext():
+            frequencies = xp.asarray(
+                self._frequencies[:self._frequency_size] - self._frequencies[0]
+            )
+            for start in range(0, angles.size, chunk_size):
+                stop = min(start + chunk_size, angles.size)
+                spatial = xp.asarray(spatial_host[:, start:stop])
+                frequency = xp.exp(
+                    -2.0j * np.pi * frequencies[:, None]
+                    * xp.asarray(delays[None, start:stop])
+                )
+                steering = (spatial[:, None, :] * frequency[None, :, :]).reshape(
+                    dimension, stop - start
+                ) / math.sqrt(dimension)
+                projection = self._signal_adjoint @ steering
+                denominator = xp.maximum(
+                    1.0 - xp.sum(xp.abs(projection) ** 2, axis=0).real,
+                    np.finfo(np.float64).eps,
+                )
+                values = 1.0 / denominator
+                result[start:stop] = (
+                    xp.asnumpy(values) if computer._device is not None else values
+                )
+        self._paired_queries += 1
+        self._evaluated_coordinates += int(angles.size)
+        return result

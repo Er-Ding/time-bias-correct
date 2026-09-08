@@ -41,13 +41,15 @@ music:
   min_angle_separation_deg: 5.0
   min_delay_separation_s: 3.0e-9
   # 峰集合整体配对：允许虚假峰不配对，漏检惩罚更高。
-  association_max_normalized_distance: 3.0
-  false_peak_penalty: 4.0
-  missed_peak_penalty: 9.0
-  uncertainty_repeats: 12
-  uncertainty_extra_peaks: 2
-  uncertainty_min_relative_height: 0.01
-  uncertainty_noise_scale: 0.35
+  # 每份接收 CSI 的谱面采样；半宽以原始搜索网格步长为单位。
+  spectrum_sampling:
+    samples_per_peak: 128
+    aoa_half_width_grid_steps: 1.5
+    delay_half_width_grid_steps: 1.5
+    local_grid_points_per_axis: 25
+    spectrum_power: 1.0
+    uniform_mixture: 0.1
+    include_nominal: true
   spatial_subarray_size: 8
   frequency_subarray_size: 32
   diagonal_loading: 1.0e-8

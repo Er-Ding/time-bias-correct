@@ -9,13 +9,14 @@ from typing import Iterable, Sequence
 import numpy as np
 
 from .constants import SPEED_OF_LIGHT_M_S
+from .reverse_compute import VectorizedWallIntersector
 from .scene import Scene2D, WallSegment, ray_segment_intersection, reflect_direction
 from .solver import CandidateTrajectory
 
 
 @dataclass(frozen=True)
 class PathObservationSample:
-    """一条 MUSIC 观测的一个可复现扰动样本。"""
+    """一条 MUSIC 观测峰附近的一个可复现角度/时延采样。"""
 
     observation_id: str
     sample_id: str
@@ -149,6 +150,7 @@ def reverse_trace_sample(
     *,
     max_reflections: int,
     beta_interval_m: tuple[float, float],
+    wall_intersector: VectorizedWallIntersector | None = None,
 ) -> list[RawReverseTrajectory]:
     """对单个 AOA/Delay 样本生成 0、1、2 次反射解释。"""
 
@@ -169,7 +171,11 @@ def reverse_trace_sample(
     candidates: list[RawReverseTrajectory] = []
 
     for reflection_order in range(max_reflections + 1):
-        next_hit = _nearest_wall_hit(scene, origin, direction)
+        next_hit = (
+            _nearest_wall_hit(scene, origin, direction)
+            if wall_intersector is None
+            else wall_intersector.nearest(origin, direction)
+        )
         free_distance = (
             next_hit[0] if next_hit is not None else _distance_to_bounds(scene, origin, direction)
         )
@@ -205,8 +211,21 @@ def generate_reverse_candidates(
     *,
     max_reflections: int,
     beta_interval_m: tuple[float, float],
+    backend: str = "numpy",
+    wall_chunk_size: int = 8192,
 ) -> list[RawReverseTrajectory]:
-    """对所有 MUSIC 样本执行反向追踪。"""
+    """对所有 MUSIC 样本执行反向追踪，复用分块墙求交数据。
+
+    numpy 批量计算每条射线与墙的交点；reference 保留原逐墙实现用于对照。
+    两种模式均保持采样顺序、反射顺序和所有候选的完整物理字段。
+    """
+
+    if backend not in {"numpy", "reference"}:
+        raise ValueError("反向追踪 backend 只能为 numpy 或 reference")
+    intersector = (
+        VectorizedWallIntersector(scene, wall_chunk_size=wall_chunk_size)
+        if backend == "numpy" else None
+    )
 
     raw: list[RawReverseTrajectory] = []
     for sample in samples:
@@ -217,103 +236,75 @@ def generate_reverse_candidates(
                 sample,
                 max_reflections=max_reflections,
                 beta_interval_m=beta_interval_m,
+                wall_intersector=intersector,
             )
         )
     return raw
 
 
-def _direction_separation_deg(first: np.ndarray, second: np.ndarray) -> float:
-    cosine = float(np.clip(np.dot(first, second), -1.0, 1.0))
-    return float(np.degrees(np.arccos(cosine)))
+def _trajectory_distance_matrices(
+    group: Sequence[RawReverseTrajectory],
+) -> tuple[np.ndarray, np.ndarray]:
+    """批量比较同一 beta 下的轨迹，返回共同区间上的最大距离与方向差。
 
-
-def _minimum_shared_interval_trajectory_distance_m(
-    first: RawReverseTrajectory,
-    second: RawReverseTrajectory,
-) -> float:
-    """返回两条轨迹在共同有效 beta 区间内能够达到的最小距离。
-
-    两条轨迹之差仍是 beta 的一次函数，因此平方距离是一个一元二次函数。
-    先解析求出最低点，再把 beta 截到共同有效区间即可。区间不相交时返回
-    正无穷，表示两个样本不能聚到一起。
+    两条轨迹的距离是 beta 的凸函数，闭区间最大值必在端点取得。因此
+    只需检查两个共同端点，不能以某一个交点处的最小距离代表整个区间。
     """
 
-    beta_min = max(first.beta_min_m, second.beta_min_m)
-    beta_max = min(first.beta_max_m, second.beta_max_m)
-    if beta_min > beta_max:
-        return float("inf")
-
-    anchor_delta = np.asarray(first.anchor_m) - np.asarray(second.anchor_m)
-    direction_delta = np.asarray(first.direction) - np.asarray(second.direction)
-    direction_energy = float(np.dot(direction_delta, direction_delta))
-    if direction_energy <= np.finfo(float).eps:
-        return float(np.linalg.norm(anchor_delta))
-
-    unconstrained_beta = float(
-        np.dot(anchor_delta, direction_delta) / direction_energy
+    anchors = np.asarray([item.anchor_m for item in group], dtype=float)
+    directions = np.asarray([item.direction for item in group], dtype=float)
+    lower = np.asarray([item.beta_min_m for item in group], dtype=float)
+    upper = np.asarray([item.beta_max_m for item in group], dtype=float)
+    shared_lower = np.maximum(lower[:, None], lower[None, :])
+    shared_upper = np.minimum(upper[:, None], upper[None, :])
+    delta_anchor = anchors[:, None, :] - anchors[None, :, :]
+    delta_direction = directions[:, None, :] - directions[None, :, :]
+    start_distance = np.linalg.norm(
+        delta_anchor - shared_lower[:, :, None] * delta_direction, axis=2
     )
-    closest_beta = float(np.clip(unconstrained_beta, beta_min, beta_max))
-    separation = anchor_delta - closest_beta * direction_delta
-    return float(np.linalg.norm(separation))
+    end_distance = np.linalg.norm(
+        delta_anchor - shared_upper[:, :, None] * delta_direction, axis=2
+    )
+    distances = np.maximum(start_distance, end_distance)
+    distances[shared_lower > shared_upper] = np.inf
+    direction_distances = np.degrees(
+        np.arccos(np.clip(directions @ directions.T, -1.0, 1.0))
+    )
+    np.fill_diagonal(distances, 0.0)
+    np.fill_diagonal(direction_distances, 0.0)
+    return distances, direction_distances
 
 
-def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
-    """计算确定性的加权中位数；恰好各占一半时取两个中间值的均值。"""
-
-    values = np.asarray(values, dtype=float)
-    weights = np.asarray(weights, dtype=float)
-    order = np.argsort(values, kind="stable")
-    ordered_values = values[order]
-    ordered_weights = weights[order]
-    cumulative = np.cumsum(ordered_weights)
-    halfway = 0.5 * float(cumulative[-1])
-    index = int(np.searchsorted(cumulative, halfway, side="left"))
-    if (
-        index + 1 < ordered_values.size
-        and np.isclose(cumulative[index], halfway, rtol=0.0, atol=1e-14)
-    ):
-        return float(0.5 * (ordered_values[index] + ordered_values[index + 1]))
-    return float(ordered_values[index])
-
-
-def _connected_components(
-    group: Sequence[RawReverseTrajectory],
+def _bounded_diameter_clusters(
+    distances: np.ndarray,
+    direction_distances: np.ndarray,
     *,
     position_radius_m: float,
     direction_radius_deg: float,
 ) -> list[list[int]]:
-    neighbors: list[list[int]] = [[] for _ in group]
-    for first in range(len(group)):
-        for second in range(first + 1, len(group)):
-            trajectory_distance = _minimum_shared_interval_trajectory_distance_m(
-                group[first], group[second]
-            )
-            direction_distance = _direction_separation_deg(
-                np.asarray(group[first].direction), np.asarray(group[second].direction)
-            )
-            if (
-                trajectory_distance <= position_radius_m
-                and direction_distance <= direction_radius_deg
-            ):
-                neighbors[first].append(second)
-                neighbors[second].append(first)
+    """确定性贪心分组：新成员必须与簇内每个已有成员都满足阈值。
 
-    components: list[list[int]] = []
-    unseen = set(range(len(group)))
-    while unseen:
-        start = min(unseen)
-        stack = [start]
-        unseen.remove(start)
-        component: list[int] = []
-        while stack:
-            index = stack.pop()
-            component.append(index)
-            for neighbor in neighbors[index]:
-                if neighbor in unseen:
-                    unseen.remove(neighbor)
-                    stack.append(neighbor)
-        components.append(sorted(component))
-    return components
+    与单链连通分量不同，A 接近 B、B 接近 C 不足以将 A/B/C 合并。
+    多个簇都兼容时，优先加入最大两两距离最小的簇；并列保持稳定顺序。
+    """
+
+    compatible = (
+        (distances <= position_radius_m)
+        & (direction_distances <= direction_radius_deg)
+    )
+    clusters: list[list[int]] = []
+    for index in range(len(distances)):
+        options = [
+            (float(np.max(distances[index, members])), cluster_index)
+            for cluster_index, members in enumerate(clusters)
+            if bool(np.all(compatible[index, members]))
+        ]
+        if options:
+            _, cluster_index = min(options)
+            clusters[cluster_index].append(index)
+        else:
+            clusters.append([index])
+    return clusters
 
 
 def cluster_reverse_candidates(
@@ -322,25 +313,33 @@ def cluster_reverse_candidates(
     position_radius_m: float = 1.5,
     direction_radius_deg: float = 5.0,
 ) -> list[CandidateTrajectory]:
-    """只在同一观测、同一反射结构内部聚类并生成可复现代表轨迹。"""
+    """汇集采样候选，按来源峰/反射结构聚类，再选真实成员作为代表。
 
-    if position_radius_m <= 0.0 or direction_radius_deg <= 0.0:
-        raise ValueError("聚类半径必须为正数")
+    每个簇具有受限的两两轨迹距离；代表为加权距离和最小的真实成员。
+    代表的几何、采样观测和有效 beta 区间完整保留，不合成平均反射路径。
+    样本频率只供诊断，不能把同一观测的多次采样当作独立测量加权。
+    """
+
+    if (
+        not np.isfinite(position_radius_m)
+        or not np.isfinite(direction_radius_deg)
+        or position_radius_m <= 0.0
+        or direction_radius_deg <= 0.0
+    ):
+        raise ValueError("聚类半径必须为有限正数")
     grouped: dict[tuple[str, str], list[RawReverseTrajectory]] = {}
     observation_sample_ids: dict[str, set[str]] = {}
     for candidate in raw_candidates:
-        grouped.setdefault(
-            (candidate.observation_id, candidate.topology_id), []
-        ).append(candidate)
-        observation_sample_ids.setdefault(candidate.observation_id, set()).add(
-            candidate.sample_id
-        )
+        grouped.setdefault((candidate.observation_id, candidate.topology_id), []).append(candidate)
+        observation_sample_ids.setdefault(candidate.observation_id, set()).add(candidate.sample_id)
 
     representatives: list[CandidateTrajectory] = []
     for (observation_id, topology_id), group in sorted(grouped.items()):
         group = sorted(group, key=lambda item: item.sample_id)
-        components = _connected_components(
-            group,
+        distances, direction_distances = _trajectory_distance_matrices(group)
+        components = _bounded_diameter_clusters(
+            distances,
+            direction_distances,
             position_radius_m=position_radius_m,
             direction_radius_deg=direction_radius_deg,
         )
@@ -348,21 +347,11 @@ def cluster_reverse_candidates(
             members = [group[index] for index in component]
             weights = np.asarray([member.weight for member in members], dtype=float)
             weights /= np.sum(weights)
-            anchors = np.asarray([member.anchor_m for member in members], dtype=float)
-            directions = np.asarray([member.direction for member in members], dtype=float)
-            anchor = np.sum(weights[:, None] * anchors, axis=0)
-            direction = np.sum(weights[:, None] * directions, axis=0)
-            direction /= np.linalg.norm(direction)
-            beta_min_values = np.asarray(
-                [member.beta_min_m for member in members], dtype=float
-            )
-            beta_max_values = np.asarray(
-                [member.beta_max_m for member in members], dtype=float
-            )
-            # 扰动样本互为替代，并非必须同时成立的多条证据。上下界各取加权
-            # 中位数，可抵抗少量极端样本，又能给出一条明确的代表有效区间。
-            beta_min = _weighted_median(beta_min_values, weights)
-            beta_max = _weighted_median(beta_max_values, weights)
+            member_distances = distances[np.ix_(component, component)]
+            medoid_index = int(np.argmin(member_distances @ weights))
+            representative = members[medoid_index]
+            beta_min_values = np.asarray([member.beta_min_m for member in members])
+            beta_max_values = np.asarray([member.beta_max_m for member in members])
             observed_delays = [member.observed_delay_s for member in members]
             observed_angles = [member.observed_aoa_global_rad for member in members]
             empirical_frequency = len({member.sample_id for member in members}) / max(
@@ -370,46 +359,52 @@ def cluster_reverse_candidates(
             )
             metadata = {
                 "topology_id": topology_id,
-                "reflection_wall_ids": list(members[0].reflection_wall_ids),
+                "reflection_wall_ids": list(representative.reflection_wall_ids),
                 "raw_count": len(members),
                 "source_sample_ids": [member.sample_id for member in members],
-                "prefix_length_m": float(
-                    np.sum(weights * np.asarray([member.prefix_length_m for member in members]))
-                ),
-                "endpoint_origin_m": list(members[0].endpoint_origin_m),
-                "reflection_points_m": [
-                    list(point) for point in members[0].reflection_points_m
-                ],
-                "observed_delay_range_s": [
-                    float(min(observed_delays)),
-                    float(max(observed_delays)),
-                ],
-                "observed_aoa_range_rad": [
-                    float(min(observed_angles)),
-                    float(max(observed_angles)),
-                ],
+                "representative_sample_id": representative.sample_id,
+                "observed_aoa_global_rad": float(representative.observed_aoa_global_rad),
+                "observed_delay_s": float(representative.observed_delay_s),
+                "prefix_length_m": float(representative.prefix_length_m),
+                "endpoint_origin_m": list(representative.endpoint_origin_m),
+                "reflection_points_m": [list(point) for point in representative.reflection_points_m],
+                "observed_delay_range_s": [float(min(observed_delays)), float(max(observed_delays))],
+                "observed_aoa_range_rad": [float(min(observed_angles)), float(max(observed_angles))],
                 "empirical_frequency": float(empirical_frequency),
-                "member_beta_min_range_m": [
-                    float(np.min(beta_min_values)),
-                    float(np.max(beta_min_values)),
+                "empirical_frequency_denominator": "distinct_samples_with_valid_reverse_candidate",
+                "observation_valid_sample_count": len(observation_sample_ids[observation_id]),
+                "member_beta_min_range_m": [float(np.min(beta_min_values)), float(np.max(beta_min_values))],
+                "member_beta_max_range_m": [float(np.min(beta_max_values)), float(np.max(beta_max_values))],
+                "shared_beta_interval_m": [float(np.max(beta_min_values)), float(np.min(beta_max_values))],
+                "representative_rule": "weighted_medoid_actual_member",
+                "cluster_distance_rule": "maximum_over_shared_beta_interval",
+                "cluster_linkage_rule": "deterministic_greedy_complete_compatibility",
+                "maximum_member_trajectory_distance_m": float(np.max(member_distances)),
+                "maximum_member_direction_difference_deg": float(
+                    np.max(direction_distances[np.ix_(component, component)])
+                ),
+                "members": [
+                    {
+                        "sample_id": member.sample_id,
+                        "anchor_m": list(member.anchor_m),
+                        "direction": list(member.direction),
+                        "beta_min_m": float(member.beta_min_m),
+                        "beta_max_m": float(member.beta_max_m),
+                        "observed_aoa_global_rad": float(member.observed_aoa_global_rad),
+                        "observed_delay_s": float(member.observed_delay_s),
+                        "weight": float(member.weight),
+                    }
+                    for member in members
                 ],
-                "member_beta_max_range_m": [
-                    float(np.min(beta_max_values)),
-                    float(np.max(beta_max_values)),
-                ],
-                "representative_rule": "weighted_mean_with_weighted_median_endpoints",
-                "cluster_distance_rule": "minimum_over_shared_beta_interval",
             }
             representatives.append(
                 CandidateTrajectory(
                     observation_id=observation_id,
                     candidate_id=f"{observation_id}:{topology_id}:cluster_{component_index}",
-                    anchor_m=anchor,
-                    direction=direction,
-                    beta_min_m=beta_min,
-                    beta_max_m=beta_max,
-                    # 簇频率是候选先验，不是位置残差的逆方差。第一版没有校准
-                    # 候选协方差，因此所有代表轨迹使用相同拟合权重。
+                    anchor_m=representative.anchor_m,
+                    direction=representative.direction,
+                    beta_min_m=representative.beta_min_m,
+                    beta_max_m=representative.beta_max_m,
                     weight=1.0,
                     metadata=metadata,
                 )

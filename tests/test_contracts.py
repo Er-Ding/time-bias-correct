@@ -566,9 +566,9 @@ def test_existing_run11_manifest_scene_and_online_file_satisfy_contract() -> Non
     validate_localization_input_contract(manifest, stage, config, scene, measurement)
 
     assert stage == "sionna_rt_to_deepmimo_v4"
-    assert bundle_id == (
-        "342d0e5978e3578801fca6de4dcaea418201d33758491e62e49ec9f127321f48"
-    )
+    # 外部 smoke 产物可由用户重新生成；校验当前清单和内容绑定，
+    # 不把某次历史运行的摘要写死成场景语义要求。
+    assert bundle_id == manifest["bundle_id"] == generation_bundle_id(manifest)
     assert scene.name == "munich_bev"
     assert scene.source == "sionna_exported_triangle_mesh"
     assert manifest_path.read_bytes() == manifest_bytes_before

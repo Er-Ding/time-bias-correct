@@ -282,8 +282,7 @@ def localized_run(tmp_path) -> dict[str, object]:
     config = deepcopy(DEFAULT_CONFIG)
     root = tmp_path / "run"
     config["output"]["root"] = str(root)
-    config["music"]["uncertainty_repeats"] = 1
-    config["music"]["uncertainty_min_relative_height"] = 1.0
+    config["music"]["spectrum_sampling"].update(samples_per_peak=8, local_grid_points_per_axis=9)
     source_config = tmp_path / "source_config.yaml"
     source_config.write_text("# 仅用于测试来源路径\n", encoding="utf-8")
     config["_config_path"] = str(source_config)
@@ -331,15 +330,16 @@ def test_successful_evaluation_is_bound_to_localization_run(
         Path(manifest["config_snapshot"]["path"]).read_text(encoding="utf-8")
     )
     assert manifest["evaluation_pending"] is False
-    assert manifest["schema_version"] == 3
+    assert manifest["schema_version"] == 4
+    assert manifest["workflow"] == "music_spectrum_sampling_v1"
     expected_artifacts = {
         "result": "localization_result.json",
         "music_spectrum": "music_spectrum.npz",
-        "uncertainty_solutions": "uncertainty_solutions.npz",
+        "spectrum_samples": "spectrum_samples.json",
         "music_peaks": "music_peaks.json",
         "raw_reverse_candidates": "raw_reverse_candidates.json",
         "clustered_candidates": "clustered_candidates.json",
-        "bootstrap_diagnostics": "bootstrap_diagnostics.json",
+        "forward_check": "forward_check.json",
     }
     assert set(manifest["artifacts"]) == set(expected_artifacts)
     for artifact_name, file_name in expected_artifacts.items():
@@ -1384,7 +1384,7 @@ def test_localize_computation_failure_does_not_archive_old_evaluation(
         raise RuntimeError("planned-computation-failure")
 
     monkeypatch.setattr(
-        pipeline_module, "music_2d_spectrum", fail_during_computation
+        pipeline_module, "get_music_computer", fail_during_computation
     )
     with pytest.raises(RuntimeError, match="planned-computation-failure"):
         localize(
@@ -1836,6 +1836,54 @@ def test_run_evaluate_script_rejects_non_evaluation_manifest_changes(
         manifest_path.write_bytes(evaluated_manifest_bytes)
 
 
+def _write_legacy_archive_fixture(root: Path, schema_version: int) -> None:
+    """构造旧版的文件集合和来源链；不能只改新版清单的版本号。"""
+    localization = root / "localization"
+    result_path = localization / "localization_result.json"
+    result = json.loads(result_path.read_text(encoding="utf-8"))
+    result.pop("workflow", None)
+    result.pop("forward_check", None)
+    result["output_type"] = "gaussian_position_estimate"
+    result["diagnostics"]["covariance_source"] = "nominal_fallback_no_solved_perturbation"
+    _write_json(result_path, result)
+    # 这里表示历史运行的扰动样本全部失败，保留其空解集合。
+    np.savez(localization / "uncertainty_solutions.npz", positions_m=np.empty((0, 2)),
+             betas_m=np.empty(0), sigmas_m2=np.empty((0, 2, 2)), weights=np.empty(0))
+    _write_json(localization / "bootstrap_diagnostics.json", [])
+    peaks_path = localization / "music_peaks.json"
+    peaks = json.loads(peaks_path.read_text(encoding="utf-8"))
+    peaks.pop("workflow", None)
+    peaks["nominal_observation_samples"] = [sample for sample in peaks.pop("observation_samples", [])
+                                               if sample["sample_id"].endswith(":nominal")]
+    peaks["perturbed_observation_samples"] = []
+    peaks["associations"] = []
+    _write_json(peaks_path, peaks)
+    metrics_path = root / "evaluation/metrics.json"
+    metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
+    metrics["schema_version"] = schema_version
+    metrics["source_result_sha256"] = file_sha256(result_path)
+    if schema_version == 2:
+        metrics.pop("generation_bundle_id")
+        metrics.pop("source_generation_manifest_sha256")
+    _write_json(metrics_path, metrics)
+    manifest_path = localization / "localization_manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["schema_version"] = schema_version
+    manifest.pop("workflow", None)
+    manifest["artifacts"] = {key: artifact_record(localization / name) for key, name in {
+        "result": "localization_result.json", "music_spectrum": "music_spectrum.npz",
+        "music_peaks": "music_peaks.json", "raw_reverse_candidates": "raw_reverse_candidates.json",
+        "clustered_candidates": "clustered_candidates.json", "uncertainty_solutions": "uncertainty_solutions.npz",
+        "bootstrap_diagnostics": "bootstrap_diagnostics.json"}.items()}
+    if schema_version == 2:
+        manifest.pop("generation_bundle")
+        manifest.pop("truth_access")
+        # 第 2 版仅记录主结果摘要，归档时需要补录诊断文件摘要。
+        manifest["artifacts"] = {"result": manifest["artifacts"]["result"]}
+    manifest["evaluation"] = artifact_record(metrics_path)
+    _write_json(manifest_path, manifest)
+
+
 def test_localize_archives_legacy_schema2_evaluation_without_forging_sources(
     localized_run: dict[str, object],
 ) -> None:
@@ -1857,25 +1905,9 @@ def test_localize_archives_legacy_schema2_evaluation_without_forging_sources(
         ),
     )
 
-    legacy_metrics = json.loads(metrics_path.read_text(encoding="utf-8"))
-    legacy_metrics["schema_version"] = 2
-    legacy_metrics.pop("generation_bundle_id")
-    legacy_metrics.pop("source_generation_manifest_sha256")
-    metrics_path.write_text(
-        json.dumps(legacy_metrics, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
+    _write_legacy_archive_fixture(root, 2)
     legacy_metrics_bytes = metrics_path.read_bytes()
     legacy_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    legacy_manifest["schema_version"] = 2
-    legacy_manifest.pop("generation_bundle")
-    legacy_manifest.pop("truth_access")
-    legacy_manifest["artifacts"] = {
-        "result": legacy_manifest["artifacts"]["result"]
-    }
-    legacy_manifest["evaluation"]["sha256"] = file_sha256(metrics_path)
-    manifest_path.write_text(
-        json.dumps(legacy_manifest, ensure_ascii=False, indent=2), encoding="utf-8"
-    )
     old_run_id = legacy_manifest["run_id"]
 
     rerun_config_path = root.parent / "schema2_rerun.yaml"
@@ -1883,8 +1915,7 @@ def test_localize_archives_legacy_schema2_evaluation_without_forging_sources(
         json.dumps(
             {
                 "music": {
-                    "uncertainty_repeats": 1,
-                    "uncertainty_min_relative_height": 1.0,
+                    "spectrum_sampling": {"samples_per_peak": 8, "local_grid_points_per_axis": 9},
                 },
                 "output": {"root": str(root)},
             },
@@ -1945,8 +1976,9 @@ def test_localize_archives_legacy_schema2_evaluation_without_forging_sources(
         assert file_sha256(record["path"]) == record["sha256"]
 
 
-def test_schema3_archive_uses_frozen_records_after_generation_manifest_updates(
-    localized_run: dict[str, object],
+@pytest.mark.parametrize("schema_version", [3, 4])
+def test_archive_uses_frozen_records_after_generation_manifest_updates(
+    localized_run: dict[str, object], schema_version,
 ) -> None:
     root = Path(localized_run["root"])
     config = localized_run["config"]
@@ -1965,6 +1997,8 @@ def test_schema3_archive_uses_frozen_records_after_generation_manifest_updates(
             root / "localization" / "localization_result.json"
         ),
     )
+    if schema_version == 3:
+        _write_legacy_archive_fixture(root, 3)
     old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     old_run_id = old_manifest["run_id"]
     old_generation_sha256 = old_manifest["generation_bundle"]["manifest"][
@@ -2001,6 +2035,7 @@ def test_schema3_archive_uses_frozen_records_after_generation_manifest_updates(
     assert archived_manifest["generation_bundle"]["manifest"]["sha256"] == (
         old_generation_sha256
     )
+    assert archived_manifest["schema_version"] == schema_version
     new_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     assert new_manifest["generation_bundle"]["manifest"]["sha256"] == file_sha256(
         generation_manifest_path
@@ -2014,8 +2049,7 @@ def test_run_offline_demo_twice_archives_first_completed_run(tmp_path) -> None:
         json.dumps(
             {
                 "music": {
-                    "uncertainty_repeats": 1,
-                    "uncertainty_min_relative_height": 1.0,
+                    "spectrum_sampling": {"samples_per_peak": 8, "local_grid_points_per_axis": 9},
                 },
                 "output": {"root": str(output_root)},
             },
@@ -2051,8 +2085,7 @@ def test_run_offline_demo_generation_failure_preserves_old_sources_in_history(
         json.dumps(
             {
                 "music": {
-                    "uncertainty_repeats": 1,
-                    "uncertainty_min_relative_height": 1.0,
+                    "spectrum_sampling": {"samples_per_peak": 8, "local_grid_points_per_axis": 9},
                 },
                 "output": {"root": str(output_root)},
             },
@@ -2255,7 +2288,7 @@ def test_offline_generated_path_count_does_not_follow_signal_rank() -> None:
     assert truth["path_selection"]["front_facing_only"] is True
 
 
-def test_localize_routes_signal_rank_to_music_and_blind_noise(
+def test_localize_routes_signal_rank_to_single_music_preparation(
     tmp_path, monkeypatch
 ) -> None:
     config = deepcopy(DEFAULT_CONFIG)
@@ -2326,21 +2359,14 @@ def test_localize_routes_signal_rank_to_music_and_blind_noise(
     )
     calls: dict[str, int] = {}
 
-    def fake_music(*args, num_sources, aoa_grid_rad, delay_grid_s, **kwargs):
-        calls["music"] = num_sources
-        spectrum = np.zeros((len(aoa_grid_rad), len(delay_grid_s)), dtype=float)
-        spectrum[10, 10] = 2.0
-        spectrum[80, 80] = 1.0
-        return spectrum
-
-    def stop_after_noise(csi, num_sources):
-        calls["noise"] = num_sources
+    def stop_after_prepare(self, csi, *, num_sources, **kwargs):
+        calls["prepare"] = num_sources
+        assert csi.shape == (1, 12, 96)
+        np.testing.assert_array_equal(csi, np.zeros_like(csi))
         raise RuntimeError("rank-routing-complete")
 
-    monkeypatch.setattr(pipeline_module, "music_2d_spectrum", fake_music)
-    monkeypatch.setattr(
-        pipeline_module, "estimate_noise_std_from_observed_csi", stop_after_noise
-    )
+    from time_bias_localization.compute import MusicComputer
+    monkeypatch.setattr(MusicComputer, "prepare", stop_after_prepare)
 
     with pytest.raises(RuntimeError, match="rank-routing-complete"):
         localize(
@@ -2351,19 +2377,52 @@ def test_localize_routes_signal_rank_to_music_and_blind_noise(
             output_root=root,
         )
 
-    assert calls == {"music": 6, "noise": 6}
+    assert calls == {"prepare": 6}
 
 
-def test_offline_pipeline_outputs_gaussian_without_accept_reject(tmp_path) -> None:
+def test_spectrum_sampling_flows_into_one_clustered_joint_solution(tmp_path, monkeypatch) -> None:
     config = deepcopy(DEFAULT_CONFIG)
     config["output"]["root"] = str(tmp_path / "run")
-    config["music"]["uncertainty_repeats"] = 3
-    # 每次扰动只保留最高峰，故必然漏掉其余 nominal 路径。最终均值应回退
-    # 完整 nominal 解，而不是被不完整的扰动解拉走；失败只放大协方差。
-    config["music"]["uncertainty_min_relative_height"] = 1.0
+    config["music"]["spectrum_sampling"].update(samples_per_peak=8, local_grid_points_per_axis=9)
     root = tmp_path / "run"
     scene = prepare_scene(config, root)
     data = generate_data(config, scene_json=scene["scene_json"], output_root=root)
+    # 每条旧入口一旦被调用立即失败，验证主流程没有重新加噪或汇总扰动解。
+    def reject_legacy_call(*args, **kwargs):
+        raise AssertionError("谱面采样主流程不应进入 CSI 扰动支路")
+    for name in ("estimate_noise_std_from_observed_csi", "estimate_music_peak_samples",
+                 "_bootstrap_joint_solutions", "_distribution_statistics"):
+        monkeypatch.setattr(pipeline_module, name, reject_legacy_call)
+    observed = load_online_measurement(data["online_npz"]).csi_observed.copy()
+    from time_bias_localization.compute import MusicComputer
+    real_prepare = MusicComputer.prepare
+    real_reverse = pipeline_module.generate_reverse_candidates
+    real_cluster = pipeline_module.cluster_reverse_candidates
+    real_solve = pipeline_module.solve_position_and_bias
+    counts = {"prepare": 0, "solve": 0}
+    recorded = {}
+    def capture_prepare(self, csi, **kwargs):
+        counts["prepare"] += 1
+        np.testing.assert_array_equal(csi, observed)
+        return real_prepare(self, csi, **kwargs)
+    def capture_reverse(scene, bs, samples, **kwargs):
+        recorded["samples"] = list(samples)
+        output = real_reverse(scene, bs, recorded["samples"], **kwargs)
+        recorded["raw"] = output
+        return output
+    def capture_cluster(raw, **kwargs):
+        assert raw is recorded["raw"]
+        output = real_cluster(raw, **kwargs)
+        recorded["clusters"] = output
+        return output
+    def capture_solve(clusters, *args, **kwargs):
+        counts["solve"] += 1
+        assert clusters is recorded["clusters"]
+        return real_solve(clusters, *args, **kwargs)
+    monkeypatch.setattr(MusicComputer, "prepare", capture_prepare)
+    monkeypatch.setattr(pipeline_module, "generate_reverse_candidates", capture_reverse)
+    monkeypatch.setattr(pipeline_module, "cluster_reverse_candidates", capture_cluster)
+    monkeypatch.setattr(pipeline_module, "solve_position_and_bias", capture_solve)
     result = localize(
         localization_config_view(config),
         scene_json=scene["scene_json"],
@@ -2380,11 +2439,16 @@ def test_offline_pipeline_outputs_gaussian_without_accept_reject(tmp_path) -> No
     )
     assert "accept" not in serialized
     assert "reject" not in serialized
-    assert serialized["diagnostics"]["uncertainty_solution_count"] == 0
-    assert serialized["diagnostics"]["uncertainty_failed_count"] == 3
+    assert counts == {"prepare": 1, "solve": 1}
+    assert len(recorded["samples"]) == 3 * (8 + 1)
+    assert len({sample.sample_id for sample in recorded["samples"]}) == 27
+    assert len(recorded["raw"]) > len(recorded["clusters"])
+    assert any(candidate.metadata["raw_count"] > 1 for candidate in recorded["clusters"])
+    np.testing.assert_array_equal(serialized["mu_m"], serialized["central_solution"]["mu_m"])
+    assert serialized["clock_bias_s"] == serialized["central_solution"]["clock_bias_s"]
     assert (
         serialized["diagnostics"]["covariance_source"]
-        == "nominal_fallback_no_solved_perturbation"
+        == "selected_candidate_geometric_residual_approximation"
     )
     manifest = json.loads(
         (root / "localization" / "localization_manifest.json").read_text(encoding="utf-8")

@@ -190,7 +190,7 @@ def test_clustering_never_mixes_observations_or_topologies() -> None:
     assert {candidate.observation_id for candidate in clustered} == {"obs_a", "obs_b"}
 
 
-def test_clustering_compares_trajectories_inside_shared_beta_interval() -> None:
+def test_clustering_does_not_merge_trajectories_that_only_cross_at_one_beta() -> None:
     beta_m = 20.0
     first_direction = np.asarray((1.0, 0.0))
     angle_rad = np.deg2rad(5.0)
@@ -217,13 +217,13 @@ def test_clustering_compares_trajectories_inside_shared_beta_interval() -> None:
 
     # 两个 anchor 相距约 1.74 m，但两条轨迹在 beta=20 m 处相交。
     assert np.linalg.norm(np.asarray(raw[0].anchor_m) - np.asarray(raw[1].anchor_m)) > 1.0
-    assert len(clustered) == 1
+    assert len(clustered) == 2
     assert clustered[0].metadata["cluster_distance_rule"] == (
-        "minimum_over_shared_beta_interval"
+        "maximum_over_shared_beta_interval"
     )
 
 
-def test_representative_interval_uses_weighted_median_not_strict_intersection() -> None:
+def test_cluster_preserves_actual_representative_interval_and_rejects_interval_chains() -> None:
     raw = [
         _raw_candidate(sample_id="sample-0", beta_interval_m=(0.0, 4.0)),
         _raw_candidate(sample_id="sample-1", beta_interval_m=(3.0, 7.0)),
@@ -232,15 +232,44 @@ def test_representative_interval_uses_weighted_median_not_strict_intersection() 
 
     clustered = cluster_reverse_candidates(raw)
 
-    # 三个替代样本没有全体交集，但中位数端点仍给出典型区间 [3, 7]。
-    assert len(clustered) == 1
-    assert clustered[0].beta_min_m == 3.0
-    assert clustered[0].beta_max_m == 7.0
+    # 0 和 2 没有共同有效区间，不能通过 1 的链式连接而被合并。
+    assert len(clustered) == 2
+    assert clustered[0].beta_min_m == 0.0
+    assert clustered[0].beta_max_m == 4.0
     assert clustered[0].metadata["representative_rule"] == (
-        "weighted_mean_with_weighted_median_endpoints"
+        "weighted_medoid_actual_member"
     )
-    assert clustered[0].metadata["member_beta_min_range_m"] == [0.0, 6.0]
-    assert clustered[0].metadata["member_beta_max_range_m"] == [4.0, 10.0]
+    assert clustered[0].metadata["member_beta_min_range_m"] == [0.0, 3.0]
+    assert clustered[0].metadata["member_beta_max_range_m"] == [4.0, 7.0]
+    assert clustered[0].metadata["shared_beta_interval_m"] == [3.0, 4.0]
+
+
+def test_cluster_diameter_cannot_grow_through_neighbor_chains() -> None:
+    raw = [
+        _raw_candidate(sample_id=str(index), anchor_m=(0.9 * index, 0.0))
+        for index in range(3)
+    ]
+    clusters = cluster_reverse_candidates(raw, position_radius_m=1.0)
+    assert len(clusters) == 2
+    assert [item.metadata["raw_count"] for item in clusters] == [2, 1]
+    assert all(item.metadata["maximum_member_trajectory_distance_m"] <= 1.0 for item in clusters)
+
+
+def test_representative_is_medoid_actual_member_with_its_original_geometry() -> None:
+    raw = [
+        _raw_candidate(sample_id=str(index), anchor_m=(offset, 0.0),
+                       beta_interval_m=(index, 10.0 + index))
+        for index, offset in enumerate((0.0, 0.2, 0.7))
+    ]
+    representative, = cluster_reverse_candidates(raw)
+    assert representative.metadata["representative_sample_id"] == "1"
+    np.testing.assert_array_equal(representative.anchor_m, raw[1].anchor_m)
+    np.testing.assert_array_equal(representative.direction, raw[1].direction)
+    assert representative.beta_interval == (1.0, 11.0)
+    assert representative.metadata["source_sample_ids"] == ["0", "1", "2"]
+    assert [item["sample_id"] for item in representative.metadata["members"]] == ["0", "1", "2"]
+    reordered, = cluster_reverse_candidates(list(reversed(raw)))
+    assert reordered.metadata == representative.metadata
 
 
 def test_cluster_frequency_is_metadata_not_solver_weight() -> None:

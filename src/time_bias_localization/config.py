@@ -50,13 +50,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "delay_step_s": 1e-9,
         "min_angle_separation_deg": 5.0,
         "min_delay_separation_s": 3e-9,
-        "association_max_normalized_distance": 3.0,
-        "false_peak_penalty": 4.0,
-        "missed_peak_penalty": 9.0,
-        "uncertainty_repeats": 12,
-        "uncertainty_extra_peaks": 2,
-        "uncertainty_min_relative_height": 0.01,
-        "uncertainty_noise_scale": 0.35,
+        "spectrum_sampling": {
+            "samples_per_peak": 128,
+            "aoa_half_width_grid_steps": 1.5,
+            "delay_half_width_grid_steps": 1.5,
+            "local_grid_points_per_axis": 25,
+            "spectrum_power": 1.0,
+            "uniform_mixture": 0.1,
+            "include_nominal": True,
+        },
         "spatial_subarray_size": 8,
         "frequency_subarray_size": 32,
         "diagonal_loading": 1e-8,
@@ -69,6 +71,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "candidate_delay_samples": 5,
         "huber_delta_m": 0.75,
         "max_iterations": 20,
+        "max_seed_pairs": 100000,
         "candidate_cluster_radius_m": 1.5,
         "candidate_direction_radius_deg": 5.0,
     },
@@ -114,13 +117,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "delay_step_s",
             "min_angle_separation_deg",
             "min_delay_separation_s",
-            "association_max_normalized_distance",
-            "false_peak_penalty",
-            "missed_peak_penalty",
-            "uncertainty_repeats",
-            "uncertainty_extra_peaks",
-            "uncertainty_min_relative_height",
-            "uncertainty_noise_scale",
+            "spectrum_sampling",
             "spatial_subarray_size",
             "frequency_subarray_size",
             "diagonal_loading",
@@ -134,11 +131,29 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "candidate_direction_radius_deg",
             "huber_delta_m",
             "max_iterations",
+            "max_seed_pairs",
         }
     ),
     "output": frozenset({"root"}),
 }
 _LOCALIZATION_SECTION_NAMES = tuple(_LOCALIZATION_SECTION_FIELDS)
+
+_REMOVED_MUSIC_FIELDS = frozenset({
+    "association_max_normalized_distance", "false_peak_penalty", "missed_peak_penalty",
+    "uncertainty_repeats", "uncertainty_extra_peaks",
+    "uncertainty_min_relative_height", "uncertainty_noise_scale",
+})
+
+
+def _reject_removed_music_fields(config: Mapping[str, Any]) -> None:
+    music = config.get("music", {})
+    if isinstance(music, Mapping):
+        removed = sorted(_REMOVED_MUSIC_FIELDS.intersection(music))
+        if removed:
+            raise ValueError(
+                f"CSI 重复加噪流程已移除，旧 music 参数不能继续使用：{removed}；"
+                "请改用 music.spectrum_sampling 配置谱面采样"
+            )
 
 
 def _merge_dict(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -186,6 +201,7 @@ def _apply_legacy_signal_rank(config: dict[str, Any], loaded: dict[str, Any]) ->
 def _validate_localization_input_fields(loaded: Mapping[str, Any]) -> None:
     """拒绝定位配置各段中未定义的字段，防止把真值藏在合法段名下。"""
 
+    _reject_removed_music_fields(loaded)
     for section_name, allowed_fields in _LOCALIZATION_SECTION_FIELDS.items():
         if section_name not in loaded:
             continue
@@ -281,6 +297,7 @@ def localization_config_view(full_config: dict[str, Any]) -> dict[str, Any]:
 
     if not isinstance(full_config, dict):
         raise TypeError("full_config 必须是键值映射")
+    _reject_removed_music_fields(full_config)
     selected = _filter_localization_sections(full_config)
     # 旧生成配置把 BS 与 UE 一起放在 simulation。BS 是定位时已知的接收端
     # 先验，因此只提升 BS 位置；UE 位置、时钟偏差和信噪比均不会进入定位视图。
@@ -352,6 +369,7 @@ def validate_config(config: dict[str, Any]) -> None:
 def _validate_localization_sections(config: dict[str, Any]) -> None:
     """校验生成和定位共同使用、且不含仿真真值的配置段。"""
 
+    _reject_removed_music_fields(config)
     compute = config.get("compute", DEFAULT_CONFIG["compute"])
     if not isinstance(compute, Mapping):
         raise ValueError("compute 必须是键值映射")
@@ -420,6 +438,7 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
     ):
         _positive_float(name, localization[name])
     _positive_integer("max_iterations", localization["max_iterations"])
+    _positive_integer("max_seed_pairs", localization.get("max_seed_pairs", 100000))
 
     angle_min = _finite_float("angle_min_deg", music["angle_min_deg"])
     angle_max = _finite_float("angle_max_deg", music["angle_max_deg"])
@@ -454,38 +473,33 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
     diagonal_loading = _finite_float("diagonal_loading", music["diagonal_loading"])
     if diagonal_loading < 0.0:
         raise ValueError("diagonal_loading 不能为负数")
-    _positive_float(
-        "association_max_normalized_distance",
-        music["association_max_normalized_distance"],
-    )
-    false_peak_penalty = _finite_float(
-        "false_peak_penalty", music["false_peak_penalty"]
-    )
-    missed_peak_penalty = _finite_float(
-        "missed_peak_penalty", music["missed_peak_penalty"]
-    )
-    if false_peak_penalty < 0.0:
-        raise ValueError("false_peak_penalty 不能为负数")
-    if missed_peak_penalty <= false_peak_penalty:
-        raise ValueError("missed_peak_penalty 必须大于 false_peak_penalty")
     for name in (
         "angle_step_deg",
         "delay_step_s",
         "min_angle_separation_deg",
         "min_delay_separation_s",
-        "uncertainty_noise_scale",
     ):
         _positive_float(name, music[name])
-    repeats = _nonnegative_integer("uncertainty_repeats", music["uncertainty_repeats"])
-    if repeats < 1:
-        raise ValueError("uncertainty_repeats 必须是正整数")
-    _nonnegative_integer("uncertainty_extra_peaks", music["uncertainty_extra_peaks"])
-    relative_height = _finite_float(
-        "uncertainty_min_relative_height",
-        music["uncertainty_min_relative_height"],
-    )
-    if not 0.0 <= relative_height <= 1.0:
-        raise ValueError("uncertainty_min_relative_height 必须位于 [0, 1]")
+    sampling = music.get("spectrum_sampling")
+    if not isinstance(sampling, Mapping):
+        raise ValueError("music.spectrum_sampling 必须是键值映射")
+    expected = set(DEFAULT_CONFIG["music"]["spectrum_sampling"])
+    if set(sampling) != expected:
+        raise ValueError(
+            "music.spectrum_sampling 字段不完整或包含未定义字段："
+            f"缺少={sorted(expected.difference(sampling))}；"
+            f"未定义={sorted(str(key) for key in set(sampling).difference(expected))}"
+        )
+    _positive_integer("samples_per_peak", sampling["samples_per_peak"])
+    if _positive_integer("local_grid_points_per_axis", sampling["local_grid_points_per_axis"]) < 3:
+        raise ValueError("local_grid_points_per_axis 至少为 3")
+    for name in ("aoa_half_width_grid_steps", "delay_half_width_grid_steps", "spectrum_power"):
+        _positive_float(name, sampling[name])
+    mixture = _finite_float("uniform_mixture", sampling["uniform_mixture"])
+    if not 0.0 <= mixture <= 1.0:
+        raise ValueError("uniform_mixture 必须位于 [0, 1]")
+    if not isinstance(sampling["include_nominal"], bool):
+        raise ValueError("include_nominal 必须为布尔值")
 
     _nonnegative_integer("random_seed", config["project"]["random_seed"])
 

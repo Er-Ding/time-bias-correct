@@ -5,9 +5,10 @@ set -euo pipefail
 PROJECT_ROOT="${PROJECT_ROOT:-/data/zhujun/differt_projects/time-bias-correct}"
 PYTHON_BIN="${PYTHON_BIN:-${PROJECT_ROOT}/.sionna-venv/bin/python}"
 CUDA_TOOLKIT_ROOT="${CUDA_TOOLKIT_ROOT:-/usr/local/cuda-12.2}"
-INPUT_ROOT="${INPUT_ROOT:-${PROJECT_ROOT}/outputs/munich_30ue_5noise_20260907T093955_528235/UE001/repeat_000}"
+INPUT_ROOT="${INPUT_ROOT:-${PROJECT_ROOT}/outputs/gpu_munich_20260908T020052_1904235/UE001/repeat_000}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-${PROJECT_ROOT}/outputs/gpu_benchmark_$(date -u +%Y%m%dT%H%M%S)_$$}"
-# full：相同输入的完整定位，含候选、聚类、联合求解和扰动传播；kernel：仅 MUSIC 谱与峰。
+# full：完整的谱面采样、反向候选、聚类与联合求解；kernel：一次分解、全局谱与局部连续采样。
+# 两种模式均不对观测 CSI 额外加噪；计时排除设备预热。
 MODE="${MODE:-full}"
 # GPU_ID 是宿主机 GPU 编号。进程只看见该卡，故 Python 中 device_id 固定为 0。
 GPU_ID="${GPU_ID:-0}"
@@ -16,8 +17,8 @@ ANGLE_CHUNK_SIZE="${ANGLE_CHUNK_SIZE:-32}"
 BLAS_THREADS="${BLAS_THREADS:-1}"
 # 1：CPU/GPU 都定位完成后才独立读取真值评估；0：只比较输出，不读取真值内容。
 EVALUATE="${EVALUATE:-0}"
-# 可选定位专用配置；空值使用 INPUT_ROOT/localization.yaml。
-LOCALIZATION_CONFIG="${LOCALIZATION_CONFIG:-}"
+# 定位专用配置：重放历史 CSI 时也使用当前谱面采样配置，不加载原目录中的旧扰动配置。
+LOCALIZATION_CONFIG="${LOCALIZATION_CONFIG:-${PROJECT_ROOT}/configs/deepmimo_sionna_munich_localization.yaml}"
 # ===================================================================
 
 if [[ ! "${GPU_ID}" =~ ^[0-9]+$ || ! "${EVALUATE}" =~ ^[01]$ ]]; then

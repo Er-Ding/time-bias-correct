@@ -64,6 +64,24 @@ def test_two_observations_recover_exact_position_and_bias() -> None:
     assert max(result.residuals.values()) < 1e-9
 
 
+def test_seed_pair_budget_is_checked_before_generating_all_pairs() -> None:
+    candidates = [
+        _candidate(f"path-{group}", f"candidate-{index}", np.array([1.0, 2.0]),
+                   3.0, _unit(90.0 * group))
+        for group in range(2) for index in range(3)
+    ]
+    with pytest.raises(SolverError, match="9.*max_seed_pairs=8"):
+        solve_position_and_bias(candidates, SolverConfig(max_seed_pairs=8))
+    result = solve_position_and_bias(candidates, SolverConfig(max_seed_pairs=9))
+    np.testing.assert_allclose(result.mu, [1.0, 2.0], atol=1e-9)
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 3.5])
+def test_seed_pair_budget_must_be_positive_integer(budget) -> None:
+    with pytest.raises(ValueError, match="max_seed_pairs"):
+        SolverConfig(max_seed_pairs=budget)
+
+
 def test_multiple_observations_use_one_shared_solution() -> None:
     true_mu = np.array((12.0, 5.0))
     true_beta = 3.25

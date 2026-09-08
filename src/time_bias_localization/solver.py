@@ -143,6 +143,7 @@ class SolverConfig:
     rank_tolerance: float = 1e-10
     max_condition_number: float = 1e12
     max_seeds: int = 512
+    max_seed_pairs: int = 100_000
     missing_observation_penalty: float | None = None
     covariance_floor: float = 1e-10
     downweight_threshold: float = 0.999
@@ -167,6 +168,7 @@ class SolverConfig:
             "max_iterations": self.max_iterations,
             "max_irls_iterations": self.max_irls_iterations,
             "max_seeds": self.max_seeds,
+            "max_seed_pairs": self.max_seed_pairs,
         }
         for name, value in integer_values.items():
             if isinstance(value, (bool, np.bool_)) or not isinstance(
@@ -542,6 +544,17 @@ def _make_seeds(
     groups: Mapping[Hashable, tuple[CandidateTrajectory, ...]],
     config: SolverConfig,
 ) -> list[Array]:
+    # max_seeds 只限制后续精修，无法约束此前的候选对生成和评分。
+    # 先显式检查预算，绝不按输入顺序静默丢弃部分观测的候选组合。
+    pair_count = sum(
+        len(groups[first_id]) * len(groups[second_id])
+        for first_id, second_id in combinations(groups, 2)
+    )
+    if pair_count > config.max_seed_pairs:
+        raise SolverError(
+            f"跨观测候选对数量 {pair_count} 超过 max_seed_pairs={config.max_seed_pairs}；"
+            "请检查第一次聚类半径与采样范围，或明确提高候选对预算"
+        )
     seeds: list[Array] = []
     seen: set[tuple[float, float, float]] = set()
     for first_id, second_id in combinations(groups, 2):

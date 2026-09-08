@@ -52,7 +52,9 @@ from .provenance import (
     verify_generation_artifact,
 )
 from .scene import Scene2D, make_synthetic_room
-from .music_stage import estimate_batched_peak_samples, get_music_computer
+from .music_stage import get_music_computer
+from .spectrum_sampling import sample_music_spectrum
+from .forward_check import forward_check_solution
 from .signal import (
     MusicPeak2D,
     MusicPeakSamples,
@@ -300,7 +302,7 @@ def _write_new_json_atomic(path: Path, data: Any) -> None:
                 pass
 
 
-_LOCALIZATION_ARTIFACT_FILENAMES = {
+_LEGACY_LOCALIZATION_ARTIFACT_FILENAMES = {
     "result": "localization_result.json",
     "music_spectrum": "music_spectrum.npz",
     "uncertainty_solutions": "uncertainty_solutions.npz",
@@ -309,6 +311,25 @@ _LOCALIZATION_ARTIFACT_FILENAMES = {
     "clustered_candidates": "clustered_candidates.json",
     "bootstrap_diagnostics": "bootstrap_diagnostics.json",
 }
+
+WORKFLOW = "music_spectrum_sampling_v1"
+_LOCALIZATION_ARTIFACT_FILENAMES = {
+    "result": "localization_result.json",
+    "music_spectrum": "music_spectrum.npz",
+    "music_peaks": "music_peaks.json",
+    "spectrum_samples": "spectrum_samples.json",
+    "raw_reverse_candidates": "raw_reverse_candidates.json",
+    "clustered_candidates": "clustered_candidates.json",
+    "forward_check": "forward_check.json",
+}
+
+
+def _manifest_artifact_filenames(manifest: dict[str, Any]) -> dict[str, str]:
+    if manifest.get("schema_version") == 4:
+        if manifest.get("workflow") != WORKFLOW:
+            raise ValueError("第 4 版定位清单必须明确记录谱面采样流程")
+        return _LOCALIZATION_ARTIFACT_FILENAMES
+    return _LEGACY_LOCALIZATION_ARTIFACT_FILENAMES
 
 
 def _archive_previous_evaluation(
@@ -355,7 +376,7 @@ def _archive_previous_evaluation(
         recorded_result_sha256 = str(result_record["sha256"])
     except (KeyError, TypeError, ValueError, OSError) as error:
         raise ValueError("旧定位清单的评估来源记录不完整，拒绝发布新定位产物") from error
-    if manifest_schema_version not in (2, 3):
+    if manifest_schema_version not in (2, 3, 4):
         raise ValueError(
             f"旧定位清单版本 {manifest_schema_version} 不支持无损归档"
         )
@@ -378,7 +399,7 @@ def _archive_previous_evaluation(
         raise ValueError("旧固定评估指标的 run_id 与定位清单不一致")
     if metrics.get("source_result_sha256") != recorded_result_sha256:
         raise ValueError("旧固定评估指标的结果摘要与旧定位清单不一致")
-    if manifest_schema_version == 3:
+    if manifest_schema_version >= 3:
         try:
             old_generation_bundle = manifest["generation_bundle"]
             old_bundle_id = str(old_generation_bundle["bundle_id"])
@@ -400,7 +421,7 @@ def _archive_previous_evaluation(
     files_to_archive: dict[Path, bytes] = {}
     archived_artifacts: dict[str, dict[str, str]] = {}
     migrated_artifact_names: list[str] = []
-    for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items():
+    for artifact_name, filename in _manifest_artifact_filenames(manifest).items():
         active_path = (output_dir / filename).resolve()
         captured = capture_file(active_path)
         record = manifest_artifacts.get(artifact_name)
@@ -497,7 +518,7 @@ def _archive_previous_evaluation(
             "sha256": truth_capture.sha256,
         }
 
-        if manifest_schema_version == 3:
+        if manifest_schema_version >= 3:
             generation_record = manifest["generation_bundle"]["manifest"]
             generation_path = Path(generation_record["path"]).expanduser().resolve()
             generation_capture = capture_file(generation_path)
@@ -554,8 +575,9 @@ def _verify_staged_localization(
     if parsed_manifest != _jsonable(manifest):
         raise RuntimeError("暂存定位清单内容与待发布记录不一致")
 
+    filenames = _manifest_artifact_filenames(manifest)
     expected_names = {
-        *_LOCALIZATION_ARTIFACT_FILENAMES.values(),
+        *filenames.values(),
         "localization_config.json",
         "localization_manifest.json",
     }
@@ -579,14 +601,14 @@ def _verify_staged_localization(
             "localization_run_id"
         ) != manifest["run_id"]:
             raise RuntimeError("暂存定位结果与定位清单的 run_id 不一致")
-    for filename in ("music_spectrum.npz", "uncertainty_solutions.npz"):
+    for filename in (name for name in expected_names if name.endswith(".npz")):
         try:
             with np.load(staging_dir / filename, allow_pickle=False) as staged_npz:
                 if not staged_npz.files:
                     raise RuntimeError(f"暂存 NPZ 没有数组：{filename}")
         except (OSError, ValueError) as error:
             raise RuntimeError(f"暂存 NPZ 无法读取：{filename}") from error
-    for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items():
+    for artifact_name, filename in filenames.items():
         staged_path = staging_dir / filename
         record = manifest["artifacts"][artifact_name]
         if Path(record["path"]).resolve() != (final_dir / filename).resolve():
@@ -888,17 +910,35 @@ def estimate_noise_std_from_observed_csi(csi: np.ndarray, num_sources: int) -> f
 
 
 def _make_grids(music_config: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
-    angle_step = float(music_config["angle_step_deg"])
-    delay_step = float(music_config["delay_step_s"])
-    angle_deg = np.arange(
+    def bounded_grid(lower: float, upper: float, step: float) -> np.ndarray:
+        """保留主步长，必要时以最后一个短格精确覆盖上界，绝不越界。"""
+        if not all(np.isfinite(value) for value in (lower, upper, step)):
+            raise ValueError("MUSIC 网格上下界和步长必须为有限数")
+        if lower >= upper or step <= 0:
+            raise ValueError("MUSIC 网格要求下界小于上界且步长为正数")
+        grid = np.arange(lower, upper, step)
+        grid = grid[(grid >= lower) & (grid < upper)]
+        if grid.size == 0:
+            grid = np.asarray([lower])
+        # 整除步长时，浮点误差可能留下一个紧挨上界的重复末格。
+        tolerance = 8 * np.finfo(float).eps * max(abs(lower), abs(upper), abs(step))
+        if grid.size > 1 and upper - grid[-1] <= tolerance:
+            grid[-1] = upper
+        else:
+            grid = np.r_[grid, upper]
+        if np.any(np.diff(grid) <= 0):
+            raise ValueError("MUSIC 网格步长过小，无法在浮点精度内形成不同坐标")
+        return grid
+
+    angle_deg = bounded_grid(
         float(music_config["angle_min_deg"]),
-        float(music_config["angle_max_deg"]) + 0.5 * angle_step,
-        angle_step,
+        float(music_config["angle_max_deg"]),
+        float(music_config["angle_step_deg"]),
     )
-    delays = np.arange(
+    delays = bounded_grid(
         float(music_config["delay_min_s"]),
-        float(music_config["delay_max_s"]) + 0.5 * delay_step,
-        delay_step,
+        float(music_config["delay_max_s"]),
+        float(music_config["delay_step_s"]),
     )
     return np.deg2rad(angle_deg), delays
 
@@ -1113,6 +1153,7 @@ def _solver_config(localization_config: dict[str, Any]) -> SolverConfig:
     return SolverConfig(
         huber_delta=float(localization_config["huber_delta_m"]),
         max_iterations=int(localization_config["max_iterations"]),
+        max_seed_pairs=int(localization_config.get("max_seed_pairs", 100000)),
     )
 
 
@@ -1428,7 +1469,53 @@ def localize(
         )
 
 
-def _localize_locked(
+def _localize_locked(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    """运行单份观测；异常时保存已完成步骤，不覆盖上一轮成功产物。"""
+    progress: dict[str, Any] = {
+        "workflow": WORKFLOW, "run_id": str(uuid4()),
+        "completed_steps": [], "failed_step": "01_csi_input", "payloads": {},
+    }
+    try:
+        return _localize_locked_impl(config, progress=progress, **kwargs)
+    except Exception as error:
+        if "inputs" in progress:
+            try:
+                directory = Path(kwargs["output_root"]) / "localization_failures" / progress["run_id"]
+                directory.mkdir(parents=True, exist_ok=False)
+                records = {}
+                for key, payload in progress["payloads"].items():
+                    path = directory / _LOCALIZATION_ARTIFACT_FILENAMES[key]
+                    if path.suffix == ".npz":
+                        np.savez_compressed(path, **payload)
+                    else:
+                        _write_json(path, payload)
+                    records[key] = artifact_record(path)
+                snapshot_path = directory / "localization_config.json"
+                snapshot = progress["config_snapshot_data"]
+                _write_json(snapshot_path, snapshot)
+                metadata = {
+                    key: value for key, value in progress.items()
+                    if key not in {"payloads", "config_snapshot_data"}
+                }
+                metadata.update(
+                    status="failed", error=f"{type(error).__name__}: {error}",
+                    artifacts=records,
+                    config_snapshot={
+                        "path": str(snapshot_path.resolve()),
+                        "file_sha256": file_sha256(snapshot_path),
+                        "canonical_sha256": snapshot["canonical_sha256"],
+                        "source_config_path": snapshot["source_config_path"],
+                    },
+                )
+                progress_path = directory / "progress.json"
+                _write_json(progress_path, metadata)
+                error.failure_progress = str(progress_path.resolve())
+            except Exception as save_error:
+                error.add_note(f"保存失败步骤时另遇到错误：{save_error}")
+        raise
+
+
+def _localize_locked_impl(
     config: dict[str, Any],
     *,
     scene_json: str | Path,
@@ -1438,6 +1525,7 @@ def _localize_locked(
     archive_previous: bool = True,
     previous_evaluation_archived: bool = False,
     run_receipt: str | Path | None = None,
+    progress: dict[str, Any],
 ) -> dict[str, Any]:
     """在输出根目录排他锁已持有时执行完整定位。"""
 
@@ -1480,7 +1568,7 @@ def _localize_locked(
         run_receipt_path == output_dir or output_dir in run_receipt_path.parents
     ):
         raise ValueError("运行回执不能写入将被整体切换的 localization 目录")
-    localization_run_id = str(uuid4())
+    localization_run_id = progress["run_id"]
     config_snapshot = localization_config_snapshot(config)
     try:
         scene_data = json.loads(scene_capture.data.decode("utf-8"))
@@ -1499,212 +1587,169 @@ def _localize_locked(
         scene,
         measurement,
     )
+    progress.update(
+        generation_bundle={"bundle_id": bundle_id, "manifest": generation_manifest_record},
+        inputs={"scene": scene_input_record, "online_measurement": online_input_record},
+        config_snapshot_data=config_snapshot,
+        truth_was_loaded=False,
+    )
+    progress["completed_steps"].append("01_csi_input")
     music_config = config["music"]
     localization_config = config["localization"]
     compute_config = config.get("compute", {})
-    compute_backend = compute_config.get("backend", "numpy")
-    computer = None
-    if compute_backend == "cuda":
-        computer = get_music_computer(
-            compute_backend, int(compute_config.get("device_id", 0)),
-            int(compute_config.get("batch_size", 4)), int(compute_config.get("angle_chunk_size", 32)),
-        )
-    compute_before = computer.metadata() if computer is not None else {}
+    computer = get_music_computer(
+        compute_config.get("backend", "numpy"), int(compute_config.get("device_id", 0)),
+        int(compute_config.get("batch_size", 4)), int(compute_config.get("angle_chunk_size", 32)),
+    )
+    compute_before = computer.metadata()
     mark_stage("input_validation_and_device_setup")
+    progress["failed_step"] = "02_music"
     unambiguous_delay_period_s = _validate_unambiguous_delay_window(
         music_config, measurement.subcarrier_frequencies_hz
     )
     num_paths = int(music_config["num_paths"])
-    signal_subspace_rank = int(
-        music_config.get("signal_subspace_rank", num_paths)
-    )
+    signal_subspace_rank = int(music_config.get("signal_subspace_rank", num_paths))
     aoa_grid, delay_grid = _make_grids(music_config)
-    spectrum_parameters = dict(
+    prepared = computer.prepare(
+        measurement.csi_observed,
         subcarrier_frequencies_hz=measurement.subcarrier_frequencies_hz,
         carrier_frequency_hz=measurement.carrier_frequency_hz,
         antenna_spacing_m=measurement.antenna_spacing_m,
-        aoa_grid_rad=aoa_grid,
-        delay_grid_s=delay_grid,
         num_sources=signal_subspace_rank,
         spatial_subarray_size=int(music_config["spatial_subarray_size"]),
         frequency_subarray_size=int(music_config["frequency_subarray_size"]),
         diagonal_loading=float(music_config["diagonal_loading"]),
     )
-    spectrum_function = computer.spectrum if computer is not None else music_2d_spectrum
-    spectrum = spectrum_function(measurement.csi_observed, **spectrum_parameters)
-    separation = _separation_bins(music_config)
+    spectrum = prepared.spectrum(aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid)
     nominal_peaks = extract_local_music_peaks(
-        spectrum,
-        aoa_grid_rad=aoa_grid,
-        delay_grid_s=delay_grid,
-        max_peaks=num_paths,
-        minimum_relative_height=0.0,
-        minimum_separation_bins=separation,
+        spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
+        max_peaks=num_paths, minimum_relative_height=0.0,
+        minimum_separation_bins=_separation_bins(music_config),
     )
+    peak_output = {
+        "workflow": WORKFLOW,
+        "note": "谱值用于候选搜索，不是经过校准的路径概率；不对观测 CSI 额外加噪",
+        "nominal": [asdict(peak) for peak in nominal_peaks],
+    }
+    progress["payloads"].update(
+        music_spectrum=dict(spectrum=spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid),
+        music_peaks=peak_output,
+    )
+    progress["completed_steps"].append("02_music")
+    mark_stage("music_observed")
     if len(nominal_peaks) < 2:
         raise RuntimeError(f"二维 MUSIC 只找到 {len(nominal_peaks)} 条路径，无法联合求解")
-    mark_stage("music_nominal")
 
-    estimated_noise_std = estimate_noise_std_from_observed_csi(
-        measurement.csi_observed, signal_subspace_rank
-    )
-    mark_stage("noise_estimation")
-    perturbation_parameters = dict(
-        subcarrier_frequencies_hz=measurement.subcarrier_frequencies_hz,
-        carrier_frequency_hz=measurement.carrier_frequency_hz,
-        antenna_spacing_m=measurement.antenna_spacing_m,
-        aoa_grid_rad=aoa_grid,
-        delay_grid_s=delay_grid,
-        noise_std=estimated_noise_std * float(music_config["uncertainty_noise_scale"]),
-        num_repetitions=int(music_config["uncertainty_repeats"]),
-        seed=int(config["project"]["random_seed"]) + 2,
-        num_sources=signal_subspace_rank,
-        peaks_per_repetition=(
-            len(nominal_peaks) + int(music_config["uncertainty_extra_peaks"])
-        ),
-        spatial_subarray_size=int(music_config["spatial_subarray_size"]),
-        frequency_subarray_size=int(music_config["frequency_subarray_size"]),
-        diagonal_loading=float(music_config["diagonal_loading"]),
-        minimum_relative_height=float(
-            music_config["uncertainty_min_relative_height"]
-        ),
-        minimum_separation_bins=separation,
-    )
-    if computer is None:
-        peak_samples = estimate_music_peak_samples(measurement.csi_observed, **perturbation_parameters)
-    else:
-        peak_samples = estimate_batched_peak_samples(
-            computer, measurement.csi_observed,
-            batch_size=int(compute_config.get("batch_size", 4)), **perturbation_parameters,
-        )
-    mark_stage("music_perturbations")
-    associations = associate_perturbed_peaks(
-        nominal_peaks,
-        peak_samples,
-        angle_scale_rad=math.radians(float(music_config["min_angle_separation_deg"])),
-        delay_scale_s=float(music_config["min_delay_separation_s"]),
-        max_normalized_distance=float(
-            music_config["association_max_normalized_distance"]
-        ),
-        false_peak_penalty=float(music_config["false_peak_penalty"]),
-        missed_peak_penalty=float(music_config["missed_peak_penalty"]),
-    )
-    nominal_samples, per_repetition = _build_observation_samples(
-        nominal_peaks,
-        associations,
+    progress["failed_step"] = "03_spectrum_sampling"
+    sampled = sample_music_spectrum(
+        prepared, nominal_peaks, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
         bs_boresight_rad=measurement.bs_boresight_rad,
+        settings=music_config["spectrum_sampling"],
+        seed=int(config["project"]["random_seed"]) + 2,
     )
-    mark_stage("peak_association")
+    peak_output["observation_samples"] = [asdict(sample) for sample in sampled.samples]
+    progress["payloads"]["spectrum_samples"] = {
+        "workflow": WORKFLOW, "samples": sampled.records,
+        "regions": sampled.regions, "diagnostics": sampled.diagnostics,
+    }
+    progress["completed_steps"].append("03_spectrum_sampling")
+    mark_stage("spectrum_sampling")
+
+    progress["failed_step"] = "04_reverse_candidates"
     beta_interval_m = (
         float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
         float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S,
     )
     raw_candidates = generate_reverse_candidates(
-        scene,
-        measurement.bs_position_m,
-        nominal_samples,
+        scene, measurement.bs_position_m, sampled.samples,
         max_reflections=int(config["scene"]["max_reflections"]),
         beta_interval_m=beta_interval_m,
     )
+    progress["payloads"]["raw_reverse_candidates"] = [
+        _raw_candidate_dict(candidate) for candidate in raw_candidates
+    ]
+    progress["completed_steps"].append("04_reverse_candidates")
     mark_stage("reverse_candidates")
+
+    progress["failed_step"] = "05_first_clustering"
     clustered_candidates = cluster_reverse_candidates(
         raw_candidates,
         position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
         direction_radius_deg=float(localization_config["candidate_direction_radius_deg"]),
     )
+    progress["payloads"]["clustered_candidates"] = [
+        _clustered_candidate_dict(candidate) for candidate in clustered_candidates
+    ]
+    progress["completed_steps"].append("05_first_clustering")
     mark_stage("first_clustering")
-    solver_config = _solver_config(localization_config)
-    central = solve_position_and_bias(clustered_candidates, solver_config)
-    mark_stage("central_solution")
-    (
-        bootstrap_positions,
-        bootstrap_betas,
-        bootstrap_sigmas,
-        bootstrap_weights,
-        bootstrap_diagnostics,
-    ) = _bootstrap_joint_solutions(
-        scene,
-        measurement,
-        per_repetition,
-        associations,
-        beta_interval_m=beta_interval_m,
-        max_reflections=int(config["scene"]["max_reflections"]),
-        solver_config=solver_config,
-        position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
-        direction_radius_deg=float(
-            localization_config["candidate_direction_radius_deg"]
-        ),
-    )
-    mark_stage("perturbation_solutions")
-    mu, sigma, beta_m, covariance_source = _distribution_statistics(
-        central.mu,
-        central.sigma,
-        central.beta,
-        bootstrap_positions,
-        bootstrap_betas,
-        bootstrap_sigmas,
-        bootstrap_weights,
-        len(per_repetition),
-    )
-    mark_stage("distribution")
 
-    compute_report = computer.metadata() if computer is not None else {
-        "backend": "numpy", "actual_device": "cpu", "dtype": "complex128",
-        "batch_size": 1, "requested_batch_size": int(compute_config.get("batch_size", 4)),
-    }
-    if computer is not None:
-        compute_report["counter_scope"] = "worker_lifetime"
-        compute_report["this_localization"] = {
-            name: compute_report[name] - compute_before[name]
-            for name in ("completed_batches", "completed_csi", "steering_cache_hits", "steering_cache_misses")
-        }
-
+    progress["failed_step"] = "06_joint_solution"
+    central = solve_position_and_bias(clustered_candidates, _solver_config(localization_config))
+    progress["completed_steps"].append("06_joint_solution")
+    mark_stage("joint_solution")
     selected = {
         str(observation_id): _clustered_candidate_dict(candidate)
         for observation_id, candidate in central.selected_candidates.items()
     }
+    # 此协方差来自最终几何残差近似；未把采样数当成独立观测数，
+    # 也未标定谱面采样本身的不确定性。采样会通过代表选择间接影响残差。
     result = {
-        "schema_version": 1,
+        "schema_version": 2, "workflow": WORKFLOW,
         "localization_run_id": localization_run_id,
-        "output_type": "anisotropic_bivariate_gaussian",
-        "mu_m": mu,
-        "sigma_m2": sigma,
-        "distance_bias_m": beta_m,
-        "clock_bias_s": beta_m / SPEED_OF_LIGHT_M_S,
+        "output_type": "point_estimate_with_geometric_residual_covariance",
+        "mu_m": central.mu, "sigma_m2": central.sigma,
+        "distance_bias_m": central.beta,
+        "clock_bias_s": central.beta / SPEED_OF_LIGHT_M_S,
         "central_solution": {
-            "mu_m": central.mu,
-            "sigma_m2": central.sigma,
+            "mu_m": central.mu, "sigma_m2": central.sigma,
             "distance_bias_m": central.beta,
             "clock_bias_s": central.beta / SPEED_OF_LIGHT_M_S,
         },
         "central_selected_candidates": selected,
         "central_residuals_m": central.residuals,
-        "perturbation_topology_support": _selection_frequencies(
-            bootstrap_diagnostics,
-            nominal_count=len(nominal_peaks),
-        ),
         "diagnostics": {
-            "compute": compute_report,
-            "stage_timings_s": stage_timings,
-            "stage_timing_scope": "输入验证到分布计算；不包含之后的压缩、归档、文件发布及独立评估",
             **asdict(central.diagnostics),
-            "estimated_noise_std_from_observed_csi": estimated_noise_std,
+            "stage_timings_s": stage_timings,
+            "stage_timing_scope": "输入验证到正向检查；不含文件发布及独立评估",
             "music_signal_subspace_rank": signal_subspace_rank,
             "requested_music_peak_count": num_paths,
             "unambiguous_delay_period_s": unambiguous_delay_period_s,
             "nominal_music_peak_count": len(nominal_peaks),
+            "spectrum_sample_count": len(sampled.samples),
+            "sampling": sampled.diagnostics,
             "raw_candidate_count": len(raw_candidates),
             "clustered_candidate_count": len(clustered_candidates),
-            "uncertainty_solution_count": int(bootstrap_positions.shape[0]),
-            "uncertainty_requested_count": len(per_repetition),
-            "uncertainty_failed_count": (
-                len(per_repetition) - int(bootstrap_positions.shape[0])
-            ),
-            "covariance_source": covariance_source,
-            "nominal_solution_not_counted_as_perturbation": True,
+            "covariance_source": "selected_candidate_geometric_residual_approximation",
+            "covariance_calibrated": False,
             "no_accept_reject_output": True,
         },
     }
+    progress["payloads"]["result"] = result
+    progress["failed_step"] = "07_forward_check"
+    forward_check = forward_check_solution(
+        scene, measurement.bs_position_m, central.selected_candidates,
+        central.mu, central.beta, max_reflections=int(config["scene"]["max_reflections"]),
+        observed_peaks={
+            f"music_path_{index:02d}": {
+                "aoa_global_rad": local_to_global_aoa(peak.aoa_rad, measurement.bs_boresight_rad),
+                "delay_s": peak.delay_s,
+            }
+            for index, peak in enumerate(nominal_peaks)
+        },
+    )
+    progress["payloads"]["forward_check"] = forward_check
+    progress["completed_steps"].append("07_forward_check")
+    mark_stage("forward_check")
+    result["forward_check"] = forward_check
+    compute_report = computer.metadata()
+    compute_report["counter_scope"] = "worker_lifetime"
+    compute_report["this_localization"] = {
+        name: compute_report[name] - compute_before.get(name, 0)
+        for name in ("completed_batches", "completed_csi", "steering_cache_hits", "steering_cache_misses", "eigendecomposition_count")
+        if name in compute_report
+    }
+    result["diagnostics"]["compute"] = compute_report
+    progress["failed_step"] = "artifact_publication"
 
     remove_fixed_metrics = (
         _archive_previous_evaluation(root, output_dir)
@@ -1719,63 +1764,12 @@ def _localize_locked(
             artifact_name: staging_dir / filename
             for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
         }
-        np.savez_compressed(
-            staged_paths["music_spectrum"],
-            spectrum=spectrum,
-            aoa_grid_rad=aoa_grid,
-            delay_grid_s=delay_grid,
-        )
-        np.savez_compressed(
-            staged_paths["uncertainty_solutions"],
-            positions_m=bootstrap_positions,
-            distance_bias_m=bootstrap_betas,
-            conditional_sigma_m2=bootstrap_sigmas,
-            distribution_weight=bootstrap_weights,
-        )
-        _write_json(
-            staged_paths["music_peaks"],
-            {
-                "note": "spectrum_value 仅用于谱内排序，不是概率",
-                "nominal": [asdict(peak) for peak in nominal_peaks],
-                "nominal_observation_samples": [asdict(sample) for sample in nominal_samples],
-                "perturbed_observation_samples": [
-                    [asdict(sample) for sample in repetition] for repetition in per_repetition
-                ],
-                "associations": [
-                    {
-                        **asdict(association),
-                        "distribution_weight": association.distribution_weight,
-                        "unmatched_peaks": [
-                            {
-                                "sample_index": sample_index,
-                                "aoa_rad": peak_samples.aoa_rad[
-                                    repetition_index, sample_index
-                                ],
-                                "delay_s": peak_samples.delay_s[
-                                    repetition_index, sample_index
-                                ],
-                                "spectrum_value": peak_samples.spectrum_value[
-                                    repetition_index, sample_index
-                                ],
-                            }
-                            for sample_index in association.unmatched_sample_indices
-                        ],
-                    }
-                    for repetition_index, association in enumerate(associations)
-                ],
-            },
-        )
-        _write_json(
-            staged_paths["raw_reverse_candidates"],
-            [_raw_candidate_dict(candidate) for candidate in raw_candidates],
-        )
-        _write_json(
-            staged_paths["clustered_candidates"],
-            [_clustered_candidate_dict(candidate) for candidate in clustered_candidates],
-        )
-        _write_json(
-            staged_paths["bootstrap_diagnostics"], bootstrap_diagnostics
-        )
+        for artifact_name, payload in progress["payloads"].items():
+            staged_path = staged_paths[artifact_name]
+            if staged_path.suffix == ".npz":
+                np.savez_compressed(staged_path, **payload)
+            else:
+                _write_json(staged_path, payload)
         staged_config_path = staging_dir / "localization_config.json"
         _write_json(staged_config_path, config_snapshot)
         config_snapshot_record = {
@@ -1792,7 +1786,8 @@ def _localize_locked(
             for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
         }
         localization_manifest = {
-            "schema_version": 3,
+            "schema_version": 4,
+            "workflow": WORKFLOW,
             "stage": "localization",
             "run_id": localization_run_id,
             "generation_bundle": {

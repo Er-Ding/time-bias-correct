@@ -92,3 +92,74 @@ def test_nan_tolerance_rejected_before_creating_output(tmp_path):
         benchmark.main(["--input-root", str(tmp_path), "--output-root", str(output),
                         "--position-atol-m", "nan"])
     assert not output.exists()
+
+
+def _convert_to_spectrum_sampling(root):
+    folder = root / "localization"
+    peaks = json.loads((folder / "music_peaks.json").read_text())
+    peaks.pop("associations")
+    peaks.pop("perturbed_observation_samples")
+    peaks["workflow"] = "music_spectrum_sampling_v1"
+    (folder / "music_peaks.json").write_text(json.dumps(peaks))
+    (folder / "bootstrap_diagnostics.json").unlink()
+    sampling = {
+        "samples": [{"observation_id": "path_0", "sample_id": "path_0:mc_00000",
+                     "sampling_kind": "local_spectrum_mc", "cell_aoa_index": 3,
+                     "cell_delay_index": 4, "aoa_local_rad": 0.12345,
+                     "delay_s": 10.12345e-9, "spectrum_value": 12.0}],
+        "diagnostics": {"prepared_music": {"eigendecomposition_count": 1},
+                        "added_csi_noise": False},
+    }
+    (folder / "spectrum_samples.json").write_text(json.dumps(sampling))
+
+
+def test_new_workflow_comparison_never_requires_bootstrap_artifacts(roots):
+    for root in roots:
+        _convert_to_spectrum_sampling(root)
+    assert _compare(roots)["passed"]
+    changed = roots[1] / "localization" / "spectrum_samples.json"
+    sampling = json.loads(changed.read_text())
+    sampling["samples"][0]["aoa_local_rad"] += 1e-4
+    changed.write_text(json.dumps(sampling))
+    comparison = _compare(roots)
+    assert not comparison["passed"]
+    assert not comparison["checks"]["sample_aoa_local_rad_within_tolerance"]
+
+
+def test_kernel_uses_one_observation_without_legacy_noise_settings(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from types import SimpleNamespace
+    from time_bias_localization import compute
+    from time_bias_localization.config import DEFAULT_CONFIG
+    from time_bias_localization.signal import synthesize_ula_csi
+
+    config = deepcopy(DEFAULT_CONFIG)
+    config["music"].update({
+        "angle_min_deg": -60, "angle_max_deg": 60, "angle_step_deg": 3,
+        "delay_min_s": 0, "delay_max_s": 160e-9, "delay_step_s": 4e-9,
+        "num_paths": 2, "signal_subspace_rank": 2, "spatial_subarray_size": 3,
+        "frequency_subarray_size": 6,
+    })
+    frequencies = (np.arange(12) - 5.5) * 2e6
+    csi = synthesize_ula_csi(
+        path_aoa_rad=np.deg2rad([12.4, -33.7]), path_delay_s=[63.7e-9, 116.3e-9],
+        path_coefficients=[1 + 0.4j, 0.8 - 0.7j], num_bs_antennas=5,
+        subcarrier_frequencies_hz=frequencies, carrier_frequency_hz=3.5e9,
+    )
+    rng = np.random.default_rng(43)
+    csi += 0.03 * (rng.normal(size=csi.shape) + 1j * rng.normal(size=csi.shape))
+    measurement = SimpleNamespace(csi_observed=csi, subcarrier_frequencies_hz=frequencies,
+                                  carrier_frequency_hz=3.5e9, antenna_spacing_m=None,
+                                  bs_boresight_rad=0)
+    original_settings = compute.ComputeSettings
+    monkeypatch.setattr(compute, "ComputeSettings", lambda **kwargs: original_settings(
+        **{**kwargs, "backend": "numpy"}
+    ))
+    monkeypatch.setattr(benchmark, "_synchronize", lambda *args: None)
+    args = SimpleNamespace(device_id=0, batch_size=4, angle_chunk_size=16)
+    result = benchmark._run_kernel(args, tmp_path, config, measurement)
+    assert result["comparison"]["passed"]
+    assert result["added_csi_noise"] is False
+    assert result["spectrum_count"] == 1
+    assert all(run["compute"]["completed_csi"] == 1 for run in result["runs"].values())
+    assert all(run["compute"]["eigendecomposition_count"] == 1 for run in result["runs"].values())

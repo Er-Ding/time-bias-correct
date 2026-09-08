@@ -41,7 +41,7 @@ def test_equivalence_ignores_only_source_names_and_existing_pixel_setting():
 
 
 @pytest.mark.parametrize("difference", [
-    "coordinate", "wall_id", "missing_wall", "extra_wall", "bounds", "height",
+    "coordinate", "missing_wall", "extra_wall", "bounds", "height",
     "source", "wall_property",
 ])
 def test_equivalence_rejects_geometry_identity_or_physical_property_changes(difference):
@@ -50,8 +50,6 @@ def test_equivalence_rejects_geometry_identity_or_physical_property_changes(diff
     if difference == "coordinate":
         # 不因默认 allclose 的相对容差而放过细小坐标改变。
         second["walls"][0]["start_m"][0] += 1e-10
-    elif difference == "wall_id":
-        second["walls"][0]["wall_id"] = "different_wall"
     elif difference == "missing_wall":
         second["walls"].pop()
     elif difference == "extra_wall":
@@ -67,11 +65,34 @@ def test_equivalence_rejects_geometry_identity_or_physical_property_changes(diff
     assert not visualization._same_scene_geometry(first, second)
 
 
+def test_sionna_reexport_ids_order_and_endpoint_direction_do_not_change_background():
+    first = _scene()
+    second = deepcopy(first)
+    second["walls"].reverse()
+    for i, wall in enumerate(second["walls"]):
+        wall["wall_id"] = f"sionna_reexport_{i}"
+        wall["start_m"], wall["end_m"] = wall["end_m"], wall["start_m"]
+    original = deepcopy(second)
+    assert visualization._same_scene_geometry(first, second)
+    assert second == original
+    second["walls"][0] = deepcopy(second["walls"][1])
+    assert not visualization._same_scene_geometry(first, second)
+
+
+def test_other_scene_sources_still_require_wall_ids():
+    first = _scene()
+    first["source"] = "synthetic"
+    second = deepcopy(first)
+    second["walls"][0]["wall_id"] = "different_wall"
+    assert not visualization._same_scene_geometry(first, second)
+
+
 class _SummaryReached(Exception):
     """停止在已验证结果汇总的边界，避免此测试额外渲染几十张图。"""
 
 
-def test_report_accepts_worker_failed_and_keeps_it_in_total_denominator(tmp_path, monkeypatch):
+@pytest.mark.parametrize("workflow", [None, "music_spectrum_sampling_v1"])
+def test_report_accepts_worker_failed_and_keeps_it_in_total_denominator(tmp_path, monkeypatch, workflow):
     scene_path = tmp_path / "scene.json"
     visualization.write_json(scene_path, _scene())
     experiment = tmp_path / "experiment"
@@ -80,6 +101,7 @@ def test_report_accepts_worker_failed_and_keeps_it_in_total_denominator(tmp_path
         "noise_repeats": 3, "scene": artifact_record(scene_path),
         "bs_position_m": [20., 50.], "bs_boresight_rad": -.5,
         "clock_bias_s": 25e-9,
+        **({"workflow": workflow} if workflow is not None else {}),
     })
     visualization.write_json(experiment / "UE001/repeat_000/attempt.json", {
         "status": "worker_failed", "error": "worker exited unexpectedly",
@@ -102,6 +124,8 @@ def test_report_accepts_worker_failed_and_keeps_it_in_total_denominator(tmp_path
 
     def capture_summary(plt, rows, summary, output):
         assert [row["status"] for row in rows] == ["worker_failed", "success", "pending"]
+        # 失败及待运行项继承计划；成功项以已保存结果的真实流程为准。
+        assert [row["workflow"] for row in rows] == [workflow, None, workflow]
         assert summary["planned_count"] == 3
         assert summary["failed_count"] == 1
         assert summary["solved_count"] == 1

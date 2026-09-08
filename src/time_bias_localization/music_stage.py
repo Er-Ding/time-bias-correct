@@ -1,4 +1,8 @@
-"""MUSIC 计算阶段：分批提交 CSI 扰动，保留原算法的随机序列和峰定义。"""
+"""MUSIC 设备复用入口，以及只供旧实验回归对照的扰动计算函数。
+
+当前定位主流程用 MusicComputer.prepare 与 spectrum_sampling，不会调用
+estimate_batched_peak_samples。保留旧函数仅用于读取旧实验和数值回归。
+"""
 
 from functools import lru_cache
 from typing import Any

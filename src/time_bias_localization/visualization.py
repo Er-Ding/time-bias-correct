@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import csv
 import json
 import os
@@ -112,6 +113,78 @@ def load_run(root: Path) -> dict[str, Any]:
                 clusters=read_json(artifacts["clustered_candidates"]), sources=sources)
 
 
+def load_failed_run(root: Path, progress_path: str | Path) -> dict[str, Any]:
+    """读取 attempt 明确绑定的失败记录；只保留已有阶段，不推断最终解。"""
+    progress_path = Path(progress_path).resolve()
+    failure_root = (root / "localization_failures").resolve()
+    if not progress_path.is_relative_to(failure_root):
+        raise ValueError("失败进度文件不属于本次样本的 localization_failures 目录")
+    progress = read_json(progress_path)
+    if progress.get("workflow") != "music_spectrum_sampling_v1":
+        raise ValueError("失败进度记录的工作流不受支持")
+    if progress_path.parent.name != progress["run_id"]:
+        raise ValueError("失败进度目录与运行编号不一致")
+    generation_path = checked_record(progress["generation_bundle"]["manifest"])
+    generation, _, bundle_id = load_generation_manifest(generation_path)
+    if bundle_id != progress["generation_bundle"]["bundle_id"]:
+        raise ValueError("失败记录与生成批次不一致")
+    sources = [artifact_record(progress_path), artifact_record(generation_path)]
+    for key in ("scene_json", "online_measurement", "ground_truth"):
+        record = generation["artifact_hashes"][key]
+        verify_generation_artifact(generation, key, record["path"])
+        sources.append(record)
+    for key, record in progress.get("inputs", {}).items():
+        path = checked_record(record)
+        generation_key = "scene_json" if key == "scene" else key
+        if generation_key in generation["artifact_hashes"]:
+            if file_sha256(path) != generation["artifact_hashes"][generation_key]["sha256"]:
+                raise ValueError("失败记录的输入与生成批次不一致")
+        sources.append(record)
+    artifacts = {}
+    for key, record in progress.get("artifacts", {}).items():
+        path = checked_record(record)
+        if not path.is_relative_to(progress_path.parent):
+            raise ValueError("失败阶段产物不属于所绑定的失败运行目录")
+        artifacts[key] = str(path)
+        sources.append(record)
+    snapshot = progress["config_snapshot"]
+    config_path = checked_record({"path": snapshot["path"], "sha256": snapshot["file_sha256"]})
+    sources.append(artifact_record(config_path))
+    inputs = {key: record["path"] for key, record in generation["artifact_hashes"].items()}
+    with np.load(inputs["online_measurement"], allow_pickle=False) as data:
+        bs = data["bs_position_m"].tolist()
+        boresight = float(data["bs_boresight_rad"])
+    with np.load(inputs["ground_truth"], allow_pickle=False) as data:
+        truth = {key: data[key] for key in data.files}
+    true = np.asarray(truth["ue_position_m"], dtype=float)
+    paths = []
+    if "retained_mask" in truth:
+        for index in np.flatnonzero(truth["retained_mask"]):
+            active = np.flatnonzero(truth["interactions"][:, index] != 0)
+            vertices = truth["vertices_m"][active, index, :2]
+            paths.append({"order": len(active), "points": np.vstack([true, vertices, bs]).tolist()})
+    else:
+        metadata_path = Path(inputs["ground_truth"]).with_suffix(".json")
+        metadata = read_json(metadata_path)
+        sources.append(artifact_record(metadata_path))
+        for index, item in enumerate(metadata["paths"]):
+            points = np.asarray([true.tolist(), *item["interaction_points_m"], bs])
+            length = np.linalg.norm(np.diff(points, axis=0), axis=1).sum()
+            if (not np.isclose(item["delay_s"], truth["path_delays_s"][index], rtol=1e-10, atol=1e-15)
+                    or not np.isclose(length / SPEED_OF_LIGHT_M_S, item["delay_s"], rtol=1e-7)):
+                raise ValueError("失败记录的真值路径 JSON 与 NPZ 不一致")
+            paths.append({"order": item["reflection_order"], "points": points.tolist()})
+    result = read_json(artifacts["result"]) if "result" in artifacts else {"workflow": progress["workflow"]}
+    if result.get("localization_run_id", progress["run_id"]) != progress["run_id"]:
+        raise ValueError("失败阶段结果与运行编号不一致")
+    return dict(root=str(root), workflow=progress["workflow"], scene=read_json(inputs["scene_json"]),
+                bs=bs, boresight=boresight, true=true.tolist(), result=result, metrics={}, paths=paths,
+                artifacts=artifacts, input_paths=inputs, config_path=str(config_path),
+                raw=read_json(artifacts["raw_reverse_candidates"]) if "raw_reverse_candidates" in artifacts else [],
+                clusters=read_json(artifacts["clustered_candidates"]) if "clustered_candidates" in artifacts else [],
+                progress=progress, sources=sources)
+
+
 def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
     """误差统计只用成功项，门限达标率以全部计划尝试为分母。"""
     solved = [row for row in rows if row["status"] == "success"]
@@ -205,15 +278,24 @@ def _label_points(ax, points):
 
 
 def _same_scene_geometry(first: dict[str, Any], second: dict[str, Any]) -> bool:
-    """只忽略源对象的说明名称，仍严格核对全部墙段及场景几何。
+    """仅用于全局底图比较，不用于跨运行匹配候选或改写墙编号。
 
-    Sionna 在同一工作进程多次加载场景时，未命名对象可能从 ``no-name-3``
-    变为 ``no-name-7``。这只改变 ``source_object`` 溯源说明；墙段编号、
-    顺序与端点均未改变。不为坐标引入容差，也不改写输入场景或墙段编号。
-    原报告就允许不同鸟瞰图分辨率，此处继续不把像素设置当作几何差异。
+    Sionna 导出时对象名称、墙编号和排列可能变化。比较精确的无向墙段
+    多重集合，保留重复段数量及其他物理字段；不引入坐标容差。
+    每个 sample 的路径图仍读取其自己的场景及原始墙编号。
     """
     if any(first[key] != second[key] for key in ("bounds_m", "fixed_height_m", "source")):
         return False
+    if first["source"] == "sionna_exported_triangle_mesh":
+        def segments(scene):
+            return Counter(
+                (tuple(sorted((tuple(wall["start_m"]), tuple(wall["end_m"])))),
+                 json.dumps({key: value for key, value in wall.items()
+                             if key not in {"wall_id", "source_object", "start_m", "end_m"}},
+                            sort_keys=True, allow_nan=False))
+                for wall in scene["walls"]
+            )
+        return segments(first) == segments(second)
     first_walls = [{key: value for key, value in wall.items() if key != "source_object"}
                    for wall in first["walls"]]
     second_walls = [{key: value for key, value in wall.items() if key != "source_object"}
@@ -221,11 +303,11 @@ def _same_scene_geometry(first: dict[str, Any], second: dict[str, Any]) -> bool:
     return first_walls == second_walls
 
 
-def create_report(output: Path, *, run_roots: list[Path] | None = None, experiment: Path | None = None) -> Path:
+def create_report(output: Path, *, run_roots: list[Path] | None = None, experiment: Path | None = None, summary_only: bool = False) -> Path:
     """单次已有结果或批量实验均可；缺失项保留为 pending。"""
     from .step_visualization import export_steps, export_summary
     plt = _plotting()
-    rows, runs, sources = [], [], []
+    rows, runs, partial_runs, sources = [], [], [], []
     plan = read_json(experiment / "experiment_plan.json") if experiment else None
     if plan:
         sources.append(artifact_record(experiment / "experiment_plan.json"))
@@ -243,13 +325,19 @@ def create_report(output: Path, *, run_roots: list[Path] | None = None, experime
         scene_path = checked_record(plan["scene"])
         scene, bs, boresight = read_json(scene_path), plan["bs_position_m"], plan["bs_boresight_rad"]
     else:
-        entries = [(f"UE{i + 1:03d}", 0, None, root, {"status": "success"}) for i, root in enumerate(run_roots or [])]
+        entries = []
+        for i, root in enumerate(run_roots or []):
+            attempt_path = root / "attempt.json"
+            record = read_json(attempt_path) if attempt_path.exists() else {"status": "success"}
+            entries.append((f"UE{i + 1:03d}", 0, None, root, record))
     if not entries:
         raise ValueError("没有可绘图的输入")
     for ue_id, repeat, true, root, status in entries:
         run = None
+        workflow = status.get("workflow", plan.get("workflow") if plan else None)
         if status["status"] == "success":
             run = load_run(root)
+            workflow = run["result"].get("workflow", run.get("workflow"))
             if true is not None and not np.allclose(true, run["true"], rtol=0, atol=1e-9):
                 raise ValueError("结果 UE 与采样计划不一致")
             if status.get("run_id", run["result"]["localization_run_id"]) != run["result"]["localization_run_id"]:
@@ -261,14 +349,29 @@ def create_report(output: Path, *, run_roots: list[Path] | None = None, experime
                 scene, bs, boresight = run["scene"], run["bs"], run["boresight"]
             same_geometry = _same_scene_geometry(scene, run["scene"])
             if not same_geometry or bs != run["bs"] or not np.isclose(boresight, run["boresight"]):
-                raise ValueError("不能把不同场景或不同 BS 的结果放进同一张全局图")
+                raise ValueError(f"{ue_id}/repeat_{repeat:03d} 的场景几何、BS 位置或朝向与全局底图不一致：{root}")
             sources.extend(run["sources"])
             runs.append((ue_id, repeat, run))
+        elif status.get("failure_progress") and (not summary_only or not plan):
+            partial = load_failed_run(root, status["failure_progress"])
+            workflow = partial.get("result", {}).get("workflow", partial.get("workflow"))
+            if true is not None and not np.allclose(true, partial["true"], rtol=0, atol=1e-9):
+                raise ValueError("失败记录的 UE 与采样计划不一致")
+            true = partial["true"]
+            if not runs and not partial_runs and not plan:
+                scene, bs, boresight = partial["scene"], partial["bs"], partial["boresight"]
+            if (not _same_scene_geometry(scene, partial["scene"]) or bs != partial["bs"]
+                    or not np.isclose(boresight, partial["boresight"])):
+                raise ValueError("失败记录的场景或 BS 与全局底图不一致")
+            sources.extend(partial["sources"])
+            partial_runs.append((ue_id, repeat, partial))
+        if true is None:
+            raise ValueError(f"缺少样本位置与已绑定的失败进度；请用完整实验计划生成报告：{root}")
         result = run["result"] if run else {}
         metrics = run["metrics"] if run else {}
         estimated = result.get("mu_m", [None, None])
         true_bias = metrics.get("true_clock_bias_s", plan.get("clock_bias_s") if plan else None)
-        rows.append(dict(ue_id=ue_id, noise_repeat=repeat, status=status["status"],
+        rows.append(dict(ue_id=ue_id, noise_repeat=repeat, status=status["status"], workflow=workflow,
                          true_x_m=true[0], true_y_m=true[1], estimated_x_m=estimated[0], estimated_y_m=estimated[1],
                          position_error_m=metrics.get("localization_error_m"),
                          true_bias_ns=true_bias * 1e9 if true_bias is not None else None,
@@ -281,7 +384,7 @@ def create_report(output: Path, *, run_roots: list[Path] | None = None, experime
     summary = summarize(rows)
     summary_root = output / "summary"
     sample_summaries = export_summary(plt, rows, summary, summary_root)
-    runs_by_id = {(ue_id, repeat): run for ue_id, repeat, run in runs}
+    runs_by_id = {(ue_id, repeat): run for ue_id, repeat, run in [*runs, *partial_runs]}
     for sample in sample_summaries:
         sample_root = output / "samples" / sample["ue_id"]
         sample_root.mkdir(parents=True)
@@ -290,7 +393,10 @@ def create_report(output: Path, *, run_roots: list[Path] | None = None, experime
         write_csv(sample_root / "results.csv", sample_rows)
         (sample_root / "README.md").write_text(
             f"# {sample['ue_id']}\n\n真实坐标：({sample['true_x_m']}, {sample['true_y_m']}) m。\n\n"
-            + "\n".join(f"- [噪声重复 {row['noise_repeat']}：{row['status']}](repeat_{row['noise_repeat']:03d}/README.md)" for row in sample_rows), encoding="utf-8")
+            + ("本报告只汇总已有结果；逐次状态和误差见 results.csv。" if summary_only else
+               "\n".join(f"- [噪声重复 {row['noise_repeat']}：{row['status']}](repeat_{row['noise_repeat']:03d}/README.md)" for row in sample_rows)), encoding="utf-8")
+        if summary_only:
+            continue
         for row in sample_rows:
             export_steps(plt, runs_by_id.get((row["ue_id"], row["noise_repeat"])),
                          sample_root / f"repeat_{row['noise_repeat']:03d}", row)
@@ -358,13 +464,17 @@ def create_report(output: Path, *, run_roots: list[Path] | None = None, experime
         "# 按 sample 和执行步骤查看定位结果\n\n"
         "- [总体误差统计](summary/README.md)：CDF、Med、P90、逐次结果表及逐 UE 汇总。\n"
         + "\n".join(f"- [{sample['ue_id']}](samples/{sample['ue_id']}/README.md)" for sample in sample_summaries)
-        + "\n\n每个 UE 的 repeat 子目录含 00–08 步骤，每步保存图、数据与对应函数说明。\n"
+        + ("\n\n本报告仅包含汇总图表及各 UE 结果表，未导出逐步骤图。\n" if summary_only else
+           "\n\n每个 UE 的 repeat 子目录含 00–08 步骤，每步保存图、数据与对应函数说明。\n")
+        +
         "不绘制候选簇联系。00 真值只作参照，不是定位输入。绘图不重新执行定位。\n"
         "旧结果没有保存的内部历史明确标注缺失；失败和待运行项保留目录和状态，不编造中间输出。\n"
         "summary/position_error_cdf 为成功结果的标准 CDF；all_attempt_attainment_and_bias 的达标比例以全部计划次数为分母。\n"
-        "PNG 为 300 dpi，另存 PDF/SVG；椭圆为名义 95% 范围，实际覆盖率未经校准。\n",
+        "PNG 为 300 dpi，另存 PDF/SVG；新流程椭圆仅表示几何残差近似，未校准，不能当作谱面采样的置信区间。\n",
         encoding="utf-8")
     write_json(output / "report_manifest.json", {"schema_version": 1, "evaluation_only": True,
+               "summary_only": summary_only,
+               "scene_comparison": "Sionna: exact undirected segment multiset including multiplicity and physical fields; export IDs and object labels ignored only for global background",
                "plotting_code": artifact_record(Path(__file__)),
                "step_plotting_code": artifact_record(Path(__file__).with_name("step_visualization.py")),
                "sources": list({record["path"]: record for record in sources}.values()),
@@ -378,8 +488,9 @@ def main(argv=None):
     inputs.add_argument("--run-root", type=Path, action="append", help="已有单次结果目录，可重复指定")
     inputs.add_argument("--experiment", type=Path, help="批量实验目录")
     parser.add_argument("--output", type=Path, required=True, help="新的图表输出目录，禁止覆盖")
+    parser.add_argument("--summary-only", action="store_true", help="仅汇总图表，不导出逐步骤图；仍校验全部成功结果的来源")
     args = parser.parse_args(argv)
-    print(create_report(args.output.resolve(), run_roots=args.run_root, experiment=args.experiment))
+    print(create_report(args.output.resolve(), run_roots=args.run_root, experiment=args.experiment, summary_only=args.summary_only))
 
 
 if __name__ == "__main__":

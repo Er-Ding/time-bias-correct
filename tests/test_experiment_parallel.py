@@ -23,8 +23,9 @@ def small_experiment(tmp_path):
     config = deepcopy(DEFAULT_CONFIG)
     config["output"]["root"] = str(tmp_path / "scene")
     config["radio"].update(num_subcarriers=80, num_bs_antennas=8)
-    config["music"].update(uncertainty_repeats=2, angle_step_deg=2., delay_step_s=2e-9,
+    config["music"].update(angle_step_deg=2., delay_step_s=2e-9,
                             spatial_subarray_size=6, frequency_subarray_size=12)
+    config["music"]["spectrum_sampling"].update(samples_per_peak=8, local_grid_points_per_axis=9)
     scene_files = prepare_scene(config)
     generation_file = tmp_path / "generation.yaml"
     generation_file.write_text(yaml.safe_dump(config))

@@ -1,11 +1,17 @@
 # 时间偏差校正的二维多径定位
 
-第一版代码已经建立一个可离线验证的完整闭环：
+当前定位主流程为 `music_spectrum_sampling_v1`，定位清单格式为第 4 版：
 
 ```text
-二维场景 → 镜面路径 → 带公共时延偏差的 CSI → AOA/Delay 二维 MUSIC
-        → 反向候选轨迹 → 多路径联合求解 → 位置均值 μ 与 2×2 协方差 Σ
+一份接收到的带噪 CSI → 一次协方差与特征分解 → 二维 MUSIC 谱与找峰
+  → 各峰附近连续采样角度和观测时延 → 汇集全部反向候选轨迹
+  → 同来源峰、同反射结构内聚类并选代表 → 一次位置与公共 bias 联合求解
+  → 正向路径检查 → 独立读取真值评估
 ```
+
+定位内部不再给 CSI 额外加噪，也不再逐次扰动求解后平均。实验中每个 UE 的
+5 次独立噪声重复仍保留，用于生成 5 份接收数据；每份接收数据分别执行上述流程。
+实现与验证说明见 [谱面采样实现记录](docs/spectrum_sampling_implementation_20260908.md)。
 
 项目同时提供 DeepMIMO V4 + Sionna RT 2.0 的可选入口。定位算法本身不依赖
 这两个大型仿真包，因此即使尚未安装它们，也能先验证数学和数据链路。
@@ -23,7 +29,9 @@
 - 同一个 MUSIC 峰产生的不同反射解释互斥，求解时最多选择一个。
 - 正常输出只有 `mu`、完整 `sigma`、公共偏差和数值诊断，不输出
   `accept/reject/ambiguous`。
-- MUSIC 伪谱值只用于找峰和排序，不直接当作概率。
+- MUSIC 伪谱值用于找峰及构造局部候选搜索分布，不当作已校准的路径概率。
+  同一来源峰的样本是互斥候选解释，不因采样数量增加而获得更多独立观测权重。
+- `sigma` 是所选候选的几何残差近似协方差，不是 CSI 扰动解的分布，也未经覆盖率校准。
 - `music.signal_subspace_rank` 表示 MUSIC 计算时认为 CSI 中有多少个信号成分；
   `music.num_paths` 表示最后向定位器输出多少个峰。两者用途不同，不再要求相等。
 
@@ -59,9 +67,11 @@ PYTHON_BIN=/绝对路径/python /data/zhujun/differt_projects/time-bias-correct/
   物理模型声明做一致性检查，但不会打开其中记录的真值文件。
 - `data/truth/ground_truth.npz`：只供独立评估读取的 UE 与偏差真值。
 - `localization/music_spectrum.npz`：二维 MUSIC 谱和坐标网格。
+- `localization/spectrum_samples.json`：每个峰的局部细谱面、连续采样坐标、来源和采样参数。
 - `localization/raw_reverse_candidates.json`：未聚类候选及完整路径来源。
 - `localization/clustered_candidates.json`：同观测、同反射结构内的代表轨迹。
 - `localization/localization_result.json`：最终 `mu`、`sigma` 和公共偏差。
+- `localization/forward_check.json`：最终解对应的路径合法性，以及预测角度、时延与输入观测的差异。
 - `localization/localization_config.json`：补齐默认值后的定位专用配置快照及其文件指纹；
   其中含有公开的 `radio.bs_position_m`，但不含 `simulation`、UE 位置、注入偏差
   或生成时使用的 `snr_db`。
@@ -180,7 +190,10 @@ cd /data/zhujun/differt_projects/time-bias-correct
 ./setup_sionna_environment.sh
 ```
 
-### 当前小规模实跑记录
+### 历史版本的小规模实跑记录（CSI 扰动流程）
+
+本节保留谱面采样改造之前的运行证据；其中的位置误差、协方差和扰动次数
+均属于当时版本，不能作为当前 `music_spectrum_sampling_v1` 的验证结果。
 
 run11 已在 Munich 场景从零完整生成，并再次执行一键脚本验证了安全复用和旧指标
 归档。产物保存在 `outputs/deepmimo_sionna_smoke_run11/`。Sionna 共给出 15 条路径，
@@ -205,8 +218,8 @@ run11 已在 Munich 场景从零完整生成，并再次执行一键脚本验证
 CSI、频率和 BS 已知量。批次号标识三个核心文件，完整生成清单自身的 SHA-256
 另外绑定上行、时延和地图等物理声明。第二次运行
 复用了生成数据，先归档第一次指标，再产生新的定位编号并重新评估；定位清单和指标
-仍绑定同一批次。这组数字只用于证明当前代码、物理方向、文件边界和一键脚本彼此
-一致，不作为多场景精度结论。当前结果见
+仍绑定同一批次。这组数字只用于证明当时版本的代码、物理方向、文件边界和一键脚本彼此
+一致，不作为多场景精度结论。当时结果见
 `outputs/deepmimo_sionna_smoke_run11/evaluation/metrics.json`。
 
 run11 中编号为 `691931db-55cb-4e92-b2ba-bb74c39dfd67` 的历史目录是在完整归档机制
@@ -228,15 +241,19 @@ cd /data/zhujun/differt_projects/time-bias-correct
 
 ## 当前边界
 
-- 离线闭环已经实际运行和验证。
+- 新流程的实现与检查记录见 [谱面采样实现记录](docs/spectrum_sampling_implementation_20260908.md)；
+  历史版本的工程运行记录保留在上节，不与新流程合并统计。
 - DeepMIMO/Sionna 的 Munich run11 从零生成、安全复用和历史指标归档都已打通，
-  可证明当前 API、数组形状、固定地图范围、双配置隔离、批次绑定和三阶段脚本能够工作。
+  证明了当时 API、数组形状、固定地图范围、双配置隔离、批次绑定和三阶段脚本能够工作。
 - `music.signal_subspace_rank` 和 `music.num_paths` 仍由配置给定。前者控制 MUSIC
   如何分开信号与噪声，后者控制送入定位的峰数；路径数自动估计留到后续实验。
-- 峰集合配对允许额外虚假峰不匹配。某次扰动若漏掉基准路径，该次结果不会
-  进入最终均值；漏检比例只会保守地放大协方差，避免少信息解把均值拉偏。
-- 少于两次扰动得到完整解时，程序会退回基准解的均值和偏差，并按失败比例放大
-  基准协方差；不会把单次扰动误当成稳定分布。
+- 局部采样复用同一份 CSI 的子空间，不重复分解，不进行扰动峰配对；候选数量
+  由 `music.spectrum_sampling.samples_per_peak` 控制。采样不会补回全局找峰已经漏掉的路径。
+- 聚类代表直接参与一次联合求解；没有足够有效路径时记录失败，失败前已完成的
+  步骤数据单独保存。未执行的后续步骤不生成估计结果。
+- 旧 `music.uncertainty_*`、`association_max_normalized_distance`、
+  `false_peak_penalty`、`missed_peak_penalty` 配置会明确报错。旧报告保持只读兼容；
+  重放旧 CSI 时应使用当前定位配置和新的输出目录。
 - 每次定位都会生成新的运行编号；`run_localization.sh` 和一键 smoke 脚本还会创建
   不可覆盖回执，并绑定配置、场景、在线 CSI 和结果文件指纹；评估
   前会核对生成批次、场景、在线 CSI、真值和结果记录。定位重跑前，旧指标和清单
@@ -253,20 +270,37 @@ cd /data/zhujun/differt_projects/time-bias-correct
 
 ## 结果图表与多 UE 小实验
 
-运行 `./run_visualize_results.sh` 可直接绘制已有 Munich run11 结果。输出按
+运行 `./run_visualize_results.sh` 可直接绘制已有 Munich run11 历史结果；新结果通过
+脚本顶部的输入目录参数指定。输出按
 `samples/UE编号/repeat编号/00–08步骤/` 组织，每步保存图及原始数据，包括 CSI、
-MUSIC、扰动峰、反向候选、聚类、原始峰联合解、扰动求解和最终评估。
+MUSIC、局部谱面采样、全部反向候选、聚类代表、唯一联合解、正向检查和独立评估。
+历史报告使用其原始步骤名，并明确标明旧版本。
 `summary/` 单独保存全部 sample 的定位误差 CDF、Med/P90 图和逐次、逐 UE 汇总表。
 不包含候选簇之间的联系图；绘图独立读取已有评估产物，不修改定位结果。
 
-`./run_visualization_experiment.sh` 提供一个 BS、30 个 UE、每点 5 次独立噪声的
+`./run_spectrum_sampling_experiment.sh` 提供一个 BS、30 个 UE、每点 5 次独立噪声的
 实验入口。设置 `PLAN_ONLY=1` 只生成固定采样计划和示意图；正式执行时每个 UE
 复用同一份无噪声信道生成重复，失败项也计入总数。默认采样范围是已有 UE 附近的
 20 m × 20 m 局部空旷区域。参数、路径、恢复运行和图表含义见
 [结果可视化说明](docs/visualization_experiments.md)。
 
-GPU 批量实验使用 `./run_gpu_experiment.sh`；例如
-`GPU_IDS=0,1 ./run_gpu_experiment.sh` 会启动两个常驻进程，每卡处理不同 UE，
-并在每个 UE 内批量计算 MUSIC 扰动。默认仍为 30 UE × 5 次噪声，逐步骤图表与
-Med/P90/CDF 输出保持原目录结构。安装、单卡/多卡命令、执行记录及对照验证见
+GPU 全量实验示例：
+
+```bash
+cd /data/zhujun/differt_projects/time-bias-correct
+GPU_IDS=0,1,2,3,4,5,6,7 PLAN_ONLY=0 RESUME=0 ./run_spectrum_sampling_experiment.sh
+```
+
+每卡一个常驻进程处理不同 UE；每份接收 CSI 的特征分解只执行一次，全局谱、
+局部谱和连续坐标评价复用该结果。默认仍为 30 UE × 5 次独立噪声。
+先检查已有观测而不生成信道时，运行：
+
+```bash
+cd /data/zhujun/differt_projects/time-bias-correct
+./run_spectrum_sampling_check.sh
+```
+
+检查脚本默认读取旧实验 UE001、UE002、UE006 各一份已保存的 CSI，在新目录重新
+定位并输出逐步骤报告和汇总。两份新脚本的输入、输出和参数都集中在顶部。
+安装、单卡/多卡命令、历史执行记录及对照验证见
 [GPU 运行说明](docs/gpu_execution.md)。

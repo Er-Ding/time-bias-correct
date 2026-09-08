@@ -55,8 +55,32 @@ def _candidate_signatures(candidates: list[dict]) -> list[tuple]:
 
 def _discrete_signature(folder: Path) -> dict:
     peaks = _read_json(folder / "music_peaks.json")
-    bootstrap = _read_json(folder / "bootstrap_diagnostics.json")
     result = _read_json(folder / "localization_result.json")
+    if peaks.get("workflow") == "music_spectrum_sampling_v1":
+        sampling = _read_json(folder / "spectrum_samples.json")
+        return {
+            "workflow": peaks["workflow"],
+            "nominal_peak_indices": [
+                [item["aoa_index"], item["delay_index"]] for item in peaks["nominal"]
+            ],
+            "spectrum_sample_sources_and_cells": [
+                {key: item[key] for key in (
+                    "observation_id", "sample_id", "sampling_kind",
+                    "cell_aoa_index", "cell_delay_index",
+                )} for item in sampling["samples"]
+            ],
+            "raw_candidates": _candidate_signatures(
+                _read_json(folder / "raw_reverse_candidates.json")
+            ),
+            "first_clusters": _candidate_signatures(
+                _read_json(folder / "clustered_candidates.json")
+            ),
+            "central_selected": _candidate_signatures(
+                list(result["central_selected_candidates"].values())
+            ),
+        }
+    # 只读兼容历史产物；新实验不再生成扰动支路。
+    bootstrap = _read_json(folder / "bootstrap_diagnostics.json")
     return {
         "nominal_peak_indices": [
             [item["aoa_index"], item["delay_index"]] for item in peaks["nominal"]
@@ -93,14 +117,33 @@ def _discrete_signature(folder: Path) -> dict:
 
 def compare_localizations(cpu_root: Path, gpu_root: Path, *, position_atol_m: float,
                           bias_atol_ns: float) -> dict:
-    """离散峰、候选和每次扰动都必须一致；不能仅凭最终位置接近判定通过。"""
+    """逐步核对峰、采样来源、候选和求解；兼容历史扰动产物的只读比较。"""
     import numpy as np
 
     cpu_folder, gpu_folder = cpu_root / "localization", gpu_root / "localization"
     cpu = _read_json(cpu_folder / "localization_result.json")
     gpu = _read_json(gpu_folder / "localization_result.json")
     cpu_signature, gpu_signature = _discrete_signature(cpu_folder), _discrete_signature(gpu_folder)
-    checks = {key: cpu_signature[key] == gpu_signature[key] for key in cpu_signature}
+    checks = {key: cpu_signature.get(key) == gpu_signature.get(key)
+              for key in cpu_signature.keys() | gpu_signature.keys()}
+    if cpu_signature.get("workflow") == gpu_signature.get("workflow") == "music_spectrum_sampling_v1":
+        cpu_sampling = _read_json(cpu_folder / "spectrum_samples.json")
+        gpu_sampling = _read_json(gpu_folder / "spectrum_samples.json")
+        for field, absolute, relative in (
+            ("aoa_local_rad", 1e-10, 0), ("delay_s", 1e-17, 0),
+            ("spectrum_value", 1e-8, 1e-4),
+        ):
+            cpu_values = np.asarray([item[field] for item in cpu_sampling["samples"]])
+            gpu_values = np.asarray([item[field] for item in gpu_sampling["samples"]])
+            checks[f"sample_{field}_within_tolerance"] = (
+                cpu_values.shape == gpu_values.shape
+                and bool(np.allclose(cpu_values, gpu_values, atol=absolute, rtol=relative))
+            )
+        checks["single_observation_subspace_per_backend"] = all(
+            item["diagnostics"]["prepared_music"]["eigendecomposition_count"] == 1
+            and item["diagnostics"]["added_csi_noise"] is False
+            for item in (cpu_sampling, gpu_sampling)
+        )
     position_difference = float(np.linalg.norm(np.asarray(cpu["mu_m"]) - gpu["mu_m"]))
     bias_difference = float((gpu["clock_bias_s"] - cpu["clock_bias_s"]) * 1e9)
     central_position_difference = float(np.linalg.norm(
@@ -120,6 +163,9 @@ def compare_localizations(cpu_root: Path, gpu_root: Path, *, position_atol_m: fl
     with np.load(gpu_folder / "music_spectrum.npz") as archive:
         gpu_spectrum = archive["spectrum"]
     difference = np.abs(gpu_spectrum - cpu_spectrum)
+    checks["spectrum_within_tolerance"] = bool(np.allclose(
+        cpu_spectrum, gpu_spectrum, atol=1e-8, rtol=1e-4,
+    ))
     return {
         "passed": all(checks.values()),
         "checks": checks,
@@ -133,8 +179,8 @@ def compare_localizations(cpu_root: Path, gpu_root: Path, *, position_atol_m: fl
         "cpu_nominal_peaks": _read_json(cpu_folder / "music_peaks.json")["nominal"],
         "gpu_nominal_peaks": _read_json(gpu_folder / "music_peaks.json")["nominal"],
         "mismatched_discrete_stages": {
-            key: {"cpu": cpu_signature[key], "cuda": gpu_signature[key]}
-            for key in cpu_signature if not checks[key]
+            key: {"cpu": cpu_signature.get(key), "cuda": gpu_signature.get(key)}
+            for key in cpu_signature.keys() | gpu_signature.keys() if not checks[key]
         },
     }
 
@@ -247,89 +293,111 @@ def _run_full(args, root: Path, config: dict, manifest_path: Path,
 
 
 def _run_kernel(args, root: Path, config: dict, measurement) -> dict:
+    """同一份带噪 CSI：单次子空间分解、全局谱和连续局部谱面采样。"""
     import numpy as np
     from time_bias_localization.compute import ComputeSettings, MusicComputer
-    from time_bias_localization.pipeline import _separation_bins, estimate_noise_std_from_observed_csi
-    from time_bias_localization.signal import _complex_gaussian_noise, extract_local_music_peaks, music_2d_spectrum
+    from time_bias_localization.pipeline import _separation_bins
+    from time_bias_localization.signal import extract_local_music_peaks
+    from time_bias_localization.spectrum_sampling import sample_music_spectrum
 
     kwargs = _spectrum_arguments(config, measurement)
-    observed = measurement.csi_observed
-    rng = np.random.default_rng(int(config["project"]["random_seed"]) + 2)
-    noise_std = estimate_noise_std_from_observed_csi(observed, kwargs["num_sources"])
-    noise_std *= config["music"]["uncertainty_noise_scale"]
-    batch = np.stack([observed] + [
-        observed + _complex_gaussian_noise(observed.shape, noise_std, rng)
-        for _ in range(config["music"]["uncertainty_repeats"])
-    ])
-    if batch.ndim == 3:
-        batch = batch[:, None, :, :]
-    spectra, records = {}, {}
+    grids = {key: kwargs.pop(key) for key in ("aoa_grid_rad", "delay_grid_s")}
+    seed = int(config["project"]["random_seed"]) + 2
+    spectra, samplings, records = {}, {}, {}
     for backend in ("numpy", "cuda"):
         label = "cpu" if backend == "numpy" else "cuda"
         record = {"status": "started"}
         records[label] = record
-        print(f"{label}: 原始 CSI 及同种子的 {len(batch) - 1} 次扰动谱对照", flush=True)
+        print(f"{label}: 同一份带噪 CSI 的一次分解、全局谱和局部谱采样对照", flush=True)
         try:
-            start = time.perf_counter()
-            computer = MusicComputer(ComputeSettings(
+            settings = ComputeSettings(
                 backend=backend, device_id=args.device_id, batch_size=args.batch_size,
                 angle_chunk_size=args.angle_chunk_size,
-            ))
-            if backend == "numpy":
-                music_2d_spectrum(batch[0], **kwargs)
-            else:
-                computer.spectrum(batch[0], **kwargs)
+            )
+            start = time.perf_counter()
+            warmup = MusicComputer(settings)
+            warmup.spectrum(measurement.csi_observed, **kwargs, **grids)
             _synchronize(backend, args.device_id)
             record["warmup_s"] = time.perf_counter() - start
+            del warmup
+            computer = MusicComputer(settings)
+            _synchronize(backend, args.device_id)
+            total_start = time.perf_counter()
             start = time.perf_counter()
-            values = (np.stack([music_2d_spectrum(item, **kwargs) for item in batch])
-                      if backend == "numpy" else computer.spectra(batch, **kwargs))
+            prepared = computer.prepare(measurement.csi_observed, **kwargs)
+            values = prepared.spectrum(**grids)
             _synchronize(backend, args.device_id)
             record["spectrum_wall_s"] = time.perf_counter() - start
-            peak_sets = []
             start = time.perf_counter()
-            nominal_count = None
-            for index, spectrum in enumerate(values):
-                limit = (config["music"]["num_paths"] if index == 0
-                         else nominal_count + config["music"]["uncertainty_extra_peaks"])
-                peaks = extract_local_music_peaks(
-                    spectrum, aoa_grid_rad=kwargs["aoa_grid_rad"], delay_grid_s=kwargs["delay_grid_s"],
-                    max_peaks=limit, minimum_separation_bins=_separation_bins(config["music"]),
-                    minimum_relative_height=(0.0 if index == 0 else config["music"]["uncertainty_min_relative_height"]),
-                )
-                if index == 0:
-                    nominal_count = len(peaks)
-                peak_sets.append([asdict(peak) for peak in peaks])
-            metadata = (computer.metadata() if backend == "cuda" else {
-                "backend": "numpy", "array_library": "numpy", "array_library_version": np.__version__,
-                "device_name": "CPU", "entrypoint": "signal.music_2d_spectrum", "batch_size": 1,
-                "complex_dtype": "complex128", "real_dtype": "float64", "completed_csi": len(batch),
+            peaks = extract_local_music_peaks(
+                values, **grids, max_peaks=config["music"]["num_paths"],
+                minimum_separation_bins=_separation_bins(config["music"]),
+                minimum_relative_height=0.0,
+            )
+            record["peak_extraction_s"] = time.perf_counter() - start
+            start = time.perf_counter()
+            sampled = sample_music_spectrum(
+                prepared, peaks, **grids, bs_boresight_rad=measurement.bs_boresight_rad,
+                settings=config["music"]["spectrum_sampling"], seed=seed,
+            )
+            _synchronize(backend, args.device_id)
+            record["sampling_wall_s"] = time.perf_counter() - start
+            record["music_and_sampling_wall_s"] = time.perf_counter() - total_start
+            record.update({
+                "status": "success", "compute": computer.metadata(),
+                "prepared_music": prepared.metadata(), "peaks": [asdict(peak) for peak in peaks],
+                "sampling_diagnostics": sampled.diagnostics,
             })
-            record.update({"peak_extraction_s": time.perf_counter() - start,
-                           "status": "success", "compute": metadata, "peaks": peak_sets})
             spectra[label] = values
-            np.savez_compressed(root / f"{label}_spectra.npz", spectra=values,
-                                aoa_grid_rad=kwargs["aoa_grid_rad"], delay_grid_s=kwargs["delay_grid_s"])
+            samplings[label] = sampled
+            np.savez_compressed(root / f"{label}_spectra.npz", spectra=values, **grids)
+            _write_json(root / f"{label}_spectrum_samples.json", {
+                "samples": sampled.records, "regions": sampled.regions,
+                "diagnostics": sampled.diagnostics,
+            })
         except Exception as error:
             record.update({"status": "failed", "error_type": type(error).__name__,
                            "error": str(error), "traceback": traceback.format_exc()})
         _write_json(root / f"{label}_benchmark.json", record)
     comparison = {"passed": False}
-    report = {"runs": records, "comparison": comparison, "spectrum_count": len(batch)}
+    report = {"runs": records, "comparison": comparison, "spectrum_count": 1,
+              "workflow": "music_spectrum_sampling_v1", "added_csi_noise": False}
     if len(spectra) == 2:
-        indices = {key: [[[p["aoa_index"], p["delay_index"]] for p in items]
-                         for items in records[key]["peaks"]] for key in records}
+        indices = {key: [[p["aoa_index"], p["delay_index"]] for p in records[key]["peaks"]]
+                   for key in records}
         difference = np.abs(spectra["cuda"] - spectra["cpu"])
         spectrum_close = bool(np.allclose(spectra["cpu"], spectra["cuda"], rtol=1e-4, atol=1e-8))
+        cpu_records, gpu_records = samplings["cpu"].records, samplings["cuda"].records
+        same_count = len(cpu_records) == len(gpu_records)
+        same_sources = same_count and all(
+            all(cpu[key] == gpu[key] for key in (
+                "sample_id", "observation_id", "sampling_kind", "cell_aoa_index", "cell_delay_index",
+            )) for cpu, gpu in zip(cpu_records, gpu_records)
+        )
+        continuous_checks = {}
+        for field, absolute, relative in (
+            ("aoa_local_rad", 1e-10, 0), ("delay_s", 1e-17, 0),
+            ("spectrum_value", 1e-8, 1e-4),
+        ):
+            continuous_checks[field] = same_count and bool(np.allclose(
+                [item[field] for item in cpu_records], [item[field] for item in gpu_records],
+                atol=absolute, rtol=relative,
+            ))
+        single_eigh = all(records[key]["compute"]["eigendecomposition_count"] == 1 for key in records)
         comparison.update({
-            "passed": indices["cpu"] == indices["cuda"] and spectrum_close,
+            "passed": (indices["cpu"] == indices["cuda"] and spectrum_close and same_sources
+                       and all(continuous_checks.values()) and single_eigh),
             "all_peak_indices_equal": indices["cpu"] == indices["cuda"],
             "spectra_within_tolerance": spectrum_close,
+            "sample_sources_and_cells_equal": same_sources,
+            "continuous_sample_checks": continuous_checks,
+            "single_eigendecomposition_per_backend": single_eigh,
             "spectrum_rtol": 1e-4, "spectrum_atol": 1e-8,
             "spectrum_max_absolute_difference": float(difference.max()),
             "spectrum_relative_l2_difference": float(np.linalg.norm(difference) / np.linalg.norm(spectra["cpu"])),
         })
-        report["cpu_over_gpu_time_ratio"] = records["cpu"]["spectrum_wall_s"] / records["cuda"]["spectrum_wall_s"]
+        report["cpu_over_gpu_time_ratio"] = (records["cpu"]["music_and_sampling_wall_s"]
+                                                  / records["cuda"]["music_and_sampling_wall_s"])
     return report
 
 
@@ -414,7 +482,8 @@ def main(argv=None) -> int:
         writer = csv.writer(handle)
         writer.writerow(["backend", "status", "stage", "seconds"])
         for label, record in report["runs"].items():
-            for key in ("warmup_s", "localize_wall_s", "spectrum_wall_s", "peak_extraction_s"):
+            for key in ("warmup_s", "localize_wall_s", "spectrum_wall_s", "peak_extraction_s",
+                        "sampling_wall_s", "music_and_sampling_wall_s"):
                 if key in record:
                     writer.writerow([label, record["status"], key, record[key]])
             for key, value in record.get("stage_timings_s", {}).items():
