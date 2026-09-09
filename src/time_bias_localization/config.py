@@ -74,7 +74,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "huber_delta_m": 0.75,
         "max_iterations": 20,
         "max_seed_pairs": 100000,
+        # DBSCAN 的邻域距离 eps，允许一个连续簇的总跨度超过此值。
         "candidate_cluster_radius_m": 1.5,
+        "candidate_cluster_min_samples": 5,
         # 兼容旧配置快照；点聚类主流程不再使用方向阈值。
         "candidate_direction_radius_deg": 5.0,
     },
@@ -132,6 +134,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "bias_max_s",
             "initial_reference_bias_s",
             "candidate_cluster_radius_m",
+            "candidate_cluster_min_samples",
             "candidate_direction_radius_deg",
             "huber_delta_m",
             "max_iterations",
@@ -444,6 +447,10 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
         raise ValueError("initial_reference_bias_s 必须是有限数") from error
     if not bias_min <= reference_bias <= bias_max:
         raise ValueError("initial_reference_bias_s 必须位于 [bias_min_s, bias_max_s] 范围内")
+    if isinstance(localization["candidate_cluster_radius_m"], bool):
+        raise ValueError("candidate_cluster_radius_m 必须为有限正数，不能是布尔值")
+    if not isinstance(localization["candidate_cluster_min_samples"], int):
+        raise ValueError("candidate_cluster_min_samples 必须为正整数")
     for name in (
         "candidate_cluster_radius_m",
         "candidate_direction_radius_deg",
@@ -451,6 +458,7 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
     ):
         _positive_float(name, localization[name])
     _positive_integer("max_iterations", localization["max_iterations"])
+    _positive_integer("candidate_cluster_min_samples", localization["candidate_cluster_min_samples"])
     _positive_integer("max_seed_pairs", localization.get("max_seed_pairs", 100000))
 
     angle_min = _finite_float("angle_min_deg", music["angle_min_deg"])

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 import math
+from numbers import Real
 from typing import TYPE_CHECKING, Any, Iterable, Sequence
 
 import numpy as np
@@ -255,17 +256,39 @@ def generate_initial_candidate_points(
     })
 
 
+@dataclass(frozen=True)
+class InitialCandidateClusteringResult:
+    """聚类结果及全部点的去向；离群点只记录，不建立代表点。"""
+
+    representatives: list[RepresentativeCandidatePoint]
+    noise_points: list[InitialCandidatePoint]
+    memberships: list[dict[str, Any]]
+    diagnostics: dict[str, Any]
+
+
 def cluster_initial_candidate_points(
     points: Sequence[InitialCandidatePoint], *, position_radius_m: float = 1.5,
-) -> list[RepresentativeCandidatePoint]:
-    """同一来源峰、同一墙序列内，纯粹按参考位置的 XY 欧式距离聚类。
+    min_samples: int = 5, return_diagnostics: bool = False,
+) -> list[RepresentativeCandidatePoint] | InitialCandidateClusteringResult:
+    """同一来源峰、同一墙序列内，对参考位置进行确定性 DBSCAN 聚类。
 
-    阈值限制簇内任意两点的最大距离。方向、bias 区间和轨迹距离均不参与
-    分组。代表为加权距离和最小的真实成员；并列由稳定样本顺序确定。
+    ``position_radius_m`` 保留原参数名，但现在表示邻近距离 eps，不限制整簇
+    的最大跨度。邻域内点数包含自身；达到 ``min_samples`` 的点为核心点，
+    核心点通过相邻关系连接成簇。非核心点只归入最近核心点所在的簇；距离
+    并列时按簇最小 sample_id 选择，不能通过边界点连接两个核心簇。
+
+    密度只计等权样本数量，不使用谱值。每簇代表仍为加权距离和最小的真实
+    成员；并列按 sample_id。离群点不生成代表，开启 return_diagnostics
+    可取得核心点、边界点、离群点及全部成员归属。方向与轨迹不参与聚类。
     """
 
-    if not np.isfinite(position_radius_m) or position_radius_m <= 0:
-        raise ValueError("position_radius_m 必须为有限正数")
+    if (isinstance(position_radius_m, (bool, np.bool_))
+            or not isinstance(position_radius_m, Real)
+            or not np.isfinite(position_radius_m) or position_radius_m <= 0):
+        raise ValueError("position_radius_m (DBSCAN eps) 必须为有限正数，不能为布尔值")
+    if (isinstance(min_samples, (bool, np.bool_))
+            or not isinstance(min_samples, (int, np.integer)) or min_samples <= 0):
+        raise ValueError("min_samples 必须为正整数，包含点自身，不能为布尔值")
     references = {point.reference_bias_s for point in points}
     if len(references) > 1:
         raise ValueError("同一轮初始点必须使用相同 reference_bias_s")
@@ -279,31 +302,57 @@ def cluster_initial_candidate_points(
         seen.add(key)
         grouped.setdefault((point.observation_id, point.reflection_wall_ids), []).append(point)
         valid_samples.setdefault(point.observation_id, set()).add(point.sample_id)
+
     representatives: list[RepresentativeCandidatePoint] = []
-    for (observation_id, _), group in sorted(grouped.items()):
+    noise_points: list[InitialCandidatePoint] = []
+    memberships: list[dict[str, Any]] = []
+    group_summaries: list[dict[str, Any]] = []
+    for (observation_id, wall_ids), group in sorted(grouped.items()):
         group = sorted(group, key=lambda point: point.sample_id)
         positions = np.asarray([point.position_m for point in group])
         distances = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2)
-        components: list[list[int]] = []
-        for index in range(len(group)):
-            options = [
-                (float(np.max(distances[index, members])), cluster_index)
-                for cluster_index, members in enumerate(components)
-                if np.all(distances[index, members] <= position_radius_m)
-            ]
-            if options:
-                _, cluster_index = min(options)
-                components[cluster_index].append(index)
-            else:
-                components.append([index])
-        for component_index, component in enumerate(components):
+        neighbors = distances <= position_radius_m
+        neighbor_counts = np.sum(neighbors, axis=1)
+        core_mask = neighbor_counts >= min_samples
+        labels = np.full(len(group), -1, dtype=int)
+        core_components: list[list[int]] = []
+        # 只遍历核心点之间的边，边界点不能把两团核心点连接起来。
+        for seed in np.flatnonzero(core_mask):
+            if labels[seed] != -1:
+                continue
+            label = len(core_components)
+            labels[seed] = label
+            pending = [int(seed)]
+            component: list[int] = []
+            while pending:
+                index = pending.pop()
+                component.append(index)
+                adjacent = np.flatnonzero(neighbors[index] & core_mask & (labels == -1))
+                labels[adjacent] = label
+                pending.extend(int(item) for item in adjacent)
+            core_components.append(sorted(component))
+        core_indices = np.flatnonzero(core_mask)
+        for index in np.flatnonzero(~core_mask):
+            adjacent = core_indices[neighbors[index, core_indices]]
+            if len(adjacent):
+                # 最小核心距离优先；同距时簇序已由稳定的 sample_id 决定。
+                nearest = min(adjacent, key=lambda item: (distances[index, item], labels[item]))
+                labels[index] = labels[nearest]
+
+        candidate_ids: dict[int, str] = {}
+        for component_index in range(len(core_components)):
+            component = np.flatnonzero(labels == component_index)
             members = tuple(group[index] for index in component)
             member_distances = distances[np.ix_(component, component)]
             weights = np.asarray([member.weight for member in members], dtype=float)
+            weights /= np.max(weights)
             weights /= np.sum(weights)
             representative = members[int(np.argmin(member_distances @ weights))]
             # 墙编号自身允许含 '-'，不能靠拼接墙编号保证候选 ID 唯一。
             candidate_id = f"{observation_id}:point_cluster_{len(representatives):06d}"
+            candidate_ids[component_index] = candidate_id
+            core_sample_ids = [group[index].sample_id for index in component if core_mask[index]]
+            border_sample_ids = [group[index].sample_id for index in component if not core_mask[index]]
             metadata = {
                 "topology_id": representative.topology_id,
                 "reflection_wall_ids": list(representative.reflection_wall_ids),
@@ -313,9 +362,18 @@ def cluster_initial_candidate_points(
                 "reference_bias_s": float(representative.reference_bias_s),
                 "initial_position_m": list(representative.position_m),
                 "representative_rule": "weighted_medoid_actual_member",
+                "cluster_algorithm": "dbscan",
                 "cluster_distance_rule": "euclidean_at_reference_bias",
-                "cluster_linkage_rule": "deterministic_greedy_complete_compatibility",
+                "cluster_linkage_rule": "density_connected_core_points_with_border_assignment",
                 "position_radius_m": float(position_radius_m),
+                "eps_m": float(position_radius_m),
+                "min_samples": int(min_samples),
+                "min_samples_includes_self": True,
+                "density_weighting": "equal_sample_counts",
+                "core_sample_ids": core_sample_ids,
+                "border_sample_ids": border_sample_ids,
+                "core_point_count": len(core_sample_ids),
+                "border_point_count": len(border_sample_ids),
                 "maximum_member_point_distance_m": float(np.max(member_distances)),
                 "uses_trajectory_distance": False,
                 "uses_direction_threshold": False,
@@ -324,7 +382,57 @@ def cluster_initial_candidate_points(
                 "empirical_frequency_denominator": "distinct_samples_with_valid_initial_point",
             }
             representatives.append(RepresentativeCandidatePoint(candidate_id, representative, members, metadata))
-    return representatives
+        for index, point in enumerate(group):
+            label = int(labels[index])
+            role = "core" if core_mask[index] else "border" if label >= 0 else "noise"
+            if role == "noise":
+                noise_points.append(point)
+            memberships.append({
+                "observation_id": point.observation_id,
+                "sample_id": point.sample_id,
+                "topology_id": point.topology_id,
+                "reflection_wall_ids": list(point.reflection_wall_ids),
+                "reference_bias_s": float(point.reference_bias_s),
+                "position_m": list(point.position_m),
+                "candidate_id": candidate_ids.get(label),
+                "role": role,
+                "neighbor_count": int(neighbor_counts[index]),
+                "is_representative": label >= 0 and point.sample_id == representatives[
+                    len(representatives) - len(core_components) + label
+                ].point.sample_id,
+            })
+        group_summaries.append({
+            "observation_id": observation_id,
+            "reflection_wall_ids": list(wall_ids),
+            "reference_bias_s": float(group[0].reference_bias_s),
+            "input_point_count": len(group),
+            "cluster_count": len(core_components),
+            "core_point_count": int(np.count_nonzero(core_mask)),
+            "border_point_count": int(np.count_nonzero((labels >= 0) & ~core_mask)),
+            "noise_point_count": int(np.count_nonzero(labels < 0)),
+            "noise_sample_ids": [group[index].sample_id for index in np.flatnonzero(labels < 0)],
+        })
+    result = InitialCandidateClusteringResult(representatives, noise_points, memberships, {
+        "algorithm": "dbscan",
+        "eps_m": float(position_radius_m),
+        "position_radius_m": float(position_radius_m),
+        "min_samples": int(min_samples),
+        "min_samples_includes_self": True,
+        "density_weighting": "equal_sample_counts",
+        "border_assignment_rule": "nearest_core_then_stable_component_order",
+        "grouping_rule": "same_observation_and_full_reflection_wall_sequence",
+        "reference_bias_s": float(next(iter(references))) if references else None,
+        "input_point_count": len(points),
+        "cluster_count": len(representatives),
+        "core_point_count": sum(row["role"] == "core" for row in memberships),
+        "border_point_count": sum(row["role"] == "border" for row in memberships),
+        "noise_point_count": len(noise_points),
+        "clustered_point_count": len(points) - len(noise_points),
+        "noise_policy": "record_without_representative_or_trajectory",
+        "group_summaries": group_summaries,
+        "builds_bias_trajectories": False,
+    })
+    return result if return_diagnostics else representatives
 
 
 def build_representative_trajectories(
@@ -398,6 +506,7 @@ def build_representative_trajectories(
 
 
 __all__ = [
+    "InitialCandidateClusteringResult",
     "InitialCandidateGenerationResult",
     "InitialCandidatePoint",
     "RepresentativeCandidatePoint",

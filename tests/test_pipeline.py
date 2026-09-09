@@ -330,8 +330,8 @@ def test_successful_evaluation_is_bound_to_localization_run(
         Path(manifest["config_snapshot"]["path"]).read_text(encoding="utf-8")
     )
     assert manifest["evaluation_pending"] is False
-    assert manifest["schema_version"] == 5
-    assert manifest["workflow"] == "music_point_clustering_v2"
+    assert manifest["schema_version"] == 6
+    assert manifest["workflow"] == "music_fine_spectrum_dbscan_v3"
     expected_artifacts = {
         "result": "localization_result.json",
         "music_spectrum": "music_spectrum.npz",
@@ -1979,7 +1979,7 @@ def test_localize_archives_legacy_schema2_evaluation_without_forging_sources(
         assert file_sha256(record["path"]) == record["sha256"]
 
 
-@pytest.mark.parametrize("schema_version", [3, 4, 5])
+@pytest.mark.parametrize("schema_version", [3, 4, 5, 6])
 def test_archive_uses_frozen_records_after_generation_manifest_updates(
     localized_run: dict[str, object], schema_version,
 ) -> None:
@@ -2013,6 +2013,10 @@ def test_archive_uses_frozen_records_after_generation_manifest_updates(
             name: artifact_record(folder / filename)
             for name, filename in pipeline_module._SPECTRUM_TRAJECTORY_ARTIFACT_FILENAMES.items()
         }
+        _write_json(manifest_path, manifest)
+    if schema_version == 5:
+        manifest = json.loads(manifest_path.read_text())
+        manifest.update(schema_version=5, workflow="music_point_clustering_v2")
         _write_json(manifest_path, manifest)
     old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     old_run_id = old_manifest["run_id"]
@@ -2436,7 +2440,8 @@ def test_initial_points_are_clustered_before_any_trajectory_is_constructed(tmp_p
         assert points is recorded["points"]
         assert "direction_radius_deg" not in kwargs
         output = real_cluster(points, **kwargs)
-        recorded["representatives"] = output
+        recorded["representatives"] = output.representatives
+        recorded["clustering"] = output
         return output
     def capture_build(representatives, **kwargs):
         stages.append("representative_trajectories")

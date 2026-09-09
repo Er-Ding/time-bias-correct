@@ -92,8 +92,8 @@ if records["manifest"]["sha256"] != manifest_sha256:
     manifest = json.loads(manifest_bytes.decode("utf-8"))
     if not isinstance(manifest, dict) or manifest.get("run_id") != run_id:
         raise SystemExit("当前定位清单既不匹配回执哈希，也不属于回执运行编号")
-    if manifest.get("schema_version") not in (3, 4, 5):
-        raise SystemExit("只有 schema_version=3、4 或 5 的定位清单允许核对评估写回")
+    if manifest.get("schema_version") not in (3, 4, 5, 6):
+        raise SystemExit("只有 schema_version=3、4、5 或 6 的定位清单允许核对评估写回")
     current_result = manifest.get("artifacts", {}).get("result")
     if not isinstance(current_result, dict):
         raise SystemExit("当前定位清单缺少结果来源记录")

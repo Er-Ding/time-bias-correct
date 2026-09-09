@@ -1,6 +1,8 @@
 # GPU 批量实验
 
-当前主流程为 `music_point_clustering_v2`。每份接收到的带噪 CSI 只做一次协方差和特征分解，随后在 GPU 上复用该结果计算全局谱、峰附近细谱面及连续采样坐标的谱值。谱面样本先在统一参考 bias 下反向 RT 到初始位置点，对点聚类后只为代表生成轨迹，再执行一次位置与公共 bias 联合求解。不同 UE 分给独立进程执行。
+正式峰、采样概率和局部底图统一使用细谱，点聚类采用 DBSCAN（默认邻域 1.5 米、5 点）。具体数据流、离群点处理和本次验证见 [统一细谱与 DBSCAN](fine_spectrum_dbscan_workflow_20260909.md)。
+
+当前主流程为 `music_fine_spectrum_dbscan_v3`。每份接收到的带噪 CSI 只做一次协方差和特征分解，随后在 GPU 上复用该结果计算全局谱、峰附近细谱面及连续采样坐标的谱值。谱面样本先在统一参考 bias 下反向 RT 到初始位置点，对点聚类后只为代表生成轨迹，再执行一次位置与公共 bias 联合求解。不同 UE 分给独立进程执行。
 
 每个 UE 的多次独立噪声重复属于实验数据生成；定位内部不再给接收 CSI 额外加噪。下文的历史验证记录仍保留旧流程数字，并明确标注版本。
 
@@ -10,14 +12,14 @@
 
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
-GPU_IDS=0 ./run_point_clustering_experiment.sh
+GPU_IDS=0 ./run_fine_dbscan_experiment.sh
 ```
 
 两张卡并行，每张卡一个常驻进程：
 
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
-GPU_IDS=0,1 ./run_point_clustering_experiment.sh
+GPU_IDS=0,1 ./run_fine_dbscan_experiment.sh
 ```
 
 `GPU_IDS` 使用 `nvidia-smi` 中的设备编号。每个进程只看见分给自己的那张卡，进程内部的 `device_id` 因此固定为 `0`。同一进程内，Sionna 信道生成和 MUSIC 使用同一张卡。所有指定的卡通过 CUDA 预检后，才开始分配 UE；无法使用 GPU 会明确报错。
@@ -75,7 +77,7 @@ COMPUTE_BACKEND=numpy WORKERS=2 CPU_THREADS=1 ./run_visualization_experiment.sh
 - `compute.py`：`MusicComputer.prepare()` 为一份 CSI 计算一次子空间；返回对象的 `spectrum()` 和 `values()` 分别评价网格和成对连续坐标。CUDA 模式使用 CuPy 双精度，角度分块限制临时数组；导向向量缓存有数量和内存上限。
 - `music_stage.py`：在常驻进程内复用计算器及设备上下文。旧扰动函数仅供历史回归检查，主流程不再调用。
 - `spectrum_sampling.py`：每个峰附近细化谱面，以谱形和少量均匀覆盖构造候选搜索分布，先抽单元、再在单元内抽连续角度与时延。局部谱和采样坐标的精确谱值复用同一子空间，不再次分解 CSI。
-- `pipeline.py`：全部样本在参考 bias 下反向追踪到初始点，对点聚类后才为代表建立轨迹，然后联合求解和正向检查。新产物使用第 5 版清单，并记录 `workflow=music_point_clustering_v2`。
+- `pipeline.py`：全部样本在参考 bias 下反向追踪到初始点，对点聚类后才为代表建立轨迹，然后联合求解和正向检查。新产物使用第 6 版清单，并记录 `workflow=music_point_clustering_v2`。
 
 仍在 CPU 上运行的部分包括：二维墙线提取、峰值筛选、初始点反向追踪、点聚类、代表轨迹生成、候选组合和位置/偏差求解、文件写入与绘图。GPU 利用率因此会随阶段变化，不能期望从开始到结束始终满载。
 
@@ -132,7 +134,7 @@ GPU 不可用导致工作进程启动失败时，UE 任务尚未发布，可以�
 cd /data/zhujun/differt_projects/time-bias-correct
 EXPERIMENT_ROOT=/绝对路径/已有实验目录 \
 REPORT_ROOT=/绝对路径/新的报告目录 \
-GPU_IDS=0,1 RESUME=1 ./run_point_clustering_experiment.sh
+GPU_IDS=0,1 RESUME=1 ./run_fine_dbscan_experiment.sh
 ```
 
 命令行模块不传 `--report-output` 时只执行计算。之后可独立绘图：

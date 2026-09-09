@@ -1,18 +1,19 @@
 # 时间偏差校正的二维多径定位
 
-当前定位主流程为 `music_point_clustering_v2`，定位清单格式为第 5 版：
+当前定位主流程为 `music_fine_spectrum_dbscan_v3`，定位清单格式为第 6 版：
 
 ```text
-一份接收到的带噪 CSI → 一次协方差与特征分解 → 二维 MUSIC 谱与找峰
-  → 各峰附近连续采样角度和观测时延 → 参考 bias 下反向 RT 得到初始位置点
-  → 同来源峰、同反射墙顺序内对位置点聚类并选真实代表
+一份接收到的带噪 CSI → 一次协方差与特征分解 → 粗谱确定区域 → 局部细谱正式找峰
+  → 在同一份局部细谱上连续采样角度和观测时延 → 参考 bias 下反向 RT 得到初始位置点
+  → 同来源峰、同反射墙顺序内做 DBSCAN 点聚类，每簇选一个真实代表，单独记录离群点
   → 只为代表点生成随 bias 变化的轨迹 → 一次位置与公共 bias 联合求解
   → 正向路径检查 → 独立读取真值评估
 ```
 
 定位内部不再给 CSI 额外加噪，也不再逐次扰动求解后平均。实验中每个 UE 的
 5 次独立噪声重复仍保留，用于生成 5 份接收数据；每份接收数据分别执行上述流程。
-实现与验证说明见 [点聚类流程说明](docs/point_clustering_workflow_20260909.md)。
+实现、运行命令与验证结果见 [统一细谱与 DBSCAN 流程说明](docs/fine_spectrum_dbscan_workflow_20260909.md)。
+先检查三份已有 CSI：`./run_fine_dbscan_check.sh`；全量新实验：`./run_fine_dbscan_experiment.sh`。
 初始参考偏差 `localization.initial_reference_bias_s` 默认为 0 秒，是公开假设，不是实际 bias；
 它只用于形成聚类点集，最终 bias 仍由联合求解得到。
 
@@ -197,7 +198,7 @@ cd /data/zhujun/differt_projects/time-bias-correct
 ### 历史版本的小规模实跑记录（CSI 扰动流程）
 
 本节保留谱面采样改造之前的运行证据；其中的位置误差、协方差和扰动次数
-均属于当时版本，不能作为当前 `music_point_clustering_v2` 的验证结果。
+均属于当时版本，不能作为当前 `music_fine_spectrum_dbscan_v3` 的验证结果。
 
 run11 已在 Munich 场景从零完整生成，并再次执行一键脚本验证了安全复用和旧指标
 归档。产物保存在 `outputs/deepmimo_sionna_smoke_run11/`。Sionna 共给出 15 条路径，

@@ -19,6 +19,11 @@ import time
 import traceback
 
 
+FINE_SPECTRUM_WORKFLOW = "music_fine_spectrum_dbscan_v3"
+POINT_WORKFLOWS = {"music_point_clustering_v2", FINE_SPECTRUM_WORKFLOW}
+SPECTRUM_WORKFLOWS = {"music_spectrum_sampling_v1", *POINT_WORKFLOWS}
+
+
 def _write_json(path: Path, value) -> None:
     def encode(item):
         if hasattr(item, "tolist"):
@@ -56,7 +61,7 @@ def _candidate_signatures(candidates: list[dict]) -> list[tuple]:
 def _discrete_signature(folder: Path) -> dict:
     peaks = _read_json(folder / "music_peaks.json")
     result = _read_json(folder / "localization_result.json")
-    if peaks.get("workflow") in {"music_spectrum_sampling_v1", "music_point_clustering_v2"}:
+    if peaks.get("workflow") in SPECTRUM_WORKFLOWS:
         sampling = _read_json(folder / "spectrum_samples.json")
         signature = {
             "workflow": peaks["workflow"],
@@ -73,7 +78,7 @@ def _discrete_signature(folder: Path) -> dict:
                 list(result["central_selected_candidates"].values())
             ),
         }
-        if peaks["workflow"] == "music_point_clustering_v2":
+        if peaks["workflow"] in POINT_WORKFLOWS:
             initial = _read_json(folder / "initial_candidates.json")
             representatives = _read_json(folder / "representative_points.json")
             signature.update(
@@ -89,6 +94,31 @@ def _discrete_signature(folder: Path) -> dict:
                     _read_json(folder / "representative_trajectories.json")
                 ),
             )
+            if peaks["workflow"] == FINE_SPECTRUM_WORKFLOW:
+                signature.update(
+                    coarse_peak_indices=[(item["aoa_index"], item["delay_index"]) for item in peaks["coarse"]],
+                    nominal_source_indices=peaks["nominal_source_indices"],
+                    fine_region_sources_and_indices=[
+                        (item["observation_id"], item["source_peak_index"],
+                         item["refined_aoa_grid_index"], item["refined_delay_grid_index"])
+                        for item in sampling["regions"]
+                    ],
+                    suppressed_refined_peak_sources=[
+                        (item["source_peak_index"], item["kept_source_peak_index"], item["reason"])
+                        for item in sampling["diagnostics"]["suppressed_refined_peaks"]
+                    ],
+                    dbscan_noise_points=_candidate_signatures(representatives["noise_points"]),
+                    dbscan_membership_roles=sorted([
+                        (item["observation_id"], item["sample_id"], tuple(item["reflection_wall_ids"]),
+                         item["candidate_id"], item["role"], item["neighbor_count"], item["is_representative"])
+                        for item in representatives["memberships"]
+                    ], key=repr),
+                    dbscan_core_border_members=sorted([
+                        (item["candidate_id"], tuple(sorted(item["metadata"]["core_sample_ids"])),
+                         tuple(sorted(item["metadata"]["border_sample_ids"])))
+                        for item in representatives["representatives"]
+                    ], key=repr),
+                )
         else:
             signature.update(
                 raw_candidates=_candidate_signatures(_read_json(folder / "raw_reverse_candidates.json")),
@@ -131,6 +161,55 @@ def _discrete_signature(folder: Path) -> dict:
     }
 
 
+def _fine_music_checks(cpu_peaks: dict, gpu_peaks: dict, cpu_sampling: dict, gpu_sampling: dict) -> dict:
+    """正式峰坐标及用于画图和抽样的同一细谱，完整核对两个后端。"""
+    import numpy as np
+
+    def close(cpu, gpu, absolute, relative=0):
+        cpu_array, gpu_array = np.asarray(cpu), np.asarray(gpu)
+        return cpu_array.shape == gpu_array.shape and bool(np.allclose(
+            cpu_array, gpu_array, atol=absolute, rtol=relative,
+        ))
+
+    checks = {"fine_nominal_source_indices_equal":
+              cpu_peaks["nominal_source_indices"] == gpu_peaks["nominal_source_indices"]}
+    for field, absolute, relative in (("aoa_rad", 1e-10, 0), ("delay_s", 1e-17, 0),
+                                      ("spectrum_value", 1e-8, 1e-4)):
+        checks[f"fine_peak_{field}_within_tolerance"] = close(
+            [peak[field] for peak in cpu_peaks["nominal"]],
+            [peak[field] for peak in gpu_peaks["nominal"]], absolute, relative,
+        )
+    cpu_regions, gpu_regions = cpu_sampling["regions"], gpu_sampling["regions"]
+    same_regions = len(cpu_regions) == len(gpu_regions)
+    checks["fine_region_sources_equal"] = same_regions and all(
+        cpu["observation_id"] == gpu["observation_id"]
+        and cpu["source_peak_index"] == gpu["source_peak_index"]
+        and cpu["refined_aoa_grid_index"] == gpu["refined_aoa_grid_index"]
+        and cpu["refined_delay_grid_index"] == gpu["refined_delay_grid_index"]
+        for cpu, gpu in zip(cpu_regions, gpu_regions)
+    )
+    for field, absolute, relative in (
+        ("aoa_grid_rad", 1e-10, 0), ("delay_grid_s", 1e-17, 0),
+        ("spectrum", 1e-8, 1e-4), ("cell_spectrum", 1e-8, 1e-4),
+        ("cell_probabilities", 1e-12, 1e-4),
+    ):
+        checks[f"fine_region_{field}_within_tolerance"] = same_regions and all(
+            close(cpu[field], gpu[field], absolute, relative)
+            for cpu, gpu in zip(cpu_regions, gpu_regions)
+        )
+    checks["fine_region_boundary_status_equal"] = same_regions and all(
+        all(cpu[field] == gpu[field] for field in (
+            "peak_on_window_edge", "refined_peak_search_boundary_axes", "unresolved_window_peak",
+        )) for cpu, gpu in zip(cpu_regions, gpu_regions)
+    )
+    checks["fine_peak_and_proposal_share_spectrum"] = all(
+        sampling["diagnostics"]["peak_and_proposal_share_fine_spectrum"] is True
+        and sampling["diagnostics"]["exact_sample_spectrum_used_for_proposal"] is False
+        for sampling in (cpu_sampling, gpu_sampling)
+    )
+    return checks
+
+
 def compare_localizations(cpu_root: Path, gpu_root: Path, *, position_atol_m: float,
                           bias_atol_ns: float) -> dict:
     """逐步核对峰、采样来源、候选和求解；兼容历史扰动产物的只读比较。"""
@@ -142,9 +221,9 @@ def compare_localizations(cpu_root: Path, gpu_root: Path, *, position_atol_m: fl
     cpu_signature, gpu_signature = _discrete_signature(cpu_folder), _discrete_signature(gpu_folder)
     checks = {key: cpu_signature.get(key) == gpu_signature.get(key)
               for key in cpu_signature.keys() | gpu_signature.keys()}
-    if cpu_signature.get("workflow") == gpu_signature.get("workflow") and cpu_signature.get("workflow") in {
-        "music_spectrum_sampling_v1", "music_point_clustering_v2",
-    }:
+    workflow = cpu_signature.get("workflow")
+    same_workflow = workflow == gpu_signature.get("workflow")
+    if same_workflow and workflow in SPECTRUM_WORKFLOWS:
         cpu_sampling = _read_json(cpu_folder / "spectrum_samples.json")
         gpu_sampling = _read_json(gpu_folder / "spectrum_samples.json")
         for field, absolute, relative in (
@@ -162,11 +241,19 @@ def compare_localizations(cpu_root: Path, gpu_root: Path, *, position_atol_m: fl
             and item["diagnostics"]["added_csi_noise"] is False
             for item in (cpu_sampling, gpu_sampling)
         )
-    if cpu_signature.get("workflow") == gpu_signature.get("workflow") == "music_point_clustering_v2":
-        for name, filename, list_key, point_key in (
+        if workflow == FINE_SPECTRUM_WORKFLOW:
+            checks.update(_fine_music_checks(
+                _read_json(cpu_folder / "music_peaks.json"), _read_json(gpu_folder / "music_peaks.json"),
+                cpu_sampling, gpu_sampling,
+            ))
+    if same_workflow and workflow in POINT_WORKFLOWS:
+        point_artifacts = [
             ("initial_points", "initial_candidates.json", "points", None),
             ("representative_points", "representative_points.json", "representatives", "point"),
-        ):
+        ]
+        if workflow == FINE_SPECTRUM_WORKFLOW:
+            point_artifacts.append(("dbscan_noise_points", "representative_points.json", "noise_points", None))
+        for name, filename, list_key, point_key in point_artifacts:
             values = []
             for folder in (cpu_folder, gpu_folder):
                 rows = _read_json(folder / filename)[list_key]
@@ -380,13 +467,17 @@ def _run_kernel(args, root: Path, config: dict, measurement) -> dict:
             sampled = sample_music_spectrum(
                 prepared, peaks, **grids, bs_boresight_rad=measurement.bs_boresight_rad,
                 settings=config["music"]["spectrum_sampling"], seed=seed,
+                minimum_angle_separation_rad=np.deg2rad(float(config["music"]["min_angle_separation_deg"])),
+                minimum_delay_separation_s=float(config["music"]["min_delay_separation_s"]),
             )
             _synchronize(backend, args.device_id)
             record["sampling_wall_s"] = time.perf_counter() - start
             record["music_and_sampling_wall_s"] = time.perf_counter() - total_start
             record.update({
                 "status": "success", "compute": computer.metadata(),
-                "prepared_music": prepared.metadata(), "peaks": [asdict(peak) for peak in peaks],
+                "prepared_music": prepared.metadata(), "coarse_peaks": [asdict(peak) for peak in peaks],
+                "peaks": [asdict(peak) for peak in sampled.refined_peaks],
+                "nominal_source_indices": sampled.refined_peak_source_indices,
                 "sampling_diagnostics": sampled.diagnostics,
             })
             spectra[label] = values
@@ -427,10 +518,22 @@ def _run_kernel(args, root: Path, config: dict, measurement) -> dict:
                 atol=absolute, rtol=relative,
             ))
         single_eigh = all(records[key]["compute"]["eigendecomposition_count"] == 1 for key in records)
+        fine_checks = _fine_music_checks(
+            {"nominal": records["cpu"]["peaks"], "nominal_source_indices": records["cpu"]["nominal_source_indices"]},
+            {"nominal": records["cuda"]["peaks"], "nominal_source_indices": records["cuda"]["nominal_source_indices"]},
+            {"regions": samplings["cpu"].regions, "diagnostics": samplings["cpu"].diagnostics},
+            {"regions": samplings["cuda"].regions, "diagnostics": samplings["cuda"].diagnostics},
+        )
+        coarse_indices_equal = [
+            (peak["aoa_index"], peak["delay_index"]) for peak in records["cpu"]["coarse_peaks"]
+        ] == [(peak["aoa_index"], peak["delay_index"]) for peak in records["cuda"]["coarse_peaks"]]
         comparison.update({
             "passed": (indices["cpu"] == indices["cuda"] and spectrum_close and same_sources
-                       and all(continuous_checks.values()) and single_eigh),
+                       and all(continuous_checks.values()) and single_eigh
+                       and coarse_indices_equal and all(fine_checks.values())),
             "all_peak_indices_equal": indices["cpu"] == indices["cuda"],
+            "coarse_peak_indices_equal": coarse_indices_equal,
+            "fine_music_checks": fine_checks,
             "spectra_within_tolerance": spectrum_close,
             "sample_sources_and_cells_equal": same_sources,
             "continuous_sample_checks": continuous_checks,

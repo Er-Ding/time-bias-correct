@@ -1,5 +1,7 @@
 # 定位实验与结果绘图
 
+正式峰、采样概率和局部底图统一使用细谱，点聚类采用 DBSCAN（默认邻域 1.5 米、5 点）。具体数据流、离群点处理和本次验证见 [统一细谱与 DBSCAN](fine_spectrum_dbscan_workflow_20260909.md)。
+
 本次实现沿用现有定位算法，新增独立的批量实验和绘图模块。**不绘制 UE 或候选簇之间的联系图。**
 真实路径、真实位置和真实偏差只供生成、评估和绘图使用；定位仍经过原有严格输入检查。
 
@@ -11,7 +13,7 @@
 默认输出中文标注的 PNG（300 dpi）、PDF、可编辑文字 SVG，以及对应 CSV。地图横纵轴统一为米，保持等比例。
 当前画布适合查看和后续排版；正式投稿时仍需按目标期刊的最终栏宽调整文字大小。
 
-当前主流程为 `music_point_clustering_v2`，定位清单格式为第 5 版。接收到的一份带噪 CSI 只计算一次子空间，随后计算全局 MUSIC 和各峰附近细谱面，连续采样、在公开参考 bias 下反向 RT 到初始位置点、对点聚类取代表，之后只为代表点生成轨迹，再联合求解一个位置和公共 bias。定位内部不再额外加噪。旧实验仍按其真实旧步骤只读展示，不会换成新流程的标签。
+当前主流程为 `music_fine_spectrum_dbscan_v3`，定位清单格式为第 6 版。接收到的一份带噪 CSI 只计算一次子空间，随后计算全局 MUSIC 和各峰附近细谱面，连续采样、在公开参考 bias 下反向 RT 到初始位置点、对点聚类取代表，之后只为代表点生成轨迹，再联合求解一个位置和公共 bias。定位内部不再额外加噪。旧实验仍按其真实旧步骤只读展示，不会换成新流程的标签。
 
 ## 直接画已有结果
 
@@ -39,7 +41,7 @@ REPORT_ROOT="${PWD}/outputs/my_result_figures" \
 
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
-GPU_IDS=0,1,2,3,4,5,6,7 PLAN_ONLY=0 RESUME=0 ./run_point_clustering_experiment.sh
+GPU_IDS=0,1,2,3,4,5,6,7 PLAN_ONLY=0 RESUME=0 ./run_fine_dbscan_experiment.sh
 ```
 
 默认解释器为项目的 `.sionna-venv/bin/python`，Sionna 环境设置沿用已有脚本。
@@ -66,7 +68,7 @@ GPU_IDS=0,1,2,3,4,5,6,7 PLAN_ONLY=0 RESUME=0 ./run_point_clustering_experiment.s
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
 PLAN_ONLY=1 EXPERIMENT_ROOT="${PWD}/outputs/my_30ue_experiment" \
-./run_point_clustering_experiment.sh
+./run_fine_dbscan_experiment.sh
 ```
 
 之后执行该固定计划：
@@ -74,7 +76,7 @@ PLAN_ONLY=1 EXPERIMENT_ROOT="${PWD}/outputs/my_30ue_experiment" \
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
 RESUME=1 EXPERIMENT_ROOT="${PWD}/outputs/my_30ue_experiment" \
-./run_point_clustering_experiment.sh
+./run_fine_dbscan_experiment.sh
 ```
 
 每个 UE 只做一次信道生成。每次噪声重复均从该 UE 保存的无噪声 CSI 重新注入噪声，位置、路径系数和真实偏差保持不变。

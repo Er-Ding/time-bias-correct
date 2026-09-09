@@ -67,6 +67,19 @@ def test_config_rejects_nonfinite_and_invalid_music_ranges() -> None:
         validate_config(config)
 
 
+@pytest.mark.parametrize("field,value", [
+    ("candidate_cluster_radius_m", True), ("candidate_cluster_radius_m", 0),
+    ("candidate_cluster_radius_m", float("nan")),
+    ("candidate_cluster_min_samples", True), ("candidate_cluster_min_samples", 0),
+    ("candidate_cluster_min_samples", 2.5), ("candidate_cluster_min_samples", 5.0),
+])
+def test_invalid_dbscan_parameters(field, value):
+    config = deepcopy(DEFAULT_CONFIG)
+    config["localization"][field] = value
+    with pytest.raises(ValueError, match=field):
+        validate_config(config)
+
+
 @pytest.mark.parametrize("reference", [
     float("nan"), float("inf"), -81e-9, 81e-9, True, False, None, "invalid",
 ])

@@ -173,10 +173,90 @@ def test_point_workflow_checks_intermediates_even_with_same_final_solution(roots
     assert not comparison["checks"][expected_check]
 
 
+def _convert_to_fine_dbscan(root):
+    from copy import deepcopy
+
+    _convert_to_point_clustering(root)
+    folder = root / "localization"
+    peaks = json.loads((folder / "music_peaks.json").read_text())
+    peaks.update(workflow="music_fine_spectrum_dbscan_v3", nominal_source_indices=[0],
+                 coarse=deepcopy(peaks["nominal"]))
+    (folder / "music_peaks.json").write_text(json.dumps(peaks))
+    sampling = json.loads((folder / "spectrum_samples.json").read_text())
+    sampling["diagnostics"].update(suppressed_refined_peaks=[], peak_and_proposal_share_fine_spectrum=True,
+                                    exact_sample_spectrum_used_for_proposal=False)
+    spectrum = np.array([[1., 2., 1.], [2., 3., 4.], [1., 2., 1.]])
+    corners = (spectrum[:-1, :-1] + spectrum[1:, :-1] + spectrum[:-1, 1:] + spectrum[1:, 1:]) / 4
+    sampling["regions"] = [{
+        "observation_id": "path_0", "source_peak_index": 0,
+        "refined_aoa_grid_index": 1, "refined_delay_grid_index": 2,
+        "aoa_grid_rad": [.09, .1, .11], "delay_grid_s": [8e-9, 9e-9, 10e-9],
+        "spectrum": spectrum.tolist(), "cell_spectrum": corners.tolist(),
+        "cell_probabilities": (corners / corners.sum()).tolist(),
+        "peak_on_window_edge": True, "refined_peak_search_boundary_axes": [],
+        "unresolved_window_peak": True,
+    }]
+    (folder / "spectrum_samples.json").write_text(json.dumps(sampling))
+    representatives = json.loads((folder / "representative_points.json").read_text())
+    representative = representatives["representatives"][0]
+    point = representative["point"]
+    representative["metadata"].update(core_sample_ids=[point["sample_id"]], border_sample_ids=[])
+    noise = {**point, "sample_id": "path_0:mc_99999", "position_m": [30., 40.]}
+    representatives["noise_points"] = [noise]
+    representatives["memberships"] = [
+        {**point, "candidate_id": representative["candidate_id"], "role": "core",
+         "neighbor_count": 4, "is_representative": True},
+        {**noise, "candidate_id": None, "role": "noise", "neighbor_count": 1, "is_representative": False},
+    ]
+    (folder / "representative_points.json").write_text(json.dumps(representatives))
+    initial = json.loads((folder / "initial_candidates.json").read_text())
+    initial["points"].append(noise)
+    (folder / "initial_candidates.json").write_text(json.dumps(initial))
+
+
+@pytest.mark.parametrize("filename, mutate, expected_check", [
+    ("music_peaks.json", lambda data: data["nominal"][0].update(aoa_rad=.15),
+     "fine_peak_aoa_rad_within_tolerance"),
+    ("music_peaks.json", lambda data: data["nominal"][0].update(delay_s=12e-9),
+     "fine_peak_delay_s_within_tolerance"),
+    ("music_peaks.json", lambda data: data.update(nominal_source_indices=[2]), "nominal_source_indices"),
+    ("spectrum_samples.json", lambda data: data["regions"][0]["spectrum"][0].__setitem__(0, 1.5),
+     "fine_region_spectrum_within_tolerance"),
+    ("spectrum_samples.json", lambda data: data["regions"][0].update(cell_probabilities=[[.4, .1], [.4, .1]]),
+     "fine_region_cell_probabilities_within_tolerance"),
+    ("spectrum_samples.json", lambda data: data["regions"][0]["aoa_grid_rad"].__setitem__(0, .091),
+     "fine_region_aoa_grid_rad_within_tolerance"),
+    ("representative_points.json", lambda data: data["noise_points"].clear(), "dbscan_noise_points"),
+    ("representative_points.json", lambda data: data["noise_points"][0].update(position_m=[30.5, 40.]),
+     "dbscan_noise_points_coordinates_within_tolerance"),
+    ("representative_points.json", lambda data: data["memberships"][0].update(role="border"),
+     "dbscan_membership_roles"),
+    ("representative_points.json", lambda data: data["memberships"][1].update(candidate_id="other"),
+     "dbscan_membership_roles"),
+    ("representative_points.json", lambda data: data["representatives"][0]["metadata"]["core_sample_ids"].clear(),
+     "dbscan_core_border_members"),
+])
+def test_fine_dbscan_comparison_detects_changed_intermediates_with_unchanged_solution(
+    roots, filename, mutate, expected_check,
+):
+    for root in roots:
+        _convert_to_fine_dbscan(root)
+    assert _compare(roots)["passed"]
+    path = roots[1] / "localization" / filename
+    data = json.loads(path.read_text())
+    mutate(data)
+    path.write_text(json.dumps(data))
+    comparison = _compare(roots)
+    assert not comparison["passed"]
+    assert not comparison["checks"][expected_check]
+    assert comparison["checks"]["position_within_tolerance"]
+    assert comparison["checks"]["bias_within_tolerance"]
+
+
 def test_kernel_uses_one_observation_without_legacy_noise_settings(tmp_path, monkeypatch):
     from copy import deepcopy
     from types import SimpleNamespace
-    from time_bias_localization import compute
+    from time_bias_localization import compute, spectrum_sampling
     from time_bias_localization.config import DEFAULT_CONFIG
     from time_bias_localization.signal import synthesize_ula_csi
 
@@ -203,6 +283,14 @@ def test_kernel_uses_one_observation_without_legacy_noise_settings(tmp_path, mon
         **{**kwargs, "backend": "numpy"}
     ))
     monkeypatch.setattr(benchmark, "_synchronize", lambda *args: None)
+    sampled_arguments = []
+    sample_music_spectrum = spectrum_sampling.sample_music_spectrum
+
+    def capture_sampling(*args, **kwargs):
+        sampled_arguments.append(kwargs)
+        return sample_music_spectrum(*args, **kwargs)
+
+    monkeypatch.setattr(spectrum_sampling, "sample_music_spectrum", capture_sampling)
     args = SimpleNamespace(device_id=0, batch_size=4, angle_chunk_size=16)
     result = benchmark._run_kernel(args, tmp_path, config, measurement)
     assert result["comparison"]["passed"]
@@ -210,3 +298,9 @@ def test_kernel_uses_one_observation_without_legacy_noise_settings(tmp_path, mon
     assert result["spectrum_count"] == 1
     assert all(run["compute"]["completed_csi"] == 1 for run in result["runs"].values())
     assert all(run["compute"]["eigendecomposition_count"] == 1 for run in result["runs"].values())
+    assert len(sampled_arguments) == 2
+    assert all(args["minimum_angle_separation_rad"] == np.deg2rad(config["music"]["min_angle_separation_deg"])
+               and args["minimum_delay_separation_s"] == config["music"]["min_delay_separation_s"]
+               for args in sampled_arguments)
+    assert all(result["comparison"]["fine_music_checks"].values())
+    assert all("coarse_peaks" in run and "nominal_source_indices" in run for run in result["runs"].values())

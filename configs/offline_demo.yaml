@@ -60,7 +60,9 @@ localization:
   # 在同一公开参考偏差下反向 RT 到初始位置点；不读取真实 bias。
   initial_reference_bias_s: 0.0
   # 同来源峰、同反射墙顺序内，按初始位置点的欧式距离聚类。
+  # DBSCAN 邻域距离 eps（米），不是簇的总跨度；邻域计数包含点自身。
   candidate_cluster_radius_m: 1.5
+  candidate_cluster_min_samples: 5
   huber_delta_m: 0.75
   max_iterations: 20
 

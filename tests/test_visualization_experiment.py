@@ -98,7 +98,7 @@ def test_batch_result_loader_and_tamper_rejection(generated, tmp_path, monkeypat
     assert len(peak_outputs["observation_samples"]) > 3
     samples = read_json(root / "localization/spectrum_samples.json")
     assert samples["samples"] and samples["regions"]
-    assert run["result"]["workflow"] == "music_point_clustering_v2"
+    assert run["result"]["workflow"] == "music_fine_spectrum_dbscan_v3"
     assert (root / "localization/forward_check.json").exists()
     assert not (root / "localization/bootstrap_diagnostics.json").exists()
     # 使用定位器实际序列化的产物走完整报告，避免手写数据模型遗漏字段层级。
@@ -115,7 +115,8 @@ def test_batch_result_loader_and_tamper_rejection(generated, tmp_path, monkeypat
     step_module.export_steps(plt, run, report_root, read_json(root / "attempt.json"))
     assert all(item["status"] == "available" for item in read_json(report_root / "step_index.json"))
     counts = read_json(report_root / "05_point_clustering/counts.json")
-    assert counts["listed_member_count"] == counts["raw_count"] == len(run["initial_candidates"]["points"])
+    assert counts["listed_member_count"] + counts["noise_count"] == counts["raw_count"] == len(run["initial_candidates"]["points"])
+    assert counts["clustering_algorithm"] == "dbscan"
     assert counts["representative_count"] == len(run["representative_points"]["representatives"])
     assert len(run["representative_trajectories"]) == counts["representative_count"]
     assert "raw" not in run and "clusters" not in run
@@ -155,13 +156,14 @@ def test_missing_sample_preserves_all_steps(tmp_path):
         assert not list((root / name).glob("*.png"))
 
 
-@pytest.mark.parametrize("workflow", [None, "music_spectrum_sampling_v1", "music_point_clustering_v2"])
+@pytest.mark.parametrize("workflow", [None, "music_spectrum_sampling_v1", "music_point_clustering_v2", "music_fine_spectrum_dbscan_v3"])
 @pytest.mark.parametrize("status", ["localization_failed", "pending"])
 def test_missing_sample_uses_recorded_workflow_for_placeholders(tmp_path, workflow, status):
-    from time_bias_localization.step_visualization import export_steps, STEPS, LEGACY_STEPS, POINT_STEPS
+    from time_bias_localization.step_visualization import export_steps, STEPS, LEGACY_STEPS, POINT_STEPS, FINE_STEPS
     root = tmp_path / "steps"
     export_steps(None, None, root, dict(status=status, workflow=workflow, error="saved failure"))
-    expected = {None: LEGACY_STEPS, "music_spectrum_sampling_v1": STEPS, "music_point_clustering_v2": POINT_STEPS}[workflow]
+    expected = {None: LEGACY_STEPS, "music_spectrum_sampling_v1": STEPS,
+                "music_point_clustering_v2": POINT_STEPS, "music_fine_spectrum_dbscan_v3": FINE_STEPS}[workflow]
     assert [item["step"] for item in read_json(root / "step_index.json")] == [item[0] for item in expected]
     assert all(item["status"] == "not_available" for item in read_json(root / "step_index.json"))
     assert ("旧流程（legacy）" in (root / "README.md").read_text()) == (workflow is None)
@@ -304,7 +306,7 @@ def test_old_results_are_dispatched_to_legacy_report(tmp_path, monkeypatch):
     assert called[0][1] is run
 
 
-@pytest.mark.parametrize("workflow", ["music_spectrum_sampling_v1", "music_point_clustering_v2"])
+@pytest.mark.parametrize("workflow", ["music_spectrum_sampling_v1", "music_point_clustering_v2", "music_fine_spectrum_dbscan_v3"])
 def test_failed_run_loads_and_exports_completed_steps_with_hashes(generated, tmp_path, monkeypatch, workflow):
     from time_bias_localization.provenance import artifact_record, generation_bundle_id
     from time_bias_localization.visualization import load_failed_run, write_json
@@ -335,7 +337,7 @@ def test_failed_run_loads_and_exports_completed_steps_with_hashes(generated, tmp
     module.export_steps(None, run, output, {"status": "localization_failed", "error": "no candidates"})
     states = {item["step"]: item["status"] for item in read_json(output / "step_index.json")}
     assert states["03_spectrum_sampling"] == "available"
-    first_candidate_step, final_step = (("04_initial_candidates", "09_final_evaluation") if workflow == module.POINT_WORKFLOW
+    first_candidate_step, final_step = (("04_initial_candidates", "09_final_evaluation") if workflow in {module.POINT_WORKFLOW, module.FINE_WORKFLOW}
                                         else ("04_reverse_candidates", "08_final_evaluation"))
     assert states[first_candidate_step] == states[final_step] == "not_available"
     (failure / "samples.json").write_text("{}")

@@ -28,6 +28,10 @@ def main(argv=None):
     parser.add_argument("--device-id", type=int, default=0)
     parser.add_argument("--reference-bias-s", type=float, default=None,
                         help="初始点的公开参考 bias（秒）；不指定时使用配置，不读取真值")
+    parser.add_argument("--dbscan-eps-m", type=float, default=None,
+                        help="DBSCAN 邻域距离（米），不是整个簇的最大跨度")
+    parser.add_argument("--dbscan-min-samples", type=int, default=None,
+                        help="DBSCAN 核心点所需的邻域样本数，包含点自身")
     args = parser.parse_args(argv)
     source = args.source_experiment.resolve()
     output = args.output.resolve()
@@ -46,6 +50,10 @@ def main(argv=None):
     config["music"]["spectrum_sampling"]["samples_per_peak"] = args.samples_per_peak
     if args.reference_bias_s is not None:
         config["localization"]["initial_reference_bias_s"] = args.reference_bias_s
+    if args.dbscan_eps_m is not None:
+        config["localization"]["candidate_cluster_radius_m"] = args.dbscan_eps_m
+    if args.dbscan_min_samples is not None:
+        config["localization"]["candidate_cluster_min_samples"] = args.dbscan_min_samples
     from time_bias_localization.config import validate_localization_config
     validate_localization_config(config)
     # 重放使用原接收数据。计划中的真值只供后续独立评估/绘图，绝不传入 localize。
@@ -80,7 +88,7 @@ def main(argv=None):
             status = dict(workflow=WORKFLOW, noise_seed=seed, source_generation_manifest=artifact_record(manifest_path))
             stage = "localization"
             started = time.perf_counter()
-            print(f"{point['ue_id']} / {repeat}: 重放原接收 CSI，先点聚类再建立代表轨迹", flush=True)
+            print(f"{point['ue_id']} / {repeat}: 重放接收 CSI，统一细谱找峰采样、DBSCAN 点聚类", flush=True)
             try:
                 result = localize(
                     load_localization_config(config_path),
@@ -105,6 +113,7 @@ def main(argv=None):
                     initial_point_count=result["diagnostics"]["initial_candidate_count"],
                     representative_point_count=result["diagnostics"]["representative_point_count"],
                     representative_trajectory_count=result["diagnostics"]["representative_trajectory_count"],
+                    clustering=result["diagnostics"]["point_clustering"],
                     compute=result["diagnostics"]["compute"]))
             except Exception as error:
                 status.update(status=f"{stage}_failed", error=f"{type(error).__name__}: {error}")

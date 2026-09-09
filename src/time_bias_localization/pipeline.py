@@ -328,7 +328,8 @@ _SPECTRUM_TRAJECTORY_ARTIFACT_FILENAMES = {
     "forward_check": "forward_check.json",
 }
 
-WORKFLOW = "music_point_clustering_v2"
+POINT_CLUSTERING_WORKFLOW = "music_point_clustering_v2"
+WORKFLOW = "music_fine_spectrum_dbscan_v3"
 _LOCALIZATION_ARTIFACT_FILENAMES = {
     "result": "localization_result.json",
     "music_spectrum": "music_spectrum.npz",
@@ -342,8 +343,12 @@ _LOCALIZATION_ARTIFACT_FILENAMES = {
 
 
 def _manifest_artifact_filenames(manifest: dict[str, Any]) -> dict[str, str]:
-    if manifest.get("schema_version") == 5:
+    if manifest.get("schema_version") == 6:
         if manifest.get("workflow") != WORKFLOW:
+            raise ValueError("第 6 版定位清单必须明确记录统一细谱与 DBSCAN 流程")
+        return _LOCALIZATION_ARTIFACT_FILENAMES
+    if manifest.get("schema_version") == 5:
+        if manifest.get("workflow") != POINT_CLUSTERING_WORKFLOW:
             raise ValueError("第 5 版定位清单必须明确记录先点聚类再建立代表轨迹的流程")
         return _LOCALIZATION_ARTIFACT_FILENAMES
     if manifest.get("schema_version") == 4:
@@ -397,7 +402,7 @@ def _archive_previous_evaluation(
         recorded_result_sha256 = str(result_record["sha256"])
     except (KeyError, TypeError, ValueError, OSError) as error:
         raise ValueError("旧定位清单的评估来源记录不完整，拒绝发布新定位产物") from error
-    if manifest_schema_version not in (2, 3, 4, 5):
+    if manifest_schema_version not in (2, 3, 4, 5, 6):
         raise ValueError(
             f"旧定位清单版本 {manifest_schema_version} 不支持无损归档"
         )
@@ -1642,7 +1647,7 @@ def _localize_locked_impl(
         diagonal_loading=float(music_config["diagonal_loading"]),
     )
     spectrum = prepared.spectrum(aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid)
-    nominal_peaks = extract_local_music_peaks(
+    coarse_peaks = extract_local_music_peaks(
         spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
         max_peaks=num_paths, minimum_relative_height=0.0,
         minimum_separation_bins=_separation_bins(music_config),
@@ -1650,7 +1655,11 @@ def _localize_locked_impl(
     peak_output = {
         "workflow": WORKFLOW,
         "note": "谱值用于候选搜索，不是经过校准的路径概率；不对观测 CSI 额外加噪",
-        "nominal": [asdict(peak) for peak in nominal_peaks],
+        "coarse": [asdict(peak) for peak in coarse_peaks],
+        "nominal": [],
+        "nominal_source_indices": [],
+        "nominal_resolution": "local_fine_spectrum",
+        "coarse_role": "search_region_proposals_only",
     }
     progress["payloads"].update(
         music_spectrum=dict(spectrum=spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid),
@@ -1658,16 +1667,22 @@ def _localize_locked_impl(
     )
     progress["completed_steps"].append("02_music")
     mark_stage("music_observed")
-    if len(nominal_peaks) < 2:
-        raise RuntimeError(f"二维 MUSIC 只找到 {len(nominal_peaks)} 条路径，无法联合求解")
+    if len(coarse_peaks) < 2:
+        raise RuntimeError(f"二维 MUSIC 只找到 {len(coarse_peaks)} 个搜索区域，无法联合求解")
 
     progress["failed_step"] = "03_spectrum_sampling"
     sampled = sample_music_spectrum(
-        prepared, nominal_peaks, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
+        prepared, coarse_peaks, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
         bs_boresight_rad=measurement.bs_boresight_rad,
         settings=music_config["spectrum_sampling"],
         seed=int(config["project"]["random_seed"]) + 2,
+        minimum_angle_separation_rad=np.deg2rad(float(music_config["min_angle_separation_deg"])),
+        minimum_delay_separation_s=float(music_config["min_delay_separation_s"]),
     )
+    nominal_peaks = sampled.refined_peaks
+    nominal_source_indices = sampled.refined_peak_source_indices
+    peak_output["nominal"] = [asdict(peak) for peak in nominal_peaks]
+    peak_output["nominal_source_indices"] = nominal_source_indices
     peak_output["observation_samples"] = [asdict(sample) for sample in sampled.samples]
     progress["payloads"]["spectrum_samples"] = {
         "workflow": WORKFLOW, "samples": sampled.records,
@@ -1675,6 +1690,8 @@ def _localize_locked_impl(
     }
     progress["completed_steps"].append("03_spectrum_sampling")
     mark_stage("spectrum_sampling")
+    if len(nominal_peaks) < 2:
+        raise RuntimeError(f"细谱找峰并去重后只有 {len(nominal_peaks)} 条路径，无法联合求解")
 
     progress["failed_step"] = "04_initial_candidates"
     reference_bias_s = float(localization_config["initial_reference_bias_s"])
@@ -1693,13 +1710,19 @@ def _localize_locked_impl(
     mark_stage("initial_candidates")
 
     progress["failed_step"] = "05_point_clustering"
-    representatives = cluster_initial_candidate_points(
+    clustering = cluster_initial_candidate_points(
         initial.points,
         position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
+        min_samples=int(localization_config["candidate_cluster_min_samples"]),
+        return_diagnostics=True,
     )
+    representatives = clustering.representatives
     progress["payloads"]["representative_points"] = {
         "reference_bias_s": reference_bias_s,
         "representatives": [asdict(point) for point in representatives],
+        "noise_points": [asdict(point) for point in clustering.noise_points],
+        "memberships": clustering.memberships,
+        "diagnostics": clustering.diagnostics,
     }
     progress["completed_steps"].append("05_point_clustering")
     mark_stage("point_clustering")
@@ -1730,7 +1753,7 @@ def _localize_locked_impl(
     # 此协方差来自最终几何残差近似；未把采样数当成独立观测数，
     # 也未标定谱面采样本身的不确定性。采样会通过代表选择间接影响残差。
     result = {
-        "schema_version": 3, "workflow": WORKFLOW,
+        "schema_version": 4, "workflow": WORKFLOW,
         "localization_run_id": localization_run_id,
         "output_type": "point_estimate_with_geometric_residual_covariance",
         "mu_m": central.mu, "sigma_m2": central.sigma,
@@ -1759,6 +1782,7 @@ def _localize_locked_impl(
             "representative_trajectory_count": len(representative_trajectories),
             "initial_candidate_generation": initial.diagnostics,
             "point_clustering": {
+                **clustering.diagnostics,
                 "space": "initial_position_xy_at_reference_bias",
                 "position_radius_m": float(localization_config["candidate_cluster_radius_m"]),
                 "grouping": "source_observation_and_reflection_wall_sequence",
@@ -1785,7 +1809,7 @@ def _localize_locked_impl(
                 "aoa_global_rad": local_to_global_aoa(peak.aoa_rad, measurement.bs_boresight_rad),
                 "delay_s": peak.delay_s,
             }
-            for index, peak in enumerate(nominal_peaks)
+            for index, peak in zip(nominal_source_indices, nominal_peaks, strict=True)
         },
     )
     progress["payloads"]["forward_check"] = forward_check
@@ -1837,7 +1861,7 @@ def _localize_locked_impl(
             for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
         }
         localization_manifest = {
-            "schema_version": 5,
+            "schema_version": 6,
             "workflow": WORKFLOW,
             "stage": "localization",
             "run_id": localization_run_id,
