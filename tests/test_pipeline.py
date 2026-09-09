@@ -330,15 +330,16 @@ def test_successful_evaluation_is_bound_to_localization_run(
         Path(manifest["config_snapshot"]["path"]).read_text(encoding="utf-8")
     )
     assert manifest["evaluation_pending"] is False
-    assert manifest["schema_version"] == 4
-    assert manifest["workflow"] == "music_spectrum_sampling_v1"
+    assert manifest["schema_version"] == 5
+    assert manifest["workflow"] == "music_point_clustering_v2"
     expected_artifacts = {
         "result": "localization_result.json",
         "music_spectrum": "music_spectrum.npz",
         "spectrum_samples": "spectrum_samples.json",
         "music_peaks": "music_peaks.json",
-        "raw_reverse_candidates": "raw_reverse_candidates.json",
-        "clustered_candidates": "clustered_candidates.json",
+        "initial_candidates": "initial_candidates.json",
+        "representative_points": "representative_points.json",
+        "representative_trajectories": "representative_trajectories.json",
         "forward_check": "forward_check.json",
     }
     assert set(manifest["artifacts"]) == set(expected_artifacts)
@@ -1839,6 +1840,8 @@ def test_run_evaluate_script_rejects_non_evaluation_manifest_changes(
 def _write_legacy_archive_fixture(root: Path, schema_version: int) -> None:
     """构造旧版的文件集合和来源链；不能只改新版清单的版本号。"""
     localization = root / "localization"
+    _write_json(localization / "raw_reverse_candidates.json", [])
+    _write_json(localization / "clustered_candidates.json", [])
     result_path = localization / "localization_result.json"
     result = json.loads(result_path.read_text(encoding="utf-8"))
     result.pop("workflow", None)
@@ -1976,7 +1979,7 @@ def test_localize_archives_legacy_schema2_evaluation_without_forging_sources(
         assert file_sha256(record["path"]) == record["sha256"]
 
 
-@pytest.mark.parametrize("schema_version", [3, 4])
+@pytest.mark.parametrize("schema_version", [3, 4, 5])
 def test_archive_uses_frozen_records_after_generation_manifest_updates(
     localized_run: dict[str, object], schema_version,
 ) -> None:
@@ -1999,6 +2002,18 @@ def test_archive_uses_frozen_records_after_generation_manifest_updates(
     )
     if schema_version == 3:
         _write_legacy_archive_fixture(root, 3)
+    elif schema_version == 4:
+        # 构造谱面轨迹聚类版本的完整产物集合，验证升级时仍可归档。
+        folder = root / "localization"
+        _write_json(folder / "raw_reverse_candidates.json", [])
+        _write_json(folder / "clustered_candidates.json", [])
+        manifest = json.loads(manifest_path.read_text())
+        manifest.update(schema_version=4, workflow="music_spectrum_sampling_v1")
+        manifest["artifacts"] = {
+            name: artifact_record(folder / filename)
+            for name, filename in pipeline_module._SPECTRUM_TRAJECTORY_ARTIFACT_FILENAMES.items()
+        }
+        _write_json(manifest_path, manifest)
     old_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     old_run_id = old_manifest["run_id"]
     old_generation_sha256 = old_manifest["generation_bundle"]["manifest"][
@@ -2380,7 +2395,7 @@ def test_localize_routes_signal_rank_to_single_music_preparation(
     assert calls == {"prepare": 6}
 
 
-def test_spectrum_sampling_flows_into_one_clustered_joint_solution(tmp_path, monkeypatch) -> None:
+def test_initial_points_are_clustered_before_any_trajectory_is_constructed(tmp_path, monkeypatch) -> None:
     config = deepcopy(DEFAULT_CONFIG)
     config["output"]["root"] = str(tmp_path / "run")
     config["music"]["spectrum_sampling"].update(samples_per_peak=8, local_grid_points_per_axis=9)
@@ -2389,39 +2404,55 @@ def test_spectrum_sampling_flows_into_one_clustered_joint_solution(tmp_path, mon
     data = generate_data(config, scene_json=scene["scene_json"], output_root=root)
     # 每条旧入口一旦被调用立即失败，验证主流程没有重新加噪或汇总扰动解。
     def reject_legacy_call(*args, **kwargs):
-        raise AssertionError("谱面采样主流程不应进入 CSI 扰动支路")
+        raise AssertionError("点聚类主流程不应进入 CSI 扰动或先轨迹聚类支路")
     for name in ("estimate_noise_std_from_observed_csi", "estimate_music_peak_samples",
-                 "_bootstrap_joint_solutions", "_distribution_statistics"):
+                 "_bootstrap_joint_solutions", "_distribution_statistics",
+                 "generate_reverse_candidates", "cluster_reverse_candidates"):
         monkeypatch.setattr(pipeline_module, name, reject_legacy_call)
     observed = load_online_measurement(data["online_npz"]).csi_observed.copy()
     from time_bias_localization.compute import MusicComputer
     real_prepare = MusicComputer.prepare
-    real_reverse = pipeline_module.generate_reverse_candidates
-    real_cluster = pipeline_module.cluster_reverse_candidates
+    real_reverse = pipeline_module.generate_initial_candidate_points
+    real_cluster = pipeline_module.cluster_initial_candidate_points
+    real_build = pipeline_module.build_representative_trajectories
     real_solve = pipeline_module.solve_position_and_bias
     counts = {"prepare": 0, "solve": 0}
     recorded = {}
+    stages = []
     def capture_prepare(self, csi, **kwargs):
         counts["prepare"] += 1
         np.testing.assert_array_equal(csi, observed)
         return real_prepare(self, csi, **kwargs)
     def capture_reverse(scene, bs, samples, **kwargs):
+        stages.append("initial_points")
         recorded["samples"] = list(samples)
         output = real_reverse(scene, bs, recorded["samples"], **kwargs)
-        recorded["raw"] = output
+        recorded["points"] = output.points
+        assert all(not hasattr(point, "anchor_m") and not hasattr(point, "beta_min_m")
+                   for point in output.points)
         return output
-    def capture_cluster(raw, **kwargs):
-        assert raw is recorded["raw"]
-        output = real_cluster(raw, **kwargs)
-        recorded["clusters"] = output
+    def capture_cluster(points, **kwargs):
+        stages.append("point_clustering")
+        assert points is recorded["points"]
+        assert "direction_radius_deg" not in kwargs
+        output = real_cluster(points, **kwargs)
+        recorded["representatives"] = output
         return output
-    def capture_solve(clusters, *args, **kwargs):
+    def capture_build(representatives, **kwargs):
+        stages.append("representative_trajectories")
+        assert representatives is recorded["representatives"]
+        output = real_build(representatives, **kwargs)
+        recorded["trajectories"] = output
+        return output
+    def capture_solve(trajectories, *args, **kwargs):
+        stages.append("joint_solution")
         counts["solve"] += 1
-        assert clusters is recorded["clusters"]
-        return real_solve(clusters, *args, **kwargs)
+        assert trajectories is recorded["trajectories"]
+        return real_solve(trajectories, *args, **kwargs)
     monkeypatch.setattr(MusicComputer, "prepare", capture_prepare)
-    monkeypatch.setattr(pipeline_module, "generate_reverse_candidates", capture_reverse)
-    monkeypatch.setattr(pipeline_module, "cluster_reverse_candidates", capture_cluster)
+    monkeypatch.setattr(pipeline_module, "generate_initial_candidate_points", capture_reverse)
+    monkeypatch.setattr(pipeline_module, "cluster_initial_candidate_points", capture_cluster)
+    monkeypatch.setattr(pipeline_module, "build_representative_trajectories", capture_build)
     monkeypatch.setattr(pipeline_module, "solve_position_and_bias", capture_solve)
     result = localize(
         localization_config_view(config),
@@ -2442,8 +2473,10 @@ def test_spectrum_sampling_flows_into_one_clustered_joint_solution(tmp_path, mon
     assert counts == {"prepare": 1, "solve": 1}
     assert len(recorded["samples"]) == 3 * (8 + 1)
     assert len({sample.sample_id for sample in recorded["samples"]}) == 27
-    assert len(recorded["raw"]) > len(recorded["clusters"])
-    assert any(candidate.metadata["raw_count"] > 1 for candidate in recorded["clusters"])
+    assert stages == ["initial_points", "point_clustering", "representative_trajectories", "joint_solution"]
+    assert len(recorded["points"]) > len(recorded["representatives"])
+    assert len(recorded["trajectories"]) == len(recorded["representatives"])
+    assert any(len(candidate.members) > 1 for candidate in recorded["representatives"])
     np.testing.assert_array_equal(serialized["mu_m"], serialized["central_solution"]["mu_m"])
     assert serialized["clock_bias_s"] == serialized["central_solution"]["clock_bias_s"]
     assert (

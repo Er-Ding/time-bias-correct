@@ -316,7 +316,7 @@ def _experiment_worker(task_queue, event_queue, output: Path, run_root: Path,
             worker["compute_device"] = computer.metadata()
         plan = read_json(output / "experiment_plan.json")
         if plan.get("workflow") != WORKFLOW:
-            raise ValueError("旧实验计划不是谱面采样流程，不能混入新结果；请新建实验输出目录")
+            raise ValueError("实验计划不是当前点聚类流程，不能混入不同流程的结果；请新建实验输出目录")
         template = load_config(checked_record(plan["generation_template"]))
         scene_path = checked_record(plan["scene"])
         write_json(workdir / "worker.json", worker)

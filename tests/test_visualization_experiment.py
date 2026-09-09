@@ -98,7 +98,7 @@ def test_batch_result_loader_and_tamper_rejection(generated, tmp_path, monkeypat
     assert len(peak_outputs["observation_samples"]) > 3
     samples = read_json(root / "localization/spectrum_samples.json")
     assert samples["samples"] and samples["regions"]
-    assert run["result"]["workflow"] == "music_spectrum_sampling_v1"
+    assert run["result"]["workflow"] == "music_point_clustering_v2"
     assert (root / "localization/forward_check.json").exists()
     assert not (root / "localization/bootstrap_diagnostics.json").exists()
     # 使用定位器实际序列化的产物走完整报告，避免手写数据模型遗漏字段层级。
@@ -114,16 +114,21 @@ def test_batch_result_loader_and_tamper_rejection(generated, tmp_path, monkeypat
     report_root = tmp_path / "actual_result_steps"
     step_module.export_steps(plt, run, report_root, read_json(root / "attempt.json"))
     assert all(item["status"] == "available" for item in read_json(report_root / "step_index.json"))
-    counts = read_json(report_root / "05_first_clustering/counts.json")
-    assert counts["listed_member_count"] == counts["raw_count"] == len(run["raw"])
-    assert counts["representative_count"] == len(run["clusters"])
+    counts = read_json(report_root / "05_point_clustering/counts.json")
+    assert counts["listed_member_count"] == counts["raw_count"] == len(run["initial_candidates"]["points"])
+    assert counts["representative_count"] == len(run["representative_points"]["representatives"])
+    assert len(run["representative_trajectories"]) == counts["representative_count"]
+    assert "raw" not in run and "clusters" not in run
     assert ("03_spectrum_sampling", "local_spectrum_000") in generated_figures
-    assert ("05_first_clustering", "members_and_representatives") in generated_figures
-    assert ("07_forward_check", "original_peak_residuals") in generated_figures
+    assert ("04_initial_candidates", "initial_points") in generated_figures
+    assert ("05_point_clustering", "members_and_representatives") in generated_figures
+    assert ("06_representative_trajectories", "trajectories") in generated_figures
+    assert ("08_forward_check", "original_peak_residuals") in generated_figures
+    assert not (report_root / "04_reverse_candidates").exists()
     status_digest = file_sha256(root / "attempt.json")
     run_experiment(output)
     assert file_sha256(root / "attempt.json") == status_digest
-    path = root / "localization/clustered_candidates.json"
+    path = root / "localization/representative_points.json"
     path.write_text("[]")
     with pytest.raises(ValueError, match="指纹"):
         load_run(root)
@@ -141,22 +146,22 @@ def test_sample_medians_do_not_average_positions():
 
 
 def test_missing_sample_preserves_all_steps(tmp_path):
-    from time_bias_localization.step_visualization import export_steps, STEPS
+    from time_bias_localization.step_visualization import export_steps, POINT_STEPS
     root = tmp_path / "sample/repeat_000"
     export_steps(None, None, root, dict(status="localization_failed", error="no solution"))
-    assert len(read_json(root / "step_index.json")) == len(STEPS)
-    for name, _, _ in STEPS:
+    assert len(read_json(root / "step_index.json")) == len(POINT_STEPS)
+    for name, _, _ in POINT_STEPS:
         assert "no solution" in (root / name / "README.md").read_text()
         assert not list((root / name).glob("*.png"))
 
 
-@pytest.mark.parametrize("workflow", [None, "music_spectrum_sampling_v1"])
+@pytest.mark.parametrize("workflow", [None, "music_spectrum_sampling_v1", "music_point_clustering_v2"])
 @pytest.mark.parametrize("status", ["localization_failed", "pending"])
 def test_missing_sample_uses_recorded_workflow_for_placeholders(tmp_path, workflow, status):
-    from time_bias_localization.step_visualization import export_steps, STEPS, LEGACY_STEPS
+    from time_bias_localization.step_visualization import export_steps, STEPS, LEGACY_STEPS, POINT_STEPS
     root = tmp_path / "steps"
     export_steps(None, None, root, dict(status=status, workflow=workflow, error="saved failure"))
-    expected = LEGACY_STEPS if workflow is None else STEPS
+    expected = {None: LEGACY_STEPS, "music_spectrum_sampling_v1": STEPS, "music_point_clustering_v2": POINT_STEPS}[workflow]
     assert [item["step"] for item in read_json(root / "step_index.json")] == [item[0] for item in expected]
     assert all(item["status"] == "not_available" for item in read_json(root / "step_index.json"))
     assert ("旧流程（legacy）" in (root / "README.md").read_text()) == (workflow is None)
@@ -186,7 +191,8 @@ def test_standard_cdf_and_global_quantiles(tmp_path, monkeypatch):
         plt.close(fig)
 
 
-def test_spectrum_report_uses_saved_samples_members_and_forward_checks(tmp_path, monkeypatch):
+@pytest.mark.parametrize("workflow", ["music_spectrum_sampling_v1", "music_point_clustering_v2"])
+def test_spectrum_report_uses_saved_samples_members_and_forward_checks(tmp_path, monkeypatch, workflow):
     pytest.importorskip("matplotlib")
     import matplotlib
     matplotlib.use("Agg")
@@ -226,13 +232,28 @@ def test_spectrum_report_uses_saved_samples_members_and_forward_checks(tmp_path,
         "original_peak_residuals": {"aoa_error_deg": .1, "delay_error_ns": .2},
         "sample_residuals": {"aoa_error_deg": .2, "delay_error_ns": .3}}]})
     central = {"mu_m": [1., 1.], "sigma_m2": [[.01, 0.], [0., .01]], "clock_bias_s": 0.}
-    result = {**central, "workflow": module.WORKFLOW, "central_solution": central,
+    result = {**central, "workflow": workflow, "central_solution": central,
               "central_selected_candidates": [cluster], "central_residuals_m": [0.], "diagnostics": {}}
     write_json(source / "result.json", result)
     artifacts = {key: str(source / filename) for key, filename in {
         "music_spectrum": "music.npz", "music_peaks": "peaks.json", "spectrum_samples": "samples.json",
         "raw_reverse_candidates": "raw.json", "clustered_candidates": "clusters.json",
         "forward_check": "forward.json", "result": "result.json"}.items()}
+    if workflow == module.POINT_WORKFLOW:
+        points = [dict(observation_id=item["observation_id"], sample_id=item["sample_id"], topology_id="los",
+                       position_m=item["anchor_m"], reference_bias_s=0., reflection_wall_ids=[],
+                       observed_aoa_global_rad=0., observed_delay_s=2e-9) for item in raw]
+        write_json(source / "initial_candidates.json", {"reference_bias_s": 0., "points": points,
+                                                        "rejected_samples": [], "diagnostics": {}})
+        write_json(source / "representative_points.json", {"reference_bias_s": 0., "representatives": [
+            {"candidate_id": "c0", "point": points[0], "members": points, "metadata": {}}]})
+        cluster["metadata"].update(initial_position_m=points[0]["position_m"], reference_bias_s=0.)
+        write_json(source / "trajectories.json", [cluster])
+        artifacts.pop("raw_reverse_candidates")
+        artifacts.pop("clustered_candidates")
+        artifacts.update({key: str(source / filename) for key, filename in {
+            "initial_candidates": "initial_candidates.json", "representative_points": "representative_points.json",
+            "representative_trajectories": "trajectories.json"}.items()})
     run = dict(scene=scene, bs=[0., 0.], boresight=0., true=[1., 1.], paths=[], result=result,
                artifacts=artifacts, metrics={"localization_error_m": 0.}, sources=[],
                input_paths={"scene_json": str(source / "scene.json"), "ground_truth": str(source / "truth.npz"),
@@ -246,14 +267,30 @@ def test_spectrum_report_uses_saved_samples_members_and_forward_checks(tmp_path,
     assert all(item["status"] == "available" for item in read_json(output / "step_index.json"))
     assert not (output / "03_peak_perturbations").exists()
     assert not (output / "07_perturbation_solutions").exists()
-    assert read_json(output / "05_first_clustering/counts.json") == {
-        "raw_count": 2, "representative_count": 1, "listed_member_count": 2}
-    assert "s1" in (output / "05_first_clustering/cluster_members.csv").read_text()
+    cluster_step = "05_point_clustering" if workflow == module.POINT_WORKFLOW else "05_first_clustering"
+    expected_counts = {"raw_count": 2, "representative_count": 1, "listed_member_count": 2}
+    if workflow == module.POINT_WORKFLOW:
+        expected_counts.update(clustering_space="initial_xy_at_reference_bias", reference_bias_s=0.)
+        for step, name in [("04_initial_candidates", "initial_points"), ("05_point_clustering", "members_and_representatives")]:
+            # 只有 BS 视角边界的两条短线，不应提前画任何候选轨迹。
+            assert len(figures[(step, name)].axes[0].lines) == 2
+            assert not (output / step / "trajectories.csv").exists()
+        assert ("06_representative_trajectories", "trajectories") in figures
+        assert "s0" in (output / "06_representative_trajectories/representative_to_trajectory.csv").read_text()
+        assert len(read_json(output / "step_index.json")) == 10
+        assert not (output / "04_reverse_candidates").exists()
+    else:
+        assert len(read_json(output / "step_index.json")) == 9
+        assert (output / "04_reverse_candidates/trajectories.csv").exists()
+        assert not (output / "04_initial_candidates").exists()
+    assert read_json(output / cluster_step / "counts.json") == expected_counts
+    assert "s1" in (output / cluster_step / "cluster_members.csv").read_text()
     sample_figure = figures[("03_spectrum_sampling", "local_spectrum_000")]
     offsets = [collection.get_offsets() for collection in sample_figure.axes[0].collections]
     assert any(np.any(np.isclose(offset[:, 1], np.degrees(.03))) for offset in offsets)
-    assert ("07_forward_check", "original_peak_residuals") in figures
-    assert "original_peak_delay_error_ns" in (output / "07_forward_check/path_checks.csv").read_text()
+    forward_step = "08_forward_check" if workflow == module.POINT_WORKFLOW else "07_forward_check"
+    assert (forward_step, "original_peak_residuals") in figures
+    assert "original_peak_delay_error_ns" in (output / forward_step / "path_checks.csv").read_text()
     for fig in figures.values():
         plt.close(fig)
 
@@ -267,7 +304,8 @@ def test_old_results_are_dispatched_to_legacy_report(tmp_path, monkeypatch):
     assert called[0][1] is run
 
 
-def test_failed_run_loads_and_exports_completed_steps_with_hashes(generated, tmp_path, monkeypatch):
+@pytest.mark.parametrize("workflow", ["music_spectrum_sampling_v1", "music_point_clustering_v2"])
+def test_failed_run_loads_and_exports_completed_steps_with_hashes(generated, tmp_path, monkeypatch, workflow):
     from time_bias_localization.provenance import artifact_record, generation_bundle_id
     from time_bias_localization.visualization import load_failed_run, write_json
     import time_bias_localization.step_visualization as module
@@ -279,7 +317,7 @@ def test_failed_run_loads_and_exports_completed_steps_with_hashes(generated, tmp
     write_json(failure / "config.json", {})
     write_json(failure / "samples.json", {"samples": [], "regions": [], "diagnostics": {}})
     write_json(failure / "progress.json", {
-        "workflow": module.WORKFLOW, "run_id": "run-failed", "completed_steps": ["01_csi_input", "03_spectrum_sampling"],
+        "workflow": workflow, "run_id": "run-failed", "completed_steps": ["01_csi_input", "03_spectrum_sampling"],
         "failed_step": "04_reverse_candidates", "error": "no candidates",
         "generation_bundle": {"bundle_id": generation_bundle_id(generation), "manifest": artifact_record(generation_path)},
         "config_snapshot": {"path": str(failure / "config.json"), "file_sha256": file_sha256(failure / "config.json")},
@@ -297,7 +335,72 @@ def test_failed_run_loads_and_exports_completed_steps_with_hashes(generated, tmp
     module.export_steps(None, run, output, {"status": "localization_failed", "error": "no candidates"})
     states = {item["step"]: item["status"] for item in read_json(output / "step_index.json")}
     assert states["03_spectrum_sampling"] == "available"
-    assert states["04_reverse_candidates"] == states["08_final_evaluation"] == "not_available"
+    first_candidate_step, final_step = (("04_initial_candidates", "09_final_evaluation") if workflow == module.POINT_WORKFLOW
+                                        else ("04_reverse_candidates", "08_final_evaluation"))
+    assert states[first_candidate_step] == states[final_step] == "not_available"
     (failure / "samples.json").write_text("{}")
     with pytest.raises(ValueError, match="指纹"):
         load_failed_run(root, failure / "progress.json")
+
+
+def test_point_clustering_failure_keeps_actual_points_without_inventing_trajectories(tmp_path, monkeypatch):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import time_bias_localization.step_visualization as module
+    from time_bias_localization.visualization import write_json
+
+    initial = [dict(observation_id="p0", sample_id=f"s{index}", topology_id="los", reference_bias_s=0.,
+                    position_m=[2., 1. + .1 * index], reflection_wall_ids=[],
+                    observed_aoa_global_rad=0., observed_delay_s=2e-9) for index in range(2)]
+    write_json(tmp_path / "initial.json", {"reference_bias_s": 0., "points": initial, "rejected_samples": [], "diagnostics": {}})
+    write_json(tmp_path / "representatives.json", {"reference_bias_s": 0., "representatives": [
+        dict(candidate_id="c0", point=initial[0], members=initial, metadata={})]})
+    run = dict(result={"workflow": module.POINT_WORKFLOW}, scene={"bounds_m": [-2., 4., -2., 4.], "walls": []},
+               bs=[0., 0.], true=[1., 1.], boresight=0., metrics={},
+               artifacts={"initial_candidates": str(tmp_path / "initial.json"),
+                          "representative_points": str(tmp_path / "representatives.json")})
+    figures = []
+    def capture(plt, fig, directory, name):
+        figures.append((directory.name, name))
+        plt.close(fig)
+    monkeypatch.setattr(module, "_save", capture)
+    output = tmp_path / "steps"
+    module.export_steps(plt, run, output, {"status": "localization_failed", "error": "trajectory generation interrupted"})
+    states = {item["step"]: item["status"] for item in read_json(output / "step_index.json")}
+    assert states["04_initial_candidates"] == states["05_point_clustering"] == "available"
+    assert states["06_representative_trajectories"] == states["07_joint_solution"] == states["09_final_evaluation"] == "not_available"
+    assert figures == [("04_initial_candidates", "initial_points"),
+                       ("05_point_clustering", "members_and_representatives"), ("05_point_clustering", "cluster_sizes")]
+    assert "s1" in (output / "05_point_clustering/cluster_members.csv").read_text()
+    assert "trajectory generation interrupted" in (output / "06_representative_trajectories/README.md").read_text()
+    assert not (output / "06_representative_trajectories/trajectories.csv").exists()
+
+
+def test_missing_peak_does_not_renumber_point_or_trajectory_observations(tmp_path, monkeypatch):
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import time_bias_localization.step_visualization as module
+    from time_bias_localization.visualization import write_json
+
+    point = dict(observation_id="music_path_02", sample_id="s0", topology_id="los", reference_bias_s=0.,
+                 position_m=[2., 1.], reflection_wall_ids=[], observed_aoa_global_rad=0., observed_delay_s=2e-9)
+    write_json(tmp_path / "points.json", {"reference_bias_s": 0., "points": [point]})
+    run = dict(scene={"bounds_m": [-2., 4., -2., 4.], "walls": []}, bs=[0., 0.], true=[1., 1.], boresight=0.,
+               artifacts={"initial_candidates": str(tmp_path / "points.json")})
+    figures = {}
+    def capture(plt, fig, directory, name):
+        figures[name] = fig
+    monkeypatch.setattr(module, "_save", capture)
+    module._export_initial_points(plt, run, tmp_path)
+    trajectory = dict(candidate_id="c0", observation_id="music_path_02", anchor_m=[2., 1.], direction=[1., 0.],
+                      beta_interval_m=[0., 1.], metadata=dict(reflection_wall_ids=[], initial_position_m=[2., 1.]))
+    module._trajectories(plt, run, [trajectory], tmp_path, clustered=True, title="representative", show_initial_points=True)
+    for name, fig in figures.items():
+        labels = fig.axes[0].get_legend_handles_labels()[1]
+        assert any(label.startswith("观测 3") for label in labels)
+        assert not any(label.startswith("观测 1") or label.startswith("观测 2") for label in labels)
+        if name == "trajectories":
+            np.testing.assert_allclose(fig.axes[0].lines[2].get_color(), plt.get_cmap("tab10")(2))
+        plt.close(fig)

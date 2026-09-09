@@ -1,17 +1,20 @@
 # 时间偏差校正的二维多径定位
 
-当前定位主流程为 `music_spectrum_sampling_v1`，定位清单格式为第 4 版：
+当前定位主流程为 `music_point_clustering_v2`，定位清单格式为第 5 版：
 
 ```text
 一份接收到的带噪 CSI → 一次协方差与特征分解 → 二维 MUSIC 谱与找峰
-  → 各峰附近连续采样角度和观测时延 → 汇集全部反向候选轨迹
-  → 同来源峰、同反射结构内聚类并选代表 → 一次位置与公共 bias 联合求解
+  → 各峰附近连续采样角度和观测时延 → 参考 bias 下反向 RT 得到初始位置点
+  → 同来源峰、同反射墙顺序内对位置点聚类并选真实代表
+  → 只为代表点生成随 bias 变化的轨迹 → 一次位置与公共 bias 联合求解
   → 正向路径检查 → 独立读取真值评估
 ```
 
 定位内部不再给 CSI 额外加噪，也不再逐次扰动求解后平均。实验中每个 UE 的
 5 次独立噪声重复仍保留，用于生成 5 份接收数据；每份接收数据分别执行上述流程。
-实现与验证说明见 [谱面采样实现记录](docs/spectrum_sampling_implementation_20260908.md)。
+实现与验证说明见 [点聚类流程说明](docs/point_clustering_workflow_20260909.md)。
+初始参考偏差 `localization.initial_reference_bias_s` 默认为 0 秒，是公开假设，不是实际 bias；
+它只用于形成聚类点集，最终 bias 仍由联合求解得到。
 
 项目同时提供 DeepMIMO V4 + Sionna RT 2.0 的可选入口。定位算法本身不依赖
 这两个大型仿真包，因此即使尚未安装它们，也能先验证数学和数据链路。
@@ -68,17 +71,18 @@ PYTHON_BIN=/绝对路径/python /data/zhujun/differt_projects/time-bias-correct/
 - `data/truth/ground_truth.npz`：只供独立评估读取的 UE 与偏差真值。
 - `localization/music_spectrum.npz`：二维 MUSIC 谱和坐标网格。
 - `localization/spectrum_samples.json`：每个峰的局部细谱面、连续采样坐标、来源和采样参数。
-- `localization/raw_reverse_candidates.json`：未聚类候选及完整路径来源。
-- `localization/clustered_candidates.json`：同观测、同反射结构内的代表轨迹。
+- `localization/initial_candidates.json`：参考 bias 下的初始位置点、路径来源和排除原因。
+- `localization/representative_points.json`：点簇、成员及所选真实代表点。
+- `localization/representative_trajectories.json`：只为代表点生成的轨迹及合法 bias 范围。
 - `localization/localization_result.json`：最终 `mu`、`sigma` 和公共偏差。
 - `localization/forward_check.json`：最终解对应的路径合法性，以及预测角度、时延与输入观测的差异。
 - `localization/localization_config.json`：补齐默认值后的定位专用配置快照及其文件指纹；
   其中含有公开的 `radio.bs_position_m`，但不含 `simulation`、UE 位置、注入偏差
   或生成时使用的 `snr_db`。
 - `localization/localization_manifest.json`：本次定位编号和批次、场景、CSI、主结果及
-  6 个诊断产物的文件指纹。
+  全部诊断产物的文件指纹。
 - `evaluation/metrics.json`：单独读取真值后得到的误差。
-- `evaluation/history/<旧运行编号>/`：当前版本在重新定位前保存旧主结果、6 个诊断文件、
+- `evaluation/history/<旧运行编号>/`：当前版本在重新定位前保存旧主结果、全部诊断文件、
   定位配置、指标及路径已改写的旧定位清单；固定 `metrics.json` 只代表当前已经
   完成评估的运行。离线闭环还会把该次使用的场景、CSI、真值和生成清单一并保存。
 - `receipts/*.json`：分阶段运行的不可覆盖回执，记录本次定位编号以及结果和清单
@@ -193,7 +197,7 @@ cd /data/zhujun/differt_projects/time-bias-correct
 ### 历史版本的小规模实跑记录（CSI 扰动流程）
 
 本节保留谱面采样改造之前的运行证据；其中的位置误差、协方差和扰动次数
-均属于当时版本，不能作为当前 `music_spectrum_sampling_v1` 的验证结果。
+均属于当时版本，不能作为当前 `music_point_clustering_v2` 的验证结果。
 
 run11 已在 Munich 场景从零完整生成，并再次执行一键脚本验证了安全复用和旧指标
 归档。产物保存在 `outputs/deepmimo_sionna_smoke_run11/`。Sionna 共给出 15 条路径，
@@ -241,7 +245,7 @@ cd /data/zhujun/differt_projects/time-bias-correct
 
 ## 当前边界
 
-- 新流程的实现与检查记录见 [谱面采样实现记录](docs/spectrum_sampling_implementation_20260908.md)；
+- 新流程的实现与检查记录见 [点聚类流程说明](docs/point_clustering_workflow_20260909.md)；
   历史版本的工程运行记录保留在上节，不与新流程合并统计。
 - DeepMIMO/Sionna 的 Munich run11 从零生成、安全复用和历史指标归档都已打通，
   证明了当时 API、数组形状、固定地图范围、双配置隔离、批次绑定和三阶段脚本能够工作。
@@ -249,7 +253,7 @@ cd /data/zhujun/differt_projects/time-bias-correct
   如何分开信号与噪声，后者控制送入定位的峰数；路径数自动估计留到后续实验。
 - 局部采样复用同一份 CSI 的子空间，不重复分解，不进行扰动峰配对；候选数量
   由 `music.spectrum_sampling.samples_per_peak` 控制。采样不会补回全局找峰已经漏掉的路径。
-- 聚类代表直接参与一次联合求解；没有足够有效路径时记录失败，失败前已完成的
+- 初始点先聚类，随后只为代表点构建轨迹，再执行一次联合求解；没有足够有效路径时记录失败，失败前已完成的
   步骤数据单独保存。未执行的后续步骤不生成估计结果。
 - 旧 `music.uncertainty_*`、`association_max_normalized_distance`、
   `false_peak_penalty`、`missed_peak_penalty` 配置会明确报错。旧报告保持只读兼容；
@@ -272,13 +276,13 @@ cd /data/zhujun/differt_projects/time-bias-correct
 
 运行 `./run_visualize_results.sh` 可直接绘制已有 Munich run11 历史结果；新结果通过
 脚本顶部的输入目录参数指定。输出按
-`samples/UE编号/repeat编号/00–08步骤/` 组织，每步保存图及原始数据，包括 CSI、
-MUSIC、局部谱面采样、全部反向候选、聚类代表、唯一联合解、正向检查和独立评估。
+`samples/UE编号/repeat编号/00–09步骤/` 组织，每步保存图及原始数据，包括 CSI、
+MUSIC、局部谱面采样、初始点、点簇及代表、代表轨迹、唯一联合解、正向检查和独立评估。
 历史报告使用其原始步骤名，并明确标明旧版本。
 `summary/` 单独保存全部 sample 的定位误差 CDF、Med/P90 图和逐次、逐 UE 汇总表。
 不包含候选簇之间的联系图；绘图独立读取已有评估产物，不修改定位结果。
 
-`./run_spectrum_sampling_experiment.sh` 提供一个 BS、30 个 UE、每点 5 次独立噪声的
+`./run_point_clustering_experiment.sh` 提供一个 BS、30 个 UE、每点 5 次独立噪声的
 实验入口。设置 `PLAN_ONLY=1` 只生成固定采样计划和示意图；正式执行时每个 UE
 复用同一份无噪声信道生成重复，失败项也计入总数。默认采样范围是已有 UE 附近的
 20 m × 20 m 局部空旷区域。参数、路径、恢复运行和图表含义见
@@ -288,7 +292,7 @@ GPU 全量实验示例：
 
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
-GPU_IDS=0,1,2,3,4,5,6,7 PLAN_ONLY=0 RESUME=0 ./run_spectrum_sampling_experiment.sh
+GPU_IDS=0,1,2,3,4,5,6,7 PLAN_ONLY=0 RESUME=0 ./run_point_clustering_experiment.sh
 ```
 
 每卡一个常驻进程处理不同 UE；每份接收 CSI 的特征分解只执行一次，全局谱、
@@ -297,10 +301,11 @@ GPU_IDS=0,1,2,3,4,5,6,7 PLAN_ONLY=0 RESUME=0 ./run_spectrum_sampling_experiment.
 
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
-./run_spectrum_sampling_check.sh
+./run_point_clustering_check.sh
 ```
 
-检查脚本默认读取旧实验 UE001、UE002、UE006 各一份已保存的 CSI，在新目录重新
+检查脚本默认读取 `spectrum_experiment_20260908T091621_2543248` 中
+UE001、UE010、UE006 各一份已保存的 CSI，在新目录重新
 定位并输出逐步骤报告和汇总。两份新脚本的输入、输出和参数都集中在顶部。
 安装、单卡/多卡命令、历史执行记录及对照验证见
 [GPU 运行说明](docs/gpu_execution.md)。

@@ -66,6 +66,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "localization": {
         "bias_min_s": -80e-9,
         "bias_max_s": 80e-9,
+        # 初始候选点共用的公开参考偏差，不是已知真值或最终估计值。
+        "initial_reference_bias_s": 0.0,
         # 仅为旧生成配置快照保持稳定；定位白名单不接收这两个未使用字段。
         "candidate_angle_samples": 5,
         "candidate_delay_samples": 5,
@@ -73,6 +75,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_iterations": 20,
         "max_seed_pairs": 100000,
         "candidate_cluster_radius_m": 1.5,
+        # 兼容旧配置快照；点聚类主流程不再使用方向阈值。
         "candidate_direction_radius_deg": 5.0,
     },
     "output": {"root": "outputs/offline_demo"},
@@ -127,6 +130,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
         {
             "bias_min_s",
             "bias_max_s",
+            "initial_reference_bias_s",
             "candidate_cluster_radius_m",
             "candidate_direction_radius_deg",
             "huber_delta_m",
@@ -431,6 +435,15 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
     bias_max = _finite_float("bias_max_s", localization["bias_max_s"])
     if bias_min >= bias_max:
         raise ValueError("bias_min_s 必须小于 bias_max_s")
+    reference_value = localization.get("initial_reference_bias_s", 0.0)
+    if isinstance(reference_value, bool):
+        raise ValueError("initial_reference_bias_s 必须是有限数，不能是布尔值")
+    try:
+        reference_bias = _finite_float("initial_reference_bias_s", reference_value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("initial_reference_bias_s 必须是有限数") from error
+    if not bias_min <= reference_bias <= bias_max:
+        raise ValueError("initial_reference_bias_s 必须位于 [bias_min_s, bias_max_s] 范围内")
     for name in (
         "candidate_cluster_radius_m",
         "candidate_direction_radius_deg",

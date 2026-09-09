@@ -1,6 +1,6 @@
 # GPU 批量实验
 
-当前主流程为 `music_spectrum_sampling_v1`。每份接收到的带噪 CSI 只做一次协方差和特征分解，随后在 GPU 上复用该结果计算全局谱、峰附近细谱面及连续采样坐标的谱值。全部采样候选先聚类，再执行一次位置与公共 bias 联合求解。不同 UE 分给独立进程执行。
+当前主流程为 `music_point_clustering_v2`。每份接收到的带噪 CSI 只做一次协方差和特征分解，随后在 GPU 上复用该结果计算全局谱、峰附近细谱面及连续采样坐标的谱值。谱面样本先在统一参考 bias 下反向 RT 到初始位置点，对点聚类后只为代表生成轨迹，再执行一次位置与公共 bias 联合求解。不同 UE 分给独立进程执行。
 
 每个 UE 的多次独立噪声重复属于实验数据生成；定位内部不再给接收 CSI 额外加噪。下文的历史验证记录仍保留旧流程数字，并明确标注版本。
 
@@ -10,14 +10,14 @@
 
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
-GPU_IDS=0 ./run_spectrum_sampling_experiment.sh
+GPU_IDS=0 ./run_point_clustering_experiment.sh
 ```
 
 两张卡并行，每张卡一个常驻进程：
 
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
-GPU_IDS=0,1 ./run_spectrum_sampling_experiment.sh
+GPU_IDS=0,1 ./run_point_clustering_experiment.sh
 ```
 
 `GPU_IDS` 使用 `nvidia-smi` 中的设备编号。每个进程只看见分给自己的那张卡，进程内部的 `device_id` 因此固定为 `0`。同一进程内，Sionna 信道生成和 MUSIC 使用同一张卡。所有指定的卡通过 CUDA 预检后，才开始分配 UE；无法使用 GPU 会明确报错。
@@ -42,10 +42,10 @@ GPU_IDS=0,1 ./run_spectrum_sampling_experiment.sh
 
 ```bash
 cd /data/zhujun/differt_projects/time-bias-correct
-./run_spectrum_sampling_check.sh
+./run_point_clustering_check.sh
 ```
 
-该脚本默认读取 `outputs/gpu_munich_20260908T020052_1904235` 中 UE001、UE002、UE006 各一份原始接收 CSI，使用当前定位配置，在新目录保存新流程结果和报告。`UE_IDS`、`NOISE_REPEATS`、`SAMPLES_PER_PEAK`、`SOURCE_EXPERIMENT`、`CONFIG_PATH` 和 `OUTPUT_ROOT` 都可在顶部参数区修改。`NOISE_REPEATS` 选择读取多少份已有观测，不会对观测重新加噪。
+该脚本默认读取 `outputs/spectrum_experiment_20260908T091621_2543248` 中 UE001、UE010、UE006 各一份原始接收 CSI，使用当前定位配置，在新目录保存新流程结果和报告。`UE_IDS`、`NOISE_REPEATS`、`SAMPLES_PER_PEAK`、`REFERENCE_BIAS_S`（秒）、`SOURCE_EXPERIMENT`、`CONFIG_PATH` 和 `OUTPUT_ROOT` 都可在顶部参数区修改。`NOISE_REPEATS` 选择读取多少份已有观测，不会对观测重新加噪。
 
 原入口仍可使用 CPU：
 
@@ -54,7 +54,7 @@ cd /data/zhujun/differt_projects/time-bias-correct
 COMPUTE_BACKEND=numpy WORKERS=2 CPU_THREADS=1 ./run_visualization_experiment.sh
 ```
 
-`WORKERS` 只控制 CPU 模式的 UE 并行进程数。CPU 与 GPU 都执行同一条“单次准备、谱面采样、汇集聚类、联合求解”流程，分别使用 NumPy 与 CuPy。Sionna 的运行设备独立记录，不能仅根据 MUSIC 为 CPU 就推断信道生成也使用 CPU。
+`WORKERS` 只控制 CPU 模式的 UE 并行进程数。CPU 与 GPU 都执行同一条“单次准备、谱面采样、初始点聚类、代表轨迹、联合求解”流程，分别使用 NumPy 与 CuPy。Sionna 的运行设备独立记录，不能仅根据 MUSIC 为 CPU 就推断信道生成也使用 CPU。
 
 以上 `.sh` 入口会在启动 Python 前设置 CPU 线程数。直接调用 Python 的 `run_experiment(..., workers=1, compute_backend='numpy')` 时，为保持已有调用行为，会沿用当前进程的线程设置；传入 `cpu_threads` 不会重新初始化已经导入的 NumPy。执行记录中的 `thread_limit_method` 会注明这一点。
 
@@ -75,9 +75,9 @@ COMPUTE_BACKEND=numpy WORKERS=2 CPU_THREADS=1 ./run_visualization_experiment.sh
 - `compute.py`：`MusicComputer.prepare()` 为一份 CSI 计算一次子空间；返回对象的 `spectrum()` 和 `values()` 分别评价网格和成对连续坐标。CUDA 模式使用 CuPy 双精度，角度分块限制临时数组；导向向量缓存有数量和内存上限。
 - `music_stage.py`：在常驻进程内复用计算器及设备上下文。旧扰动函数仅供历史回归检查，主流程不再调用。
 - `spectrum_sampling.py`：每个峰附近细化谱面，以谱形和少量均匀覆盖构造候选搜索分布，先抽单元、再在单元内抽连续角度与时延。局部谱和采样坐标的精确谱值复用同一子空间，不再次分解 CSI。
-- `pipeline.py`：全部样本进入反向追踪和第一次聚类，代表候选进入一次联合求解，然后做正向检查。新产物使用第 4 版清单，并记录 `workflow=music_spectrum_sampling_v1`。
+- `pipeline.py`：全部样本在参考 bias 下反向追踪到初始点，对点聚类后才为代表建立轨迹，然后联合求解和正向检查。新产物使用第 5 版清单，并记录 `workflow=music_point_clustering_v2`。
 
-仍在 CPU 上运行的部分包括：二维墙线提取、峰值筛选、候选轨迹生成、第一次聚类、候选组合和位置/偏差求解、文件写入与绘图。GPU 利用率因此会随阶段变化，不能期望从开始到结束始终满载。
+仍在 CPU 上运行的部分包括：二维墙线提取、峰值筛选、初始点反向追踪、点聚类、代表轨迹生成、候选组合和位置/偏差求解、文件写入与绘图。GPU 利用率因此会随阶段变化，不能期望从开始到结束始终满载。
 
 ## 输出和核对
 
@@ -132,7 +132,7 @@ GPU 不可用导致工作进程启动失败时，UE 任务尚未发布，可以�
 cd /data/zhujun/differt_projects/time-bias-correct
 EXPERIMENT_ROOT=/绝对路径/已有实验目录 \
 REPORT_ROOT=/绝对路径/新的报告目录 \
-GPU_IDS=0,1 RESUME=1 ./run_spectrum_sampling_experiment.sh
+GPU_IDS=0,1 RESUME=1 ./run_point_clustering_experiment.sh
 ```
 
 命令行模块不传 `--report-output` 时只执行计算。之后可独立绘图：
@@ -157,7 +157,7 @@ GPU_ID=0 EVALUATE=1 ./run_benchmark_gpu.sh
 
 `INPUT_ROOT` 默认指向 `outputs/gpu_munich_20260908T020052_1904235/UE001/repeat_000`，`LOCALIZATION_CONFIG` 默认指向当前 `configs/deepmimo_sionna_munich_localization.yaml`；不会加载输入目录里的旧扰动配置。`OUTPUT_ROOT` 默认自动生成新目录。CPU 与 GPU 使用同一输入、随机种子和双精度；先分别做一次单谱预热，再测整个定位调用。只有两次定位完成后，`EVALUATE=1` 才独立读取真实位置和偏差。默认 `EVALUATE=0` 只比较 CPU/GPU 输出。
 
-`MODE=kernel` 只比较单次子空间准备、全局谱和局部连续采样，其耗时包含局部谱评价。完整模式另外核对采样来源与连续坐标、反向候选、第一次聚类、选中路径、位置和 bias。当前版本的验证记录见 [谱面采样实现记录](spectrum_sampling_implementation_20260908.md)。
+`MODE=kernel` 只比较单次子空间准备、全局谱和局部连续采样，其耗时包含局部谱评价。完整模式另外核对采样来源与连续坐标、初始候选点、点簇、代表轨迹、选中路径、位置和 bias。当前版本的验证记录见 [点聚类流程说明](point_clustering_workflow_20260909.md)，上一版记录保存在 [谱面采样实现记录](spectrum_sampling_implementation_20260908.md)。
 
 ## 历史版本的 CPU/GPU 与双卡验证（CSI 扰动流程）
 
@@ -175,7 +175,7 @@ GPU_ID=0 EVALUATE=1 ./run_benchmark_gpu.sh
 | 独立评估的位置误差 | 0.066532 m | 0.066532 m |
 | 独立评估的偏差误差 | −0.150389 ns | −0.150389 ns |
 
-本输入的完整定位加速比为 3.82。原始峰索引、扰动峰配对、反向候选、第一次聚类、选中路径及每次扰动求解状态均一致；最终位置和偏差之差均为 0，MUSIC 谱的相对二范数差为约 `3.52e-10`。这不表示谱逐位相同。
+本输入的完整定位加速比为 3.82。原始峰索引、扰动峰配对、初始候选点、点簇、代表轨迹、选中路径及每次扰动求解状态均一致；最终位置和偏差之差均为 0，MUSIC 谱的相对二范数差为约 `3.52e-10`。这不表示谱逐位相同。
 
 CPU 和 GPU 的首次单谱预热分别用了 1.050 s 和 8.443 s，未计入表中的完整定位耗时；首次批量调用仍可能需要编译。这里比较的是重构后的 CPU 与 GPU，一次输入、一次计时，不用历史实验的耗时推算加速比，也不代表全部 sample 的平均表现。表中不含射线生成、独立评估及绘图。
 

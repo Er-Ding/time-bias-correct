@@ -40,6 +40,22 @@ def checked_record(record: dict[str, str]) -> Path:
     return path
 
 
+def _candidate_artifacts(artifacts: dict, workflow: str | None) -> dict[str, Any]:
+    """按原始工作流保留点、点簇和轨迹的不同含义，缺失阶段不伪造。"""
+    if workflow == "music_point_clustering_v2":
+        return {
+            "initial_candidates": read_json(artifacts["initial_candidates"]) if "initial_candidates" in artifacts else None,
+            "representative_points": read_json(artifacts["representative_points"]) if "representative_points" in artifacts else None,
+            "representative_trajectories": read_json(artifacts["representative_trajectories"]) if "representative_trajectories" in artifacts else None,
+        }
+    if workflow not in {None, "music_spectrum_sampling_v1"}:
+        raise ValueError(f"未知的定位工作流：{workflow}")
+    return {
+        "raw": read_json(artifacts["raw_reverse_candidates"]) if "raw_reverse_candidates" in artifacts else [],
+        "clusters": read_json(artifacts["clustered_candidates"]) if "clustered_candidates" in artifacts else [],
+    }
+
+
 def load_run(root: Path) -> dict[str, Any]:
     """核对生成批次、主结果、诊断和评估；不修改原始产物。"""
     manifest_path = root / "localization/localization_manifest.json"
@@ -109,8 +125,7 @@ def load_run(root: Path) -> dict[str, Any]:
                 artifacts={key: str(path) for key, path in artifacts.items()},
                 input_paths={key: record["path"] for key, record in generation["artifact_hashes"].items()},
                 config_path=str(snapshot_path),
-                raw=read_json(artifacts["raw_reverse_candidates"]),
-                clusters=read_json(artifacts["clustered_candidates"]), sources=sources)
+                **_candidate_artifacts(artifacts, result.get("workflow")), sources=sources)
 
 
 def load_failed_run(root: Path, progress_path: str | Path) -> dict[str, Any]:
@@ -120,7 +135,7 @@ def load_failed_run(root: Path, progress_path: str | Path) -> dict[str, Any]:
     if not progress_path.is_relative_to(failure_root):
         raise ValueError("失败进度文件不属于本次样本的 localization_failures 目录")
     progress = read_json(progress_path)
-    if progress.get("workflow") != "music_spectrum_sampling_v1":
+    if progress.get("workflow") not in {"music_spectrum_sampling_v1", "music_point_clustering_v2"}:
         raise ValueError("失败进度记录的工作流不受支持")
     if progress_path.parent.name != progress["run_id"]:
         raise ValueError("失败进度目录与运行编号不一致")
@@ -180,8 +195,7 @@ def load_failed_run(root: Path, progress_path: str | Path) -> dict[str, Any]:
     return dict(root=str(root), workflow=progress["workflow"], scene=read_json(inputs["scene_json"]),
                 bs=bs, boresight=boresight, true=true.tolist(), result=result, metrics={}, paths=paths,
                 artifacts=artifacts, input_paths=inputs, config_path=str(config_path),
-                raw=read_json(artifacts["raw_reverse_candidates"]) if "raw_reverse_candidates" in artifacts else [],
-                clusters=read_json(artifacts["clustered_candidates"]) if "clustered_candidates" in artifacts else [],
+                **_candidate_artifacts(artifacts, progress["workflow"]),
                 progress=progress, sources=sources)
 
 
@@ -465,7 +479,7 @@ def create_report(output: Path, *, run_roots: list[Path] | None = None, experime
         "- [总体误差统计](summary/README.md)：CDF、Med、P90、逐次结果表及逐 UE 汇总。\n"
         + "\n".join(f"- [{sample['ue_id']}](samples/{sample['ue_id']}/README.md)" for sample in sample_summaries)
         + ("\n\n本报告仅包含汇总图表及各 UE 结果表，未导出逐步骤图。\n" if summary_only else
-           "\n\n每个 UE 的 repeat 子目录含 00–08 步骤，每步保存图、数据与对应函数说明。\n")
+           "\n\n每个 UE 的 repeat 子目录按本次运行保存的流程分步：当前点聚类流程为 00–09；历史流程保留其原有 00–08。每步保存图、数据与对应函数说明。\n")
         +
         "不绘制候选簇联系。00 真值只作参照，不是定位输入。绘图不重新执行定位。\n"
         "旧结果没有保存的内部历史明确标注缺失；失败和待运行项保留目录和状态，不编造中间输出。\n"

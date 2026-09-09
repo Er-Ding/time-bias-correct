@@ -68,8 +68,10 @@ music:
 localization:
   bias_min_s: -80.0e-9
   bias_max_s: 80.0e-9
+  # 在同一公开参考偏差下反向 RT 到初始位置点；不读取真实 bias。
+  initial_reference_bias_s: 0.0
+  # 同来源峰、同反射墙顺序内，按初始位置点的欧式距离聚类。
   candidate_cluster_radius_m: 1.5
-  candidate_direction_radius_deg: 5.0
   huber_delta_m: 0.75
   max_iterations: 20
 

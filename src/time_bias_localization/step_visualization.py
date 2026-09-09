@@ -10,6 +10,7 @@ from .visualization import _save, _scene_axes, read_json, write_csv, write_json
 
 
 WORKFLOW = "music_spectrum_sampling_v1"
+POINT_WORKFLOW = "music_point_clustering_v2"
 
 STEPS = [
     ("00_scene_truth", "场景与仿真真值（仅作参照）", "generate_synthetic_measurement / extract_planar_uplink_csi"),
@@ -21,6 +22,16 @@ STEPS = [
     ("06_joint_solution", "代表候选的位置与共同偏差联合解", "solve_position_and_bias"),
     ("07_forward_check", "预测路径与输入观测的检查", "forward_check"),
     ("08_final_evaluation", "独立真值评价", "evaluate"),
+]
+
+POINT_STEPS = [
+    *STEPS[:4],
+    ("04_initial_candidates", "反向追踪得到的初始位置点", "generate_initial_candidate_points"),
+    ("05_point_clustering", "初始位置点聚类、成员与代表点", "cluster_initial_candidate_points"),
+    ("06_representative_trajectories", "仅由代表点建立的偏差—位置轨迹", "build_representative_trajectories"),
+    ("07_joint_solution", "代表轨迹的位置与共同偏差联合解", "solve_position_and_bias"),
+    ("08_forward_check", "预测路径与输入观测的检查", "forward_check_solution"),
+    ("09_final_evaluation", "独立真值评价", "evaluate"),
 ]
 
 LEGACY_STEPS = [
@@ -53,10 +64,28 @@ def _map(plt, run, title):
     return fig, ax
 
 
-def _trajectories(plt, run, candidates, directory, *, clustered, title):
+def _observation_indices(run, observation_ids):
+    """沿用 MUSIC 来源编号；某个峰没有合法候选时不压缩后续编号或颜色。"""
+    source = run.get("artifacts", {}).get("spectrum_samples")
+    regions = read_json(source).get("regions", []) if source else []
+    known = {region["observation_id"]: int(region.get("peak_index", index))
+             for index, region in enumerate(regions)}
+    result = {}
+    for fallback, observation_id in enumerate(sorted(observation_ids)):
+        if observation_id in known:
+            result[observation_id] = known[observation_id]
+        elif observation_id.startswith("music_path_") and observation_id.removeprefix("music_path_").isdigit():
+            result[observation_id] = int(observation_id.removeprefix("music_path_"))
+        else:
+            result[observation_id] = fallback
+    return result
+
+
+def _trajectories(plt, run, candidates, directory, *, clustered, title, show_initial_points=False):
     fig, ax = _map(plt, run, title)
     ids = sorted({item["observation_id"] for item in candidates})
-    colors = {key: plt.get_cmap("tab10")(i % 10) for i, key in enumerate(ids)}
+    indices = _observation_indices(run, ids) if show_initial_points else {key: index for index, key in enumerate(ids)}
+    colors = {key: plt.get_cmap("tab10")(indices[key] % 10) for key in ids}
     rows, extents = [], [run["true"], run["bs"]]
     for index, item in enumerate(candidates):
         interval = item["beta_interval_m"] if clustered else [item["beta_min_m"], item["beta_max_m"]]
@@ -66,6 +95,9 @@ def _trajectories(plt, run, candidates, directory, *, clustered, title):
         order = len(metadata["reflection_wall_ids"])
         label = f"{'C' if clustered else 'R'}{index + 1}"
         ax.plot(*endpoints.T, color=colors[item["observation_id"]], ls=["-", "--", "-."][order], lw=1.5 if clustered else .9, alpha=.8)
+        if show_initial_points:
+            ax.scatter(*metadata["initial_position_m"], color=colors[item["observation_id"]], marker="D", s=25,
+                       edgecolors="black", linewidths=.4, zorder=8)
         if len(candidates) <= (8 if clustered else 30):
             ax.annotate(label, endpoints.mean(axis=0), fontsize=6, xytext=(3, 3), textcoords="offset points")
         rows.append(dict(label=label, observation_id=item["observation_id"],
@@ -75,9 +107,13 @@ def _trajectories(plt, run, candidates, directory, *, clustered, title):
                          direction_x=item["direction"][0], direction_y=item["direction"][1],
                          bias_min_ns=interval[0] / SPEED_OF_LIGHT_M_S * 1e9,
                          bias_max_ns=interval[1] / SPEED_OF_LIGHT_M_S * 1e9,
-                         member_count=metadata.get("raw_count", 1)))
-    for i, key in enumerate(ids):
-        ax.plot([], [], color=colors[key], label=f"观测 {i + 1}")
+                         member_count=metadata.get("raw_count", 1),
+                         representative_sample_id=metadata.get("representative_sample_id", "")))
+    for key in ids:
+        ax.plot([], [], color=colors[key], label=f"观测 {indices[key] + 1}")
+    if show_initial_points:
+        ax.scatter([], [], color="0.5", marker="D", s=25, edgecolors="black", linewidths=.4,
+                   label="上一步保留的初始代表点")
     xy = np.asarray(extents)
     ax.set(xlim=(xy[:, 0].min() - 3, xy[:, 0].max() + 3), ylim=(xy[:, 1].min() - 3, xy[:, 1].max() + 3))
     ax.legend(fontsize=7)
@@ -96,7 +132,7 @@ def _position(plt, run, solution, directory, title):
     radii = np.sqrt(5.991 * np.maximum(eigenvalues, 0))
     angle = np.degrees(np.arctan2(eigenvectors[1, 1], eigenvectors[0, 1]))
     ellipse_label = ("几何残差近似椭圆（未校准，非采样置信区间）"
-                     if run.get("result", {}).get("workflow") == WORKFLOW
+                     if run.get("result", {}).get("workflow") in {WORKFLOW, POINT_WORKFLOW}
                      else "名义 95% 椭圆（未校准）")
     ax.add_patch(Ellipse(estimate, 2 * radii[1], 2 * radii[0], angle=angle, fill=False,
                         color="#4477AA", label=ellipse_label))
@@ -348,7 +384,7 @@ def _export_spectrum_samples(plt, run, folder):
         im = ax.pcolormesh(delays, angles, relative, shading="auto", cmap="viridis", vmin=-40, vmax=0)
         fig.colorbar(im, ax=ax, label="局部 MUSIC 谱 / dB（非概率）")
         for nominal, marker, color, label in [(False, ".", "#F2F2F2", "连续谱面采样"),
-                                               (True, "*", "#FFB000", "原始峰")]:
+                                               (True, "*", "#FFB000", "粗网格初始峰")]:
             subset = [item for item in members if (item.get("sampling_kind", item.get("source")) == "nominal") == nominal]
             if subset:
                 ax.scatter([item["delay_s"] * 1e9 for item in subset],
@@ -421,6 +457,7 @@ def _export_clusters(plt, run, folder):
 
 
 def _export_forward_check(plt, run, folder):
+    step_number = folder.name.split("_", 1)[0]
     source = run["artifacts"]["forward_check"]
     _copy(source, folder / "forward_check.json")
     diagnostics = read_json(source)
@@ -453,9 +490,9 @@ def _export_forward_check(plt, run, folder):
             ax.axhline(0., color="0.4", lw=.7)
             ax.set_xticks(x, [f"P{i + 1}" for i in x])
             ax.set(xlabel="所选路径（顺序见表）", ylabel=title)
-        fig.suptitle("07  所选反射路径正向重算；与原始峰比较，未使用真值", fontsize=10)
+        fig.suptitle(f"{step_number}  所选反射路径正向重算；与原始峰比较，未使用真值", fontsize=10)
         _save(plt, fig, folder, "original_peak_residuals")
-        fig, ax = _map(plt, run, "07  联合解正向重算的所选路径")
+        fig, ax = _map(plt, run, f"{step_number}  联合解正向重算的所选路径")
         extents = [run["true"], run["bs"]]
         for i, item in enumerate(paths):
             points = np.asarray(item.get("path_nodes_m", []), dtype=float)
@@ -480,14 +517,221 @@ def _export_forward_check(plt, run, folder):
         table.scale(1., 1.3)
     else:
         ax.text(.5, .5, f"已记录 {len(paths)} 条路径检查，详见 JSON 和 CSV", ha="center", transform=ax.transAxes)
-    ax.set_title("07  对原始观测的检查（不使用真实位置或真实 bias）")
+    ax.set_title(f"{step_number}  对原始观测的检查（不使用真实位置或真实 bias）")
     _save(plt, fig, folder, "forward_check")
+
+
+def _point_row(point):
+    return dict(observation_id=point["observation_id"], sample_id=point["sample_id"],
+                topology_id=point["topology_id"], x_m=point["position_m"][0], y_m=point["position_m"][1],
+                reference_bias_ns=point["reference_bias_s"] * 1e9,
+                aoa_global_deg=float(np.degrees(point["observed_aoa_global_rad"])),
+                observed_delay_ns=point["observed_delay_s"] * 1e9,
+                reflection_wall_ids=" | ".join(point["reflection_wall_ids"]))
+
+
+def _point_limits(ax, run, points):
+    xy = np.asarray([run["true"], run["bs"], *[point["position_m"] for point in points]], dtype=float)
+    ax.set(xlim=(xy[:, 0].min() - 2, xy[:, 0].max() + 2),
+           ylim=(xy[:, 1].min() - 2, xy[:, 1].max() + 2))
+
+
+def _export_initial_points(plt, run, folder):
+    source = run["artifacts"]["initial_candidates"]
+    _copy(source, folder / "initial_candidates.json")
+    payload = read_json(source)
+    points = payload["points"]
+    _table(folder / "initial_candidates.csv", [_point_row(point) for point in points])
+    write_json(folder / "rejected_samples.json", payload.get("rejected_samples", []))
+    write_json(folder / "generation_diagnostics.json", payload.get("diagnostics", {}))
+    fig, ax = _map(plt, run, "04  每个谱面样本反向追踪后的初始位置点")
+    observation_ids = sorted({point["observation_id"] for point in points})
+    indices = _observation_indices(run, observation_ids)
+    groups = []
+    # 颜色区分来源峰，同色的不同符号区分反射墙组合，避免把路径分支看成断开的单条轨迹。
+    markers = ("o", "^", "s", "D", "v", "P", "X")
+    for observation_id in observation_ids:
+        index = indices[observation_id]
+        members = [point for point in points if point["observation_id"] == observation_id]
+        topologies = sorted({point["topology_id"] for point in members})
+        for branch, topology_id in enumerate(topologies):
+            group = [point for point in members if point["topology_id"] == topology_id]
+            xy = np.asarray([point["position_m"] for point in group])
+            label = f"观测 {index + 1} / 墙组合 {branch + 1}（{len(group)} 点）"
+            ax.scatter(*xy.T, color=plt.get_cmap("tab10")(index % 10), marker=markers[branch % len(markers)],
+                       s=16, alpha=.65, label=label, zorder=7)
+            groups.append(dict(label=label, observation_id=observation_id, topology_id=topology_id,
+                               point_count=len(group), reflection_wall_ids=" | ".join(group[0]["reflection_wall_ids"])))
+    _point_limits(ax, run, points)
+    ax.legend(fontsize=6, loc="best")
+    fig.suptitle(f"参考 bias = {payload['reference_bias_s'] * 1e9:g} ns，只用于初始化；不是已知或估计的真实 bias；本步未生成轨迹", fontsize=8)
+    _save(plt, fig, folder, "initial_points")
+    _table(folder / "observation_topologies.csv", groups)
+
+
+def _export_point_clusters(plt, run, folder):
+    initial = read_json(run["artifacts"]["initial_candidates"])
+    source = run["artifacts"]["representative_points"]
+    _copy(source, folder / "representative_points.json")
+    payload = read_json(source)
+    representatives = payload["representatives"]
+    lookup = {(point["observation_id"], point["sample_id"]): point for point in initial["points"]}
+    if len(lookup) != len(initial["points"]):
+        raise ValueError("初始候选点的来源与样本编号重复")
+    if payload["reference_bias_s"] != initial["reference_bias_s"]:
+        raise ValueError("初始点与代表点使用的参考 bias 不一致")
+    fig, ax = _map(plt, run, "05  初始位置点聚类：圆点为成员，菱形为保留的真实代表点")
+    membership, counts, representative_rows, assigned = [], [], [], set()
+    for index, representative in enumerate(representatives):
+        point, members = representative["point"], representative["members"]
+        candidate_id = representative["candidate_id"]
+        member_ids = {(member["observation_id"], member["sample_id"]) for member in members}
+        if (len(member_ids) != len(members) or assigned.intersection(member_ids)
+                or (point["observation_id"], point["sample_id"]) not in member_ids):
+            raise ValueError(f"点簇成员重复或代表不是簇内成员：{candidate_id}")
+        for member in members:
+            key = (member["observation_id"], member["sample_id"])
+            if key not in lookup or lookup[key] != member:
+                raise ValueError(f"点簇成员与初始候选点不一致：{member['sample_id']}")
+            if member["observation_id"] != point["observation_id"] or member["topology_id"] != point["topology_id"]:
+                raise ValueError(f"点簇混入不同来源峰或反射墙组合：{candidate_id}")
+            membership.append(dict(candidate_id=candidate_id, **_point_row(member),
+                                   is_representative=member["sample_id"] == point["sample_id"]))
+        if lookup[(point["observation_id"], point["sample_id"])] != point:
+            raise ValueError(f"保留的代表点被改写：{candidate_id}")
+        assigned.update(member_ids)
+        color = plt.get_cmap("tab20")(index % 20)
+        xy = np.asarray([member["position_m"] for member in members])
+        ax.scatter(*xy.T, s=17, color=color, alpha=.5, zorder=7)
+        ax.scatter(*point["position_m"], s=65, marker="D", color=color, edgecolors="black", linewidths=.7, zorder=9)
+        representative_rows.append(dict(candidate_id=candidate_id, **_point_row(point)))
+        counts.append(dict(label=f"C{index + 1}", candidate_id=candidate_id, observation_id=point["observation_id"],
+                           topology_id=point["topology_id"], member_count=len(members), representative_sample_id=point["sample_id"]))
+    if assigned != set(lookup):
+        raise ValueError("点聚类没有完整覆盖已保存的初始候选点")
+    _point_limits(ax, run, initial["points"])
+    ax.scatter([], [], color="0.5", s=17, alpha=.5, label="簇内初始位置点")
+    ax.scatter([], [], color="0.5", marker="D", s=65, edgecolors="black", label="实际成员中的代表点")
+    ax.legend(fontsize=7)
+    fig.suptitle(f"{len(initial['points'])} 个初始点 → {len(representatives)} 个代表点；同一来源峰、同一反射墙组合内按 XY 距离聚类；尚未建立轨迹", fontsize=8)
+    _save(plt, fig, folder, "members_and_representatives")
+    _table(folder / "cluster_members.csv", membership)
+    _table(folder / "cluster_counts.csv", counts)
+    _table(folder / "representative_points.csv", representative_rows)
+    write_json(folder / "counts.json", dict(raw_count=len(initial["points"]), representative_count=len(representatives),
+               listed_member_count=len(membership), clustering_space="initial_xy_at_reference_bias",
+               reference_bias_s=payload["reference_bias_s"]))
+    fig, ax = plt.subplots(figsize=(max(7.2, .3 * len(counts)), 4.), layout="constrained")
+    if counts:
+        sizes = [item["member_count"] for item in counts]
+        bars = ax.bar([item["label"] for item in counts], sizes,
+                      color=[plt.get_cmap("tab20")(i % 20) for i in range(len(counts))])
+        ax.bar_label(bars, padding=3, fontsize=7)
+        ax.set_ylim(0., max(sizes) * 1.18)
+    ax.set(xlabel="点簇编号（与表一致）", ylabel="簇内初始位置点数", title="05  初始位置点聚类压缩数量")
+    ax.tick_params(axis="x", labelsize=7, rotation=45 if len(counts) > 12 else 0)
+    fig.suptitle("成员数用于说明点集压缩，不表示独立观测数或求解权重", fontsize=9)
+    _save(plt, fig, folder, "cluster_sizes")
+
+
+def _export_point_steps(plt, run, directory, row):
+    directory.mkdir(parents=True, exist_ok=False)
+    artifacts = run.get("artifacts", {}) if run else {}
+    available = {name: False for name, _, _ in POINT_STEPS}
+    if run:
+        available.update({
+            "00_scene_truth": all(key in run.get("input_paths", {}) for key in ("scene_json", "ground_truth")),
+            "01_csi_input": "online_measurement" in run.get("input_paths", {}),
+            "02_music": all(key in artifacts for key in ("music_spectrum", "music_peaks")),
+            "03_spectrum_sampling": "spectrum_samples" in artifacts,
+            "04_initial_candidates": "initial_candidates" in artifacts,
+            "05_point_clustering": all(key in artifacts for key in ("initial_candidates", "representative_points")),
+            "06_representative_trajectories": all(key in artifacts for key in ("representative_points", "representative_trajectories")),
+            "07_joint_solution": bool(run.get("result", {}).get("central_solution")),
+            "08_forward_check": "forward_check" in artifacts,
+            "09_final_evaluation": bool(run.get("metrics")) and "result" in artifacts,
+        })
+    notes = {
+        "04_initial_candidates": "本步是谱面样本在公开参考 bias 下反向追踪到的实际 XY 端点。参考 bias 只是初始化参数，不是真值，也不是联合估计结果；非法样本单独记录。没有先建立完整候选轨迹。",
+        "05_point_clustering": "仅对同一来源峰、同一反射墙组合的初始 XY 点按欧式距离聚类，选簇内真实成员为代表。此时不比较轨迹距离、不使用轨迹方向或最终估计 bias。成员及代表点图的颜色与 cluster_sizes 簇大小图一致；簇编号、成员与代表坐标见 CSV，避免在密集点群上叠加编号文字。",
+        "06_representative_trajectories": "只为上一步保留的代表点建立 bias—位置关系；画出完整合法 bias 范围。其他簇成员不进入轨迹生成。颜色区分来源观测，具体反射墙组合见表。",
+    }
+    folders, index = {}, []
+    for name, title, function in POINT_STEPS:
+        folder = directory / name
+        folder.mkdir()
+        folders[name] = folder
+        state = "available" if available[name] else "not_available"
+        note = ("只导出本次运行保存的输出，不重新执行定位。" if available[name] else
+                f"状态：{row['status']}。本步骤没有保存可核验的输出。{row.get('error', '')}")
+        (folder / "README.md").write_text(f"# {title}\n\n对应函数：`{function}`。\n\n{note}\n\n{notes.get(name, '')}\n", encoding="utf-8")
+        index.append(dict(step=name, title=title, function=function, status=state))
+    write_json(directory / "attempt.json", row)
+    write_json(directory / "step_index.json", index)
+    (directory / "README.md").write_text(
+        "# 按执行步骤查看本次定位\n\n"
+        + ("未记录工作流来源；下列为当前流程占位，不表示这些步骤已经运行。\n\n" if run is None and "workflow" not in row else "")
+        + "工作流：带噪 CSI → MUSIC 谱附近采样 → 反向追踪初始位置点 → 点聚类与真实代表点 → 仅为代表点建立轨迹 → 一次联合求解。\n\n"
+        + "\n".join(f"- [{title}]({name}/README.md)" for name, title, _ in POINT_STEPS)
+        + "\n\n04、05 只展示初始位置点，06 才展示代表点的偏差—位置轨迹。参考 bias 是公开初始化参数，不读取真实 bias，也不是最终估计值。"
+        "\n01 的 CSI 已带噪，定位器不额外加噪；03 的样本用于候选搜索，不表示独立观测或定位置信区间。"
+        "\n00、09 在独立评估侧读取真值；08 正向检查不使用真值。失败时已保存的步骤照常导出。\n", encoding="utf-8")
+    if run is None:
+        return
+    for name, exporter in [("00_scene_truth", _export_scene), ("01_csi_input", _export_csi),
+                           ("02_music", _export_music), ("03_spectrum_sampling", _export_spectrum_samples),
+                           ("04_initial_candidates", _export_initial_points), ("05_point_clustering", _export_point_clusters),
+                           ("08_forward_check", _export_forward_check)]:
+        if available[name]:
+            exporter(plt, run, folders[name])
+    if available["06_representative_trajectories"]:
+        folder = folders["06_representative_trajectories"]
+        _copy(artifacts["representative_trajectories"], folder / "representative_trajectories.json")
+        trajectories = read_json(artifacts["representative_trajectories"])
+        representatives = read_json(artifacts["representative_points"])["representatives"]
+        lookup = {representative["candidate_id"]: representative for representative in representatives}
+        trajectory_ids = {trajectory["candidate_id"] for trajectory in trajectories}
+        if len(trajectory_ids) != len(trajectories) or trajectory_ids != set(lookup):
+            raise ValueError("代表轨迹与上一步代表点没有一一对应")
+        mapping = []
+        for trajectory in trajectories:
+            point = lookup[trajectory["candidate_id"]]["point"]
+            metadata = trajectory["metadata"]
+            if (metadata["representative_sample_id"] != point["sample_id"]
+                    or trajectory["observation_id"] != point["observation_id"]
+                    or metadata["initial_position_m"] != point["position_m"]
+                    or metadata["reflection_wall_ids"] != point["reflection_wall_ids"]):
+                raise ValueError("代表轨迹的来源或初始位置与代表点不一致")
+            at_reference = np.asarray(trajectory["anchor_m"]) - point["reference_bias_s"] * SPEED_OF_LIGHT_M_S * np.asarray(trajectory["direction"])
+            if not np.allclose(at_reference, point["position_m"], rtol=0., atol=1e-8):
+                raise ValueError("代表轨迹在参考 bias 下没有经过代表点")
+            mapping.append(dict(candidate_id=trajectory["candidate_id"], **_point_row(point)))
+        _table(folder / "representative_to_trajectory.csv", mapping)
+        _trajectories(plt, run, trajectories, folder, clustered=True, title="06  仅由聚类代表点生成的合法偏差—位置轨迹",
+                      show_initial_points=True)
+    if available["07_joint_solution"]:
+        folder = folders["07_joint_solution"]
+        result = run["result"]
+        central = result["central_solution"]
+        write_json(folder / "joint_solution.json", {**central,
+                   "selected_candidates": result.get("central_selected_candidates", []),
+                   "residuals_m": result.get("central_residuals_m", []), "diagnostics": result.get("diagnostics", {})})
+        _position(plt, run, central, folder, "07  代表轨迹的唯一联合求解结果")
+    if available["09_final_evaluation"]:
+        folder = folders["09_final_evaluation"]
+        _copy(artifacts["result"], folder / "localization_result.json")
+        write_json(folder / "metrics.json", run["metrics"])
+        write_csv(folder / "result.csv", [row])
+        _position(plt, run, run["result"], folder, "09  联合解的独立真值评价")
+    write_json(directory / "sources.json", run.get("sources", []))
 
 
 def export_steps(plt, run, directory: Path, row: dict) -> None:
     """按保存的工作流导出步骤；失败运行也保留已完成阶段。"""
     workflow = (run.get("result", {}).get("workflow", run.get("workflow"))
-                if run else row.get("workflow", WORKFLOW))
+                if run else row.get("workflow", POINT_WORKFLOW))
+    if workflow == POINT_WORKFLOW:
+        return _export_point_steps(plt, run, directory, row)
     if workflow != WORKFLOW:
         if workflow is not None:
             raise ValueError(f"未知的定位工作流：{workflow}")

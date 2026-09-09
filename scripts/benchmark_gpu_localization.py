@@ -56,9 +56,9 @@ def _candidate_signatures(candidates: list[dict]) -> list[tuple]:
 def _discrete_signature(folder: Path) -> dict:
     peaks = _read_json(folder / "music_peaks.json")
     result = _read_json(folder / "localization_result.json")
-    if peaks.get("workflow") == "music_spectrum_sampling_v1":
+    if peaks.get("workflow") in {"music_spectrum_sampling_v1", "music_point_clustering_v2"}:
         sampling = _read_json(folder / "spectrum_samples.json")
-        return {
+        signature = {
             "workflow": peaks["workflow"],
             "nominal_peak_indices": [
                 [item["aoa_index"], item["delay_index"]] for item in peaks["nominal"]
@@ -69,16 +69,32 @@ def _discrete_signature(folder: Path) -> dict:
                     "cell_aoa_index", "cell_delay_index",
                 )} for item in sampling["samples"]
             ],
-            "raw_candidates": _candidate_signatures(
-                _read_json(folder / "raw_reverse_candidates.json")
-            ),
-            "first_clusters": _candidate_signatures(
-                _read_json(folder / "clustered_candidates.json")
-            ),
             "central_selected": _candidate_signatures(
                 list(result["central_selected_candidates"].values())
             ),
         }
+        if peaks["workflow"] == "music_point_clustering_v2":
+            initial = _read_json(folder / "initial_candidates.json")
+            representatives = _read_json(folder / "representative_points.json")
+            signature.update(
+                reference_bias_s=initial["reference_bias_s"],
+                initial_candidates=_candidate_signatures(initial["points"]),
+                initial_rejections=initial["rejected_samples"],
+                point_clusters=[
+                    (item["candidate_id"], item["point"]["sample_id"],
+                     tuple(member["sample_id"] for member in item["members"]))
+                    for item in representatives["representatives"]
+                ],
+                representative_trajectories=_candidate_signatures(
+                    _read_json(folder / "representative_trajectories.json")
+                ),
+            )
+        else:
+            signature.update(
+                raw_candidates=_candidate_signatures(_read_json(folder / "raw_reverse_candidates.json")),
+                first_clusters=_candidate_signatures(_read_json(folder / "clustered_candidates.json")),
+            )
+        return signature
     # 只读兼容历史产物；新实验不再生成扰动支路。
     bootstrap = _read_json(folder / "bootstrap_diagnostics.json")
     return {
@@ -126,7 +142,9 @@ def compare_localizations(cpu_root: Path, gpu_root: Path, *, position_atol_m: fl
     cpu_signature, gpu_signature = _discrete_signature(cpu_folder), _discrete_signature(gpu_folder)
     checks = {key: cpu_signature.get(key) == gpu_signature.get(key)
               for key in cpu_signature.keys() | gpu_signature.keys()}
-    if cpu_signature.get("workflow") == gpu_signature.get("workflow") == "music_spectrum_sampling_v1":
+    if cpu_signature.get("workflow") == gpu_signature.get("workflow") and cpu_signature.get("workflow") in {
+        "music_spectrum_sampling_v1", "music_point_clustering_v2",
+    }:
         cpu_sampling = _read_json(cpu_folder / "spectrum_samples.json")
         gpu_sampling = _read_json(gpu_folder / "spectrum_samples.json")
         for field, absolute, relative in (
@@ -144,6 +162,29 @@ def compare_localizations(cpu_root: Path, gpu_root: Path, *, position_atol_m: fl
             and item["diagnostics"]["added_csi_noise"] is False
             for item in (cpu_sampling, gpu_sampling)
         )
+    if cpu_signature.get("workflow") == gpu_signature.get("workflow") == "music_point_clustering_v2":
+        for name, filename, list_key, point_key in (
+            ("initial_points", "initial_candidates.json", "points", None),
+            ("representative_points", "representative_points.json", "representatives", "point"),
+        ):
+            values = []
+            for folder in (cpu_folder, gpu_folder):
+                rows = _read_json(folder / filename)[list_key]
+                values.append(np.asarray([
+                    (item[point_key] if point_key else item)["position_m"] for item in rows
+                ]))
+            checks[f"{name}_coordinates_within_tolerance"] = (
+                values[0].shape == values[1].shape
+                and bool(np.allclose(*values, atol=1e-7, rtol=0))
+            )
+        trajectories = [_read_json(folder / "representative_trajectories.json")
+                        for folder in (cpu_folder, gpu_folder)]
+        for field in ("anchor_m", "direction", "beta_interval_m"):
+            values = [np.asarray([item[field] for item in rows]) for rows in trajectories]
+            checks[f"representative_trajectory_{field}_within_tolerance"] = (
+                values[0].shape == values[1].shape
+                and bool(np.allclose(*values, atol=1e-7, rtol=0))
+            )
     position_difference = float(np.linalg.norm(np.asarray(cpu["mu_m"]) - gpu["mu_m"]))
     bias_difference = float((gpu["clock_bias_s"] - cpu["clock_bias_s"]) * 1e9)
     central_position_difference = float(np.linalg.norm(
@@ -360,8 +401,10 @@ def _run_kernel(args, root: Path, config: dict, measurement) -> dict:
                            "error": str(error), "traceback": traceback.format_exc()})
         _write_json(root / f"{label}_benchmark.json", record)
     comparison = {"passed": False}
+    from time_bias_localization.pipeline import WORKFLOW
     report = {"runs": records, "comparison": comparison, "spectrum_count": 1,
-              "workflow": "music_spectrum_sampling_v1", "added_csi_noise": False}
+              "workflow": WORKFLOW, "scope": "music_spectrum_and_sampling_only",
+              "added_csi_noise": False}
     if len(spectra) == 2:
         indices = {key: [[p["aoa_index"], p["delay_index"]] for p in records[key]["peaks"]]
                    for key in records}

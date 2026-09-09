@@ -54,6 +54,11 @@ from .provenance import (
 from .scene import Scene2D, make_synthetic_room
 from .music_stage import get_music_computer
 from .spectrum_sampling import sample_music_spectrum
+from .initial_candidates import (
+    generate_initial_candidate_points,
+    cluster_initial_candidate_points,
+    build_representative_trajectories,
+)
 from .forward_check import forward_check_solution
 from .signal import (
     MusicPeak2D,
@@ -312,8 +317,8 @@ _LEGACY_LOCALIZATION_ARTIFACT_FILENAMES = {
     "bootstrap_diagnostics": "bootstrap_diagnostics.json",
 }
 
-WORKFLOW = "music_spectrum_sampling_v1"
-_LOCALIZATION_ARTIFACT_FILENAMES = {
+SPECTRUM_TRAJECTORY_WORKFLOW = "music_spectrum_sampling_v1"
+_SPECTRUM_TRAJECTORY_ARTIFACT_FILENAMES = {
     "result": "localization_result.json",
     "music_spectrum": "music_spectrum.npz",
     "music_peaks": "music_peaks.json",
@@ -323,12 +328,28 @@ _LOCALIZATION_ARTIFACT_FILENAMES = {
     "forward_check": "forward_check.json",
 }
 
+WORKFLOW = "music_point_clustering_v2"
+_LOCALIZATION_ARTIFACT_FILENAMES = {
+    "result": "localization_result.json",
+    "music_spectrum": "music_spectrum.npz",
+    "music_peaks": "music_peaks.json",
+    "spectrum_samples": "spectrum_samples.json",
+    "initial_candidates": "initial_candidates.json",
+    "representative_points": "representative_points.json",
+    "representative_trajectories": "representative_trajectories.json",
+    "forward_check": "forward_check.json",
+}
+
 
 def _manifest_artifact_filenames(manifest: dict[str, Any]) -> dict[str, str]:
-    if manifest.get("schema_version") == 4:
+    if manifest.get("schema_version") == 5:
         if manifest.get("workflow") != WORKFLOW:
-            raise ValueError("第 4 版定位清单必须明确记录谱面采样流程")
+            raise ValueError("第 5 版定位清单必须明确记录先点聚类再建立代表轨迹的流程")
         return _LOCALIZATION_ARTIFACT_FILENAMES
+    if manifest.get("schema_version") == 4:
+        if manifest.get("workflow") != SPECTRUM_TRAJECTORY_WORKFLOW:
+            raise ValueError("第 4 版定位清单必须明确记录谱面采样流程")
+        return _SPECTRUM_TRAJECTORY_ARTIFACT_FILENAMES
     return _LEGACY_LOCALIZATION_ARTIFACT_FILENAMES
 
 
@@ -376,7 +397,7 @@ def _archive_previous_evaluation(
         recorded_result_sha256 = str(result_record["sha256"])
     except (KeyError, TypeError, ValueError, OSError) as error:
         raise ValueError("旧定位清单的评估来源记录不完整，拒绝发布新定位产物") from error
-    if manifest_schema_version not in (2, 3, 4):
+    if manifest_schema_version not in (2, 3, 4, 5):
         raise ValueError(
             f"旧定位清单版本 {manifest_schema_version} 不支持无损归档"
         )
@@ -1655,37 +1676,52 @@ def _localize_locked_impl(
     progress["completed_steps"].append("03_spectrum_sampling")
     mark_stage("spectrum_sampling")
 
-    progress["failed_step"] = "04_reverse_candidates"
+    progress["failed_step"] = "04_initial_candidates"
+    reference_bias_s = float(localization_config["initial_reference_bias_s"])
+    initial = generate_initial_candidate_points(
+        scene, measurement.bs_position_m, sampled.samples,
+        reference_bias_s=reference_bias_s,
+        max_reflections=int(config["scene"]["max_reflections"]),
+    )
+    progress["payloads"]["initial_candidates"] = {
+        "reference_bias_s": reference_bias_s,
+        "points": [asdict(point) for point in initial.points],
+        "rejected_samples": initial.rejected_samples,
+        "diagnostics": initial.diagnostics,
+    }
+    progress["completed_steps"].append("04_initial_candidates")
+    mark_stage("initial_candidates")
+
+    progress["failed_step"] = "05_point_clustering"
+    representatives = cluster_initial_candidate_points(
+        initial.points,
+        position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
+    )
+    progress["payloads"]["representative_points"] = {
+        "reference_bias_s": reference_bias_s,
+        "representatives": [asdict(point) for point in representatives],
+    }
+    progress["completed_steps"].append("05_point_clustering")
+    mark_stage("point_clustering")
+
+    # 只有点簇代表进入此步；此前从未构建任何随 beta 变化的候选轨迹。
+    progress["failed_step"] = "06_representative_trajectories"
     beta_interval_m = (
         float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
         float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S,
     )
-    raw_candidates = generate_reverse_candidates(
-        scene, measurement.bs_position_m, sampled.samples,
-        max_reflections=int(config["scene"]["max_reflections"]),
-        beta_interval_m=beta_interval_m,
+    representative_trajectories = build_representative_trajectories(
+        representatives, beta_interval_m=beta_interval_m,
     )
-    progress["payloads"]["raw_reverse_candidates"] = [
-        _raw_candidate_dict(candidate) for candidate in raw_candidates
+    progress["payloads"]["representative_trajectories"] = [
+        _clustered_candidate_dict(candidate) for candidate in representative_trajectories
     ]
-    progress["completed_steps"].append("04_reverse_candidates")
-    mark_stage("reverse_candidates")
+    progress["completed_steps"].append("06_representative_trajectories")
+    mark_stage("representative_trajectories")
 
-    progress["failed_step"] = "05_first_clustering"
-    clustered_candidates = cluster_reverse_candidates(
-        raw_candidates,
-        position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
-        direction_radius_deg=float(localization_config["candidate_direction_radius_deg"]),
-    )
-    progress["payloads"]["clustered_candidates"] = [
-        _clustered_candidate_dict(candidate) for candidate in clustered_candidates
-    ]
-    progress["completed_steps"].append("05_first_clustering")
-    mark_stage("first_clustering")
-
-    progress["failed_step"] = "06_joint_solution"
-    central = solve_position_and_bias(clustered_candidates, _solver_config(localization_config))
-    progress["completed_steps"].append("06_joint_solution")
+    progress["failed_step"] = "07_joint_solution"
+    central = solve_position_and_bias(representative_trajectories, _solver_config(localization_config))
+    progress["completed_steps"].append("07_joint_solution")
     mark_stage("joint_solution")
     selected = {
         str(observation_id): _clustered_candidate_dict(candidate)
@@ -1694,7 +1730,7 @@ def _localize_locked_impl(
     # 此协方差来自最终几何残差近似；未把采样数当成独立观测数，
     # 也未标定谱面采样本身的不确定性。采样会通过代表选择间接影响残差。
     result = {
-        "schema_version": 2, "workflow": WORKFLOW,
+        "schema_version": 3, "workflow": WORKFLOW,
         "localization_run_id": localization_run_id,
         "output_type": "point_estimate_with_geometric_residual_covariance",
         "mu_m": central.mu, "sigma_m2": central.sigma,
@@ -1717,15 +1753,30 @@ def _localize_locked_impl(
             "nominal_music_peak_count": len(nominal_peaks),
             "spectrum_sample_count": len(sampled.samples),
             "sampling": sampled.diagnostics,
-            "raw_candidate_count": len(raw_candidates),
-            "clustered_candidate_count": len(clustered_candidates),
+            "initial_reference_bias_s": reference_bias_s,
+            "initial_candidate_count": len(initial.points),
+            "representative_point_count": len(representatives),
+            "representative_trajectory_count": len(representative_trajectories),
+            "initial_candidate_generation": initial.diagnostics,
+            "point_clustering": {
+                "space": "initial_position_xy_at_reference_bias",
+                "position_radius_m": float(localization_config["candidate_cluster_radius_m"]),
+                "grouping": "source_observation_and_reflection_wall_sequence",
+                "representative": "actual_member_medoid",
+                "uses_trajectory_distance": False,
+                "uses_direction_threshold": False,
+            },
+            # 汇总读取器的兼容计数；v2 的对象明确是点与点簇代表。
+            "raw_candidate_count": len(initial.points),
+            "clustered_candidate_count": len(representatives),
+            "candidate_count_semantics": "initial_points_then_representative_points",
             "covariance_source": "selected_candidate_geometric_residual_approximation",
             "covariance_calibrated": False,
             "no_accept_reject_output": True,
         },
     }
     progress["payloads"]["result"] = result
-    progress["failed_step"] = "07_forward_check"
+    progress["failed_step"] = "08_forward_check"
     forward_check = forward_check_solution(
         scene, measurement.bs_position_m, central.selected_candidates,
         central.mu, central.beta, max_reflections=int(config["scene"]["max_reflections"]),
@@ -1738,7 +1789,7 @@ def _localize_locked_impl(
         },
     )
     progress["payloads"]["forward_check"] = forward_check
-    progress["completed_steps"].append("07_forward_check")
+    progress["completed_steps"].append("08_forward_check")
     mark_stage("forward_check")
     result["forward_check"] = forward_check
     compute_report = computer.metadata()
@@ -1786,7 +1837,7 @@ def _localize_locked_impl(
             for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
         }
         localization_manifest = {
-            "schema_version": 4,
+            "schema_version": 5,
             "workflow": WORKFLOW,
             "stage": "localization",
             "run_id": localization_run_id,

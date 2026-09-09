@@ -91,7 +91,7 @@ class _SummaryReached(Exception):
     """停止在已验证结果汇总的边界，避免此测试额外渲染几十张图。"""
 
 
-@pytest.mark.parametrize("workflow", [None, "music_spectrum_sampling_v1"])
+@pytest.mark.parametrize("workflow", [None, "music_spectrum_sampling_v1", "music_point_clustering_v2"])
 def test_report_accepts_worker_failed_and_keeps_it_in_total_denominator(tmp_path, monkeypatch, workflow):
     scene_path = tmp_path / "scene.json"
     visualization.write_json(scene_path, _scene())

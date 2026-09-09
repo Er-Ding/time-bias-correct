@@ -1,4 +1,4 @@
-"""在独立目录重放已有接收 CSI，检查谱面采样流程和逐步报告。"""
+"""在独立目录重放接收 CSI，检查点聚类、代表轨迹和逐步报告。"""
 
 from __future__ import annotations
 
@@ -26,6 +26,8 @@ def main(argv=None):
     parser.add_argument("--samples-per-peak", type=int, default=128)
     parser.add_argument("--backend", choices=("numpy", "cuda"), default="cuda")
     parser.add_argument("--device-id", type=int, default=0)
+    parser.add_argument("--reference-bias-s", type=float, default=None,
+                        help="初始点的公开参考 bias（秒）；不指定时使用配置，不读取真值")
     args = parser.parse_args(argv)
     source = args.source_experiment.resolve()
     output = args.output.resolve()
@@ -42,6 +44,10 @@ def main(argv=None):
         parser.error("重复数必须在原实验范围内，每峰采样数必须为正")
     config["compute"].update(backend=args.backend, device_id=args.device_id)
     config["music"]["spectrum_sampling"]["samples_per_peak"] = args.samples_per_peak
+    if args.reference_bias_s is not None:
+        config["localization"]["initial_reference_bias_s"] = args.reference_bias_s
+    from time_bias_localization.config import validate_localization_config
+    validate_localization_config(config)
     # 重放使用原接收数据。计划中的真值只供后续独立评估/绘图，绝不传入 localize。
     points = [deepcopy(by_id[name]) for name in ue_ids]
     for point in points:
@@ -74,7 +80,7 @@ def main(argv=None):
             status = dict(workflow=WORKFLOW, noise_seed=seed, source_generation_manifest=artifact_record(manifest_path))
             stage = "localization"
             started = time.perf_counter()
-            print(f"{point['ue_id']} / {repeat}: 重放原接收 CSI，运行谱面采样", flush=True)
+            print(f"{point['ue_id']} / {repeat}: 重放原接收 CSI，先点聚类再建立代表轨迹", flush=True)
             try:
                 result = localize(
                     load_localization_config(config_path),
@@ -96,6 +102,9 @@ def main(argv=None):
                     bias_error_ns=metrics["clock_bias_error_ns"],
                     raw_count=result["diagnostics"]["raw_candidate_count"],
                     clustered_count=result["diagnostics"]["clustered_candidate_count"],
+                    initial_point_count=result["diagnostics"]["initial_candidate_count"],
+                    representative_point_count=result["diagnostics"]["representative_point_count"],
+                    representative_trajectory_count=result["diagnostics"]["representative_trajectory_count"],
                     compute=result["diagnostics"]["compute"]))
             except Exception as error:
                 status.update(status=f"{stage}_failed", error=f"{type(error).__name__}: {error}")

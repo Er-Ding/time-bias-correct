@@ -126,6 +126,53 @@ def test_new_workflow_comparison_never_requires_bootstrap_artifacts(roots):
     assert not comparison["checks"]["sample_aoa_local_rad_within_tolerance"]
 
 
+def _convert_to_point_clustering(root):
+    _convert_to_spectrum_sampling(root)
+    folder = root / "localization"
+    peaks = json.loads((folder / "music_peaks.json").read_text())
+    peaks["workflow"] = "music_point_clustering_v2"
+    (folder / "music_peaks.json").write_text(json.dumps(peaks))
+    point = {"observation_id": "path_0", "sample_id": "path_0:nominal",
+             "topology_id": "wall", "reflection_wall_ids": ["wall"],
+             "position_m": [3., 4.], "reference_bias_s": 0.}
+    representative = {"candidate_id": "path_0:wall:cluster_0", "point": point,
+                      "members": [point], "metadata": {}}
+    trajectory = json.loads((folder / "clustered_candidates.json").read_text())[0]
+    trajectory.update(anchor_m=[3., 4.], direction=[1., 0.], beta_interval_m=[-2., 5.])
+    files = {
+        "initial_candidates.json": {"reference_bias_s": 0., "points": [point], "rejected_samples": []},
+        "representative_points.json": {"reference_bias_s": 0., "representatives": [representative]},
+        "representative_trajectories.json": [trajectory],
+    }
+    for name, value in files.items():
+        (folder / name).write_text(json.dumps(value))
+    (folder / "raw_reverse_candidates.json").unlink()
+    (folder / "clustered_candidates.json").unlink()
+
+
+@pytest.mark.parametrize("filename, mutate, expected_check", [
+    ("initial_candidates.json", lambda data: data["points"][0].update(position_m=[4., 4.]),
+     "initial_points_coordinates_within_tolerance"),
+    ("representative_points.json", lambda data: data["representatives"][0]["point"].update(position_m=[4., 4.]),
+     "representative_points_coordinates_within_tolerance"),
+    ("representative_trajectories.json", lambda data: data[0].update(beta_interval_m=[-3., 5.]),
+     "representative_trajectory_beta_interval_m_within_tolerance"),
+    ("initial_candidates.json", lambda data: data["rejected_samples"].append({"sample_id": "missing", "reason": "outside"}),
+     "initial_rejections"),
+])
+def test_point_workflow_checks_intermediates_even_with_same_final_solution(roots, filename, mutate, expected_check):
+    for root in roots:
+        _convert_to_point_clustering(root)
+    assert _compare(roots)["passed"]
+    path = roots[1] / "localization" / filename
+    data = json.loads(path.read_text())
+    mutate(data)
+    path.write_text(json.dumps(data))
+    comparison = _compare(roots)
+    assert not comparison["passed"]
+    assert not comparison["checks"][expected_check]
+
+
 def test_kernel_uses_one_observation_without_legacy_noise_settings(tmp_path, monkeypatch):
     from copy import deepcopy
     from types import SimpleNamespace

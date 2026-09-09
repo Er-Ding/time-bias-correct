@@ -67,6 +67,37 @@ def test_config_rejects_nonfinite_and_invalid_music_ranges() -> None:
         validate_config(config)
 
 
+@pytest.mark.parametrize("reference", [
+    float("nan"), float("inf"), -81e-9, 81e-9, True, False, None, "invalid",
+])
+def test_initial_point_reference_bias_rejects_invalid_values(reference) -> None:
+    config = deepcopy(DEFAULT_CONFIG)
+    config["localization"]["initial_reference_bias_s"] = reference
+    with pytest.raises(ValueError, match="initial_reference_bias_s"):
+        validate_config(config)
+    with pytest.raises(ValueError, match="initial_reference_bias_s"):
+        localization_config_view(config)
+
+
+@pytest.mark.parametrize("reference", [-80e-9, 0.0, 80e-9])
+def test_initial_point_reference_bias_allows_search_interval_endpoints(reference) -> None:
+    config = deepcopy(DEFAULT_CONFIG)
+    config["localization"]["initial_reference_bias_s"] = reference
+    isolated = localization_config_view(config)
+    assert isolated["localization"]["initial_reference_bias_s"] == reference
+    validate_localization_config(isolated)
+
+
+def test_reference_bias_is_public_and_does_not_inherit_simulated_truth(tmp_path) -> None:
+    config = deepcopy(DEFAULT_CONFIG)
+    config["simulation"]["clock_bias_s"] = 47e-9
+    isolated = localization_config_view(config)
+    assert isolated["localization"]["initial_reference_bias_s"] == 0.0
+    path = tmp_path / "localization.yaml"
+    path.write_text("radio:\n  bs_position_m: [2, 7]\nlocalization:\n  initial_reference_bias_s: 1.2e-8\n")
+    assert load_localization_config(path)["localization"]["initial_reference_bias_s"] == 12e-9
+
+
 def test_config_rejects_invalid_subarray_and_noninteger_counts() -> None:
     config = deepcopy(DEFAULT_CONFIG)
     config["music"]["frequency_subarray_size"] = config["radio"]["num_subcarriers"] + 1
