@@ -27,6 +27,7 @@ class GeometricPath2D:
     interaction_points_m: tuple[tuple[float, float], ...]
     length_m: float
     arrival_aoa_deg: float
+    propagation_interactions: tuple[tuple[str, str], ...] = ()
 
     @property
     def delay_s(self) -> float:
@@ -35,6 +36,10 @@ class GeometricPath2D:
     @property
     def reflection_order(self) -> int:
         return len(self.interaction_wall_ids)
+
+    @property
+    def diffraction_order(self) -> int:
+        return sum(kind == "diffraction" for kind, _ in self.propagation_interactions)
 
     @property
     def nodes(self) -> np.ndarray:
@@ -200,4 +205,3 @@ def enumerate_specular_paths(
 
     paths.sort(key=lambda path: (path.reflection_order, path.length_m, path.path_id))
     return paths
-

@@ -13,6 +13,7 @@ from .visualization import _save, _scene_axes, read_json, write_csv, write_json
 WORKFLOW = "music_spectrum_sampling_v1"
 POINT_WORKFLOW = "music_point_clustering_v2"
 FINE_WORKFLOW = "music_fine_spectrum_dbscan_v3"
+DIFFRACTION_WORKFLOW = "music_diffraction_cover_v4"
 
 STEPS = [
     ("00_scene_truth", "场景与仿真真值（仅作参照）", "generate_synthetic_measurement / extract_planar_uplink_csi"),
@@ -47,7 +48,7 @@ FINE_STEPS = [
 
 
 def _is_fine_workflow(run):
-    return run.get("result", {}).get("workflow", run.get("workflow")) == FINE_WORKFLOW
+    return run.get("result", {}).get("workflow", run.get("workflow")) in {FINE_WORKFLOW, DIFFRACTION_WORKFLOW}
 
 LEGACY_STEPS = [
     ("00_scene_truth", "场景与仿真真值（仅作参照）", "generate_synthetic_measurement / extract_planar_uplink_csi"),
@@ -147,7 +148,7 @@ def _position(plt, run, solution, directory, title):
     radii = np.sqrt(5.991 * np.maximum(eigenvalues, 0))
     angle = np.degrees(np.arctan2(eigenvectors[1, 1], eigenvectors[0, 1]))
     ellipse_label = ("几何残差近似椭圆（未校准，非采样置信区间）"
-                     if run.get("result", {}).get("workflow") in {WORKFLOW, POINT_WORKFLOW, FINE_WORKFLOW}
+                     if run.get("result", {}).get("workflow") in {WORKFLOW, POINT_WORKFLOW, FINE_WORKFLOW, DIFFRACTION_WORKFLOW}
                      else "名义 95% 椭圆（未校准）")
     ax.add_patch(Ellipse(estimate, 2 * radii[1], 2 * radii[0], angle=angle, fill=False,
                         color="#4477AA", label=ellipse_label))
@@ -558,7 +559,7 @@ def _export_forward_check(plt, run, folder):
         xy = np.asarray(extents)
         ax.set(xlim=(xy[:, 0].min() - 2, xy[:, 0].max() + 2), ylim=(xy[:, 1].min() - 2, xy[:, 1].max() + 2))
         ax.legend(fontsize=7)
-        fig.suptitle("只检查已选反射路径；不是全部路径枚举，也不是 CSI 拟合；真值星号仅供画图参照", fontsize=8)
+        fig.suptitle("检查已选路径的几何与观测残差；真值星号仅供画图参照", fontsize=8)
         _save(plt, fig, folder, "predicted_paths")
     fig, ax = plt.subplots(figsize=(9, max(3., .28 * min(len(scalar_rows), 20) + 1.5)), layout="constrained")
     ax.axis("off")
@@ -647,9 +648,24 @@ def _export_point_clusters(plt, run, folder):
             raise ValueError("DBSCAN 逐点角色没有覆盖全部初始点")
     fig, ax = _map(plt, run, "05  初始位置点聚类：圆点为成员，菱形为保留的真实代表点")
     membership, counts, representative_rows, assigned = [], [], [], set()
-    for index, representative in enumerate(representatives):
+    clusters = {}
+    seen_representative_ids = set()
+    for representative in representatives:
+        representative_id = representative["candidate_id"]
+        if representative_id in seen_representative_ids:
+            raise ValueError("代表编号重复")
+        seen_representative_ids.add(representative_id)
+        cluster_id = representative.get("metadata", {}).get("point_cluster_id", representative_id)
+        clusters.setdefault(cluster_id, []).append(representative)
+    for index, (candidate_id, cluster_representatives) in enumerate(clusters.items()):
+        representative = cluster_representatives[0]
         point, members = representative["point"], representative["members"]
-        candidate_id = representative["candidate_id"]
+        representative_sample_ids = {item["point"]["sample_id"] for item in cluster_representatives}
+        if len(representative_sample_ids) != len(cluster_representatives):
+            raise ValueError("同一簇重复保存同一个代表成员")
+        for item in cluster_representatives:
+            if item["members"] != members or item["point"] not in members:
+                raise ValueError("同簇多代表的成员列表不一致，或代表不是实际成员")
         member_ids = {(member["observation_id"], member["sample_id"]) for member in members}
         if (len(member_ids) != len(members) or assigned.intersection(member_ids)
                 or (point["observation_id"], point["sample_id"]) not in member_ids):
@@ -663,7 +679,7 @@ def _export_point_clusters(plt, run, folder):
             if fine and (roles[key]["role"] not in {"core", "border"} or roles[key]["candidate_id"] != candidate_id):
                 raise ValueError(f"DBSCAN 逐点角色与簇归属不一致：{member['sample_id']}")
             membership.append(dict(candidate_id=candidate_id, **_point_row(member),
-                                   is_representative=member["sample_id"] == point["sample_id"],
+                                   is_representative=member["sample_id"] in representative_sample_ids,
                                    **({"role": roles[key]["role"]} if fine else {})))
         if lookup[(point["observation_id"], point["sample_id"])] != point:
             raise ValueError(f"保留的代表点被改写：{candidate_id}")
@@ -671,10 +687,14 @@ def _export_point_clusters(plt, run, folder):
         color = plt.get_cmap("tab20")(index % 20)
         xy = np.asarray([member["position_m"] for member in members])
         ax.scatter(*xy.T, s=17, color=color, alpha=.5, zorder=7)
-        ax.scatter(*point["position_m"], s=65, marker="D", color=color, edgecolors="black", linewidths=.7, zorder=9)
-        representative_rows.append(dict(candidate_id=candidate_id, **_point_row(point)))
+        for item in cluster_representatives:
+            actual_point = item["point"]
+            ax.scatter(*actual_point["position_m"], s=65, marker="D", color=color, edgecolors="black", linewidths=.7, zorder=9)
+            representative_rows.append(dict(candidate_id=item["candidate_id"], point_cluster_id=candidate_id,
+                                            **_point_row(actual_point)))
         counts.append(dict(label=f"C{index + 1}", candidate_id=candidate_id, observation_id=point["observation_id"],
-                           topology_id=point["topology_id"], member_count=len(members), representative_sample_id=point["sample_id"]))
+                           topology_id=point["topology_id"], member_count=len(members), representative_sample_id=point["sample_id"],
+                           representative_count=len(cluster_representatives)))
     noise_rows, noise_ids = [], set()
     for point in noise_points:
         key = (point["observation_id"], point["sample_id"])
@@ -713,6 +733,7 @@ def _export_point_clusters(plt, run, folder):
                 writer.writeheader()
                 writer.writerows(rows)
     write_json(folder / "counts.json", dict(raw_count=len(initial["points"]), representative_count=len(representatives),
+               **({"cluster_count": len(clusters)} if run.get("result", {}).get("workflow", run.get("workflow")) == DIFFRACTION_WORKFLOW else {}),
                listed_member_count=len(membership), clustering_space="initial_xy_at_reference_bias",
                reference_bias_s=payload["reference_bias_s"],
                **({"noise_count": len(noise_points), "clustering_algorithm": "dbscan"} if fine else {})))
@@ -732,7 +753,7 @@ def _export_point_clusters(plt, run, folder):
 def _export_point_steps(plt, run, directory, row):
     directory.mkdir(parents=True, exist_ok=False)
     workflow = (run.get("result", {}).get("workflow", run.get("workflow")) if run else row.get("workflow", FINE_WORKFLOW))
-    fine = workflow == FINE_WORKFLOW
+    fine = workflow in {FINE_WORKFLOW, DIFFRACTION_WORKFLOW}
     steps = FINE_STEPS if fine else POINT_STEPS
     artifacts = run.get("artifacts", {}) if run else {}
     available = {name: False for name, _, _ in steps}
@@ -760,6 +781,12 @@ def _export_point_steps(plt, run, directory, row):
             "03_spectrum_sampling": "正式峰取自本张局部细谱的最大值节点。采样概率由同一份细谱每个单元的四角平均谱值、面积及均匀混合项计算，不额外换用其他分辨率的谱。星号始终表示正式细峰，加号仅表示粗搜索点；即使不把正式峰加入候选样本，图上也保留该星号。",
             "05_point_clustering": "v3：在同一来源峰、同一反射墙面顺序内部，对初始 XY 点做 DBSCAN。eps 限制相邻距离，不限制整个簇的长度；min_samples 包含点自身。每簇只保留一个真实成员作为代表。离群点用灰色叉号显示，独立保存到 noise_points.csv，不合并成一个簇，也不各自生成代表。point_memberships.csv 逐点记录 core（核心点）、border（边界点）或 noise（离群点）。所有角色合计必须覆盖原始点集；参数和分组数量见 clustering_diagnostics.json。此时尚未生成轨迹，也不使用真实位置或真实 bias。",
         })
+    if workflow == DIFFRACTION_WORKFLOW:
+        notes["05_point_clustering"] = (
+            "v4：同一来源峰、完整反射与绕射顺序内做 DBSCAN。反射簇保留一个实际成员；"
+            "绕射簇按覆盖距离保留多个实际成员，再通过解析区间并集补足整个合法偏差范围的覆盖。"
+            "同一簇的成员只统计一次；代表增加不会增加独立观测数或求解权重。"
+            "覆盖只针对已生成成员，不保证未采样区域覆盖或最终定位精度。")
     folders, index = {}, []
     for name, title, function in steps:
         folder = directory / name
@@ -775,7 +802,7 @@ def _export_point_steps(plt, run, directory, row):
     (directory / "README.md").write_text(
         "# 按执行步骤查看本次定位\n\n"
         + ("未记录工作流来源；下列为当前流程占位，不表示这些步骤已经运行。\n\n" if run is None and "workflow" not in row else "")
-        + ("工作流 v3：带噪 CSI → 粗谱搜索区域 → 局部细谱正式找峰与采样 → 反向追踪初始点 → DBSCAN 与每簇一个真实代表 → 仅为代表点建立轨迹 → 一次联合求解。\n\n" if fine else
+        + ("工作流 v4：带噪 CSI → 统一细谱采样 → 反射与一次绕射初始点 → DBSCAN → 绕射簇按覆盖距离选多个实际代表 → 代表轨迹 → 共享偏差求解。\n\n" if workflow == DIFFRACTION_WORKFLOW else "工作流 v3：带噪 CSI → 粗谱搜索区域 → 局部细谱正式找峰与采样 → 反向追踪初始点 → DBSCAN 与每簇一个真实代表 → 仅为代表点建立轨迹 → 一次联合求解。\n\n" if fine else
            "旧工作流 v2：带噪 CSI → 粗谱峰附近的细谱采样 → 反向追踪初始位置点 → 按簇内最大跨度划分与真实代表点 → 仅为代表点建立轨迹 → 一次联合求解。\n\n")
         + "\n".join(f"- [{title}]({name}/README.md)" for name, title, _ in steps)
         + "\n\n04、05 只展示初始位置点，06 才展示代表点的偏差—位置轨迹。参考 bias 是公开初始化参数，不读取真实 bias，也不是最终估计值。"
@@ -835,7 +862,7 @@ def export_steps(plt, run, directory: Path, row: dict) -> None:
     """按保存的工作流导出步骤；失败运行也保留已完成阶段。"""
     workflow = (run.get("result", {}).get("workflow", run.get("workflow"))
                 if run else row.get("workflow", FINE_WORKFLOW))
-    if workflow in {POINT_WORKFLOW, FINE_WORKFLOW}:
+    if workflow in {POINT_WORKFLOW, FINE_WORKFLOW, DIFFRACTION_WORKFLOW}:
         return _export_point_steps(plt, run, directory, row)
     if workflow != WORKFLOW:
         if workflow is not None:

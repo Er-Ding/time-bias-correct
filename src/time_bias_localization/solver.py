@@ -20,6 +20,8 @@ from typing import Any, Hashable, Iterable, Mapping, Sequence
 
 import numpy as np
 
+from .timing import stage
+
 
 Array = np.ndarray
 
@@ -546,51 +548,53 @@ def _make_seeds(
 ) -> list[Array]:
     # max_seeds 只限制后续精修，无法约束此前的候选对生成和评分。
     # 先显式检查预算，绝不按输入顺序静默丢弃部分观测的候选组合。
-    pair_count = sum(
-        len(groups[first_id]) * len(groups[second_id])
-        for first_id, second_id in combinations(groups, 2)
-    )
-    if pair_count > config.max_seed_pairs:
-        raise SolverError(
-            f"跨观测候选对数量 {pair_count} 超过 max_seed_pairs={config.max_seed_pairs}；"
-            "请检查第一次聚类半径与采样范围，或明确提高候选对预算"
+    with stage('T12_seed_generation'):
+        pair_count = sum(
+            len(groups[first_id]) * len(groups[second_id])
+            for first_id, second_id in combinations(groups, 2)
         )
-    seeds: list[Array] = []
-    seen: set[tuple[float, float, float]] = set()
-    for first_id, second_id in combinations(groups, 2):
-        for first in groups[first_id]:
-            for second in groups[second_id]:
-                beta_min = max(first.beta_interval[0], second.beta_interval[0])
-                beta_max = min(first.beta_interval[1], second.beta_interval[1])
-                if beta_min > beta_max + config.validity_tolerance:
-                    continue
-                try:
-                    seed, _, _ = _weighted_fit(
-                        (first, second),
-                        np.array((first.weight, second.weight), dtype=float),
-                        config,
-                    )
-                except SolverError:
-                    continue
-                key = tuple(float(value) for value in np.round(seed, decimals=12))
-                if key not in seen:
-                    seen.add(key)
-                    seeds.append(seed)
+        if pair_count > config.max_seed_pairs:
+            raise SolverError(
+                f"跨观测候选对数量 {pair_count} 超过 max_seed_pairs={config.max_seed_pairs}；"
+                "请检查第一次聚类半径与采样范围，或明确提高候选对预算"
+            )
+        seeds: list[Array] = []
+        seen: set[tuple[float, float, float]] = set()
+        for first_id, second_id in combinations(groups, 2):
+            for first in groups[first_id]:
+                for second in groups[second_id]:
+                    beta_min = max(first.beta_interval[0], second.beta_interval[0])
+                    beta_max = min(first.beta_interval[1], second.beta_interval[1])
+                    if beta_min > beta_max + config.validity_tolerance:
+                        continue
+                    try:
+                        seed, _, _ = _weighted_fit(
+                            (first, second),
+                            np.array((first.weight, second.weight), dtype=float),
+                            config,
+                        )
+                    except SolverError:
+                        continue
+                    key = tuple(float(value) for value in np.round(seed, decimals=12))
+                    if key not in seen:
+                        seen.add(key)
+                        seeds.append(seed)
 
     # 先保留对全部观测解释得更好的初值，避免候选数很大时组合爆炸。
-    seeds.sort(
-        key=lambda state: (
-            _objective(
-                state,
-                _assign_candidates(state, groups, config),
-                len(groups),
-                config,
-            ),
-            float(state[2]),
-            float(state[0]),
-            float(state[1]),
+    with stage('T12_seed_scoring'):
+        seeds.sort(
+            key=lambda state: (
+                _objective(
+                    state,
+                    _assign_candidates(state, groups, config),
+                    len(groups),
+                    config,
+                ),
+                float(state[2]),
+                float(state[0]),
+                float(state[1]),
+            )
         )
-    )
     return seeds[: config.max_seeds]
 
 
@@ -660,59 +664,61 @@ def solve_position_and_bias(
     if not seeds:
         raise SolverError("没有两条候选轨迹能够产生可辨识且区间合法的初始解")
 
-    solutions: list[_RefinedSolution] = []
-    for seed in seeds:
-        solution = _refine_seed(seed, groups, config)
-        if solution is not None:
-            solutions.append(solution)
-    if not solutions:
-        raise SolverError("所有初始解均在稳健拟合过程中失效")
+    with stage('T12_iterations'):
+        solutions: list[_RefinedSolution] = []
+        for seed in seeds:
+            solution = _refine_seed(seed, groups, config)
+            if solution is not None:
+                solutions.append(solution)
+        if not solutions:
+            raise SolverError("所有初始解均在稳健拟合过程中失效")
 
-    solutions.sort(
-        key=lambda item: (
-            item.objective,
-            -len(item.assignment),
-            float(item.state[2]),
-            float(item.state[0]),
-            float(item.state[1]),
-            _assignment_signature(item.assignment),
+    with stage('T12_result'):
+        solutions.sort(
+            key=lambda item: (
+                item.objective,
+                -len(item.assignment),
+                float(item.state[2]),
+                float(item.state[0]),
+                float(item.state[1]),
+                _assignment_signature(item.assignment),
+            )
         )
-    )
-    best = solutions[0]
-    sigma, joint_covariance = _estimate_covariance(best, config)
-    unused_observations = tuple(
-        observation_id
-        for observation_id in groups
-        if observation_id not in best.assignment
-    )
-    downweighted_observations = tuple(
-        observation_id
-        for observation_id in best.assignment
-        if best.robust_weights.get(observation_id, 1.0) < config.downweight_threshold
-    )
-    diagnostics = SolverDiagnostics(
-        converged=best.converged,
-        iterations=best.iterations,
-        seed_count=len(seeds),
-        evaluated_solution_count=len(solutions),
-        objective=best.objective,
-        design_rank=best.rank,
-        condition_number=best.condition_number,
-        selected_observation_count=len(best.assignment),
-        total_observation_count=len(groups),
-        downweighted_observations=downweighted_observations,
-        unused_observations=unused_observations,
-        robust_weights=best.robust_weights,
-        joint_covariance=joint_covariance,
-    )
-    return SolverResult(
-        mu=best.state[:2],
-        sigma=sigma,
-        beta=float(best.state[2]),
-        selected_candidates=best.assignment,
-        residuals=best.residuals,
-        diagnostics=diagnostics,
-    )
+        best = solutions[0]
+        sigma, joint_covariance = _estimate_covariance(best, config)
+        unused_observations = tuple(
+            observation_id
+            for observation_id in groups
+            if observation_id not in best.assignment
+        )
+        downweighted_observations = tuple(
+            observation_id
+            for observation_id in best.assignment
+            if best.robust_weights.get(observation_id, 1.0) < config.downweight_threshold
+        )
+        diagnostics = SolverDiagnostics(
+            converged=best.converged,
+            iterations=best.iterations,
+            seed_count=len(seeds),
+            evaluated_solution_count=len(solutions),
+            objective=best.objective,
+            design_rank=best.rank,
+            condition_number=best.condition_number,
+            selected_observation_count=len(best.assignment),
+            total_observation_count=len(groups),
+            downweighted_observations=downweighted_observations,
+            unused_observations=unused_observations,
+            robust_weights=best.robust_weights,
+            joint_covariance=joint_covariance,
+        )
+        return SolverResult(
+            mu=best.state[:2],
+            sigma=sigma,
+            beta=float(best.state[2]),
+            selected_candidates=best.assignment,
+            residuals=best.residuals,
+            diagnostics=diagnostics,
+        )
 
 
 # 简短别名，便于流水线模块调用。

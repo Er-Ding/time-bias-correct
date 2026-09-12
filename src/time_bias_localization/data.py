@@ -16,7 +16,8 @@ import numpy as np
 
 from .candidates import global_to_local_aoa
 from .constants import SPEED_OF_LIGHT_M_S
-from .raytrace2d import GeometricPath2D, enumerate_specular_paths
+from .raytrace2d import GeometricPath2D
+from .diffraction import enumerate_paths
 from .scene import Scene2D
 from .signal import apply_common_delay_bias, synthesize_ula_csi
 
@@ -67,8 +68,9 @@ def _select_paths(
 
     # 先覆盖不同反射次数，再按路径长度补齐，避免离线例子只选到一类几何。
     selected: list[GeometricPath2D] = []
-    for order in (0, 1, 2):
-        order_paths = [path for path in eligible if path.reflection_order == order]
+    categories = [(0, 0), (1, 0), (0, 1), (2, 0), (1, 1), (2, 1)]
+    for order, diffraction_order in categories:
+        order_paths = [path for path in eligible if (path.reflection_order, path.diffraction_order) == (order, diffraction_order)]
         if order_paths and len(selected) < count:
             selected.append(min(order_paths, key=lambda item: (item.length_m, item.path_id)))
     for path in eligible:
@@ -93,11 +95,12 @@ def generate_synthetic_measurement(
     front_facing_only = bool(radio.get("front_facing_only", True))
     local_angle_min_rad = math.radians(float(music["angle_min_deg"]))
     local_angle_max_rad = math.radians(float(music["angle_max_deg"]))
-    all_paths = enumerate_specular_paths(
+    all_paths = enumerate_paths(
         scene,
         source_m=ue_position,
         receiver_m=bs_position,
         max_reflections=int(scene_max_reflections(config)),
+        max_diffractions=int(config["scene"].get("max_diffractions", 0)),
     )
     selected = _select_paths(
         all_paths,
@@ -353,6 +356,9 @@ def save_measurement_bundle(
             {
                 "path_id": path.path_id,
                 "reflection_order": path.reflection_order,
+                "diffraction_order": getattr(path, "diffraction_order", 0),
+                "propagation_interactions": [list(item) for item in (
+                    getattr(path, "propagation_interactions", ()) or tuple(("reflection", key) for key in path.interaction_wall_ids))],
                 "interaction_wall_ids": list(path.interaction_wall_ids),
                 "interaction_points_m": [list(point) for point in path.interaction_points_m],
                 "length_m": path.length_m,

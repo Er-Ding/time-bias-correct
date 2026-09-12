@@ -1,0 +1,37 @@
+# 固定高度二维墙角示例；生成端使用指定幅度合成 CSI，不模拟 UTD 复振幅。
+project:
+  random_seed: 20260910
+compute:
+  backend: numpy
+scene:
+  source: synthetic_room
+  name: diffraction_screen_demo
+  bounds_m: [0.0, 20.0, 0.0, 14.0]
+  fixed_height_m: 1.5
+  bev_resolution_m: 0.05
+  max_reflections: 2
+  max_diffractions: 1
+radio:
+  snr_db: 35.0
+simulation:
+  bs_position_m: [2.0, 7.0]
+  ue_position_m: [14.0, 4.0]
+  clock_bias_s: 1.0e-8
+  path_amplitudes: [1.0, 0.75, 0.55]
+music:
+  num_paths: 3
+  signal_subspace_rank: 3
+  spectrum_sampling:
+    samples_per_peak: 64
+localization:
+  bias_min_s: -1.5e-8
+  bias_max_s: 2.5e-8
+  initial_reference_bias_s: 0.0
+  candidate_cluster_radius_m: 1.5
+  candidate_cluster_min_samples: 3
+  diffraction_directions_per_sample: 4
+  diffraction_angle_tolerance_deg: 3.0
+  diffraction_coverage_distance_m: 1.0
+  max_seed_pairs: 100000
+output:
+  root: outputs/diffraction_demo

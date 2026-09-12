@@ -278,6 +278,7 @@ def _validate_reverse_scene_consistency(
     failures: list[str] = []
     los_count = 0
     reflected_count = 0
+    diffracted_count = 0
     x_min, x_max, y_min, y_max = scene.bounds_m
 
     def inside_fixed_bounds(point_xy: np.ndarray) -> bool:
@@ -310,7 +311,8 @@ def _validate_reverse_scene_consistency(
                 )
             continue
 
-        reflected_count += 1
+        reflected_count += int(np.any(interactions[active_depths, path_index] == 1))
+        diffracted_count += int(np.any(interactions[active_depths, path_index] == 8))
         outside_depths = [
             int(depth)
             for depth in active_depths
@@ -320,6 +322,35 @@ def _validate_reverse_scene_consistency(
             failures.append(
                 f"路径 {path_index} 的交互点层 {outside_depths} 超出固定定位区域"
             )
+            continue
+        if np.any(interactions[active_depths, path_index] == 8):
+            from .diffraction import diffraction_edges, rebuild_path
+            sequence = []
+            edge_list = diffraction_edges(scene)
+            for depth in active_depths:
+                point = vertices[int(depth), path_index, :2]
+                kind = int(interactions[int(depth), path_index])
+                if kind == 8:
+                    matches = [edge for edge in edge_list if np.linalg.norm(point - edge.position_m) <= tolerance_m]
+                    if len(matches) != 1:
+                        break
+                    sequence.append(("diffraction", matches[0].edge_id))
+                elif kind == 1:
+                    matches = []
+                    for wall in scene.walls:
+                        t = np.dot(point - wall.start, wall.vector) / np.dot(wall.vector, wall.vector)
+                        if 1e-7 < t < 1 - 1e-7 and np.linalg.norm(point - wall.start - t * wall.vector) <= tolerance_m:
+                            matches.append(wall)
+                    if len(matches) != 1:
+                        break
+                    sequence.append(("reflection", matches[0].wall_id))
+                else:
+                    break
+            rebuilt = rebuild_path(scene, ue_xy, bs_xy, tuple(sequence)) if len(sequence) == len(active_depths) else None
+            expected_points = vertices[active_depths, path_index, :2]
+            if rebuilt is None or not np.allclose(np.asarray(rebuilt.interaction_points_m), expected_points,
+                                                  atol=tolerance_m, rtol=0):
+                failures.append(f"路径 {path_index} 的完整绕射/反射顺序无法由公开二维地图重建")
             continue
         expected = vertices[int(active_depths[-1]), path_index, :2]
         if nearest is None:
@@ -340,6 +371,7 @@ def _validate_reverse_scene_consistency(
         "checked_path_count": int(np.sum(retained)),
         "los_path_count": los_count,
         "reflected_path_count": reflected_count,
+        **({"diffracted_path_count": diffracted_count} if diffracted_count else {}),
         "position_tolerance_m": float(tolerance_m),
         "passed": True,
     }
@@ -352,10 +384,13 @@ def extract_planar_uplink_csi(
     fixed_height_m: float,
     vertical_tolerance_m: float,
     max_reflections: int,
+    max_diffractions: int = 0,
     bs_boresight_rad: float = 0.0,
     local_angle_min_rad: float = -math.pi / 2.0,
     local_angle_max_rad: float = math.pi / 2.0,
     front_facing_only: bool = True,
+    minimum_path_count: int = 2,
+    coefficient_zero_threshold: float | None = None,
 ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
     """从 Sionna 路径保留二维、阵列正面可解释路径并合成绝对时延 CSI。
 
@@ -377,6 +412,12 @@ def extract_planar_uplink_csi(
         raise ValueError("局部角范围必须位于 [-pi/2, pi/2] 且下界小于上界")
     if not isinstance(front_facing_only, (bool, np.bool_)):
         raise ValueError("front_facing_only 必须是布尔值")
+    if isinstance(minimum_path_count, bool) or not isinstance(minimum_path_count, int) or minimum_path_count < 0:
+        raise ValueError("minimum_path_count 必须是非负整数")
+    if coefficient_zero_threshold is not None and (
+        not np.isfinite(coefficient_zero_threshold) or coefficient_zero_threshold < 0.0
+    ):
+        raise ValueError("系数零阈值必须是非负有限数")
 
     cir_coefficients, tau = sionna_paths_cir(
         paths,
@@ -401,7 +442,15 @@ def extract_planar_uplink_csi(
     active_interactions = interactions != 0
     interaction_order = np.sum(active_interactions, axis=0)
     planar_valid = np.isfinite(absolute_delays) & (absolute_delays >= 0.0)
-    planar_valid &= interaction_order <= int(max_reflections)
+    # Sionna RT 当前版本的 InteractionType 位标志：SPECULAR=1，DIFFRACTION=8。
+    # 未识别的散射、折射等交互必须排除，不能误计为镜面反射。
+    if isinstance(max_diffractions, bool) or max_diffractions not in (0, 1):
+        raise ValueError("当前只支持最多一次绕射")
+    reflection_order = np.sum(interactions == 1, axis=0)
+    diffraction_order = np.sum(interactions == 8, axis=0)
+    planar_valid &= reflection_order <= int(max_reflections)
+    planar_valid &= diffraction_order <= int(max_diffractions)
+    planar_valid &= np.all(np.isin(interactions, (0, 1, 8)), axis=0)
     for path_index in range(num_paths):
         active = active_interactions[:, path_index]
         if not np.any(active):
@@ -427,10 +476,16 @@ def extract_planar_uplink_csi(
         if bool(front_facing_only)
         else planar_valid.copy()
     )
-    if int(np.sum(valid)) < 2:
+    finite_nonzero = np.all(np.isfinite(path_coefficients), axis=0) & np.any(
+        np.abs(path_coefficients) > float(coefficient_zero_threshold or 0.0), axis=0
+    )
+    if coefficient_zero_threshold is not None:
+        valid &= finite_nonzero
+    if int(np.sum(valid)) < minimum_path_count:
         raise RuntimeError(
-            "二维高度、反射次数和阵列正面角度筛选后少于两条 Sionna 路径；"
-            "请调整 UE/BS 位置、阵列朝向、角度范围或射线采样数"
+            ("二维高度、反射次数和阵列正面角度筛选后少于两条 Sionna 路径；" if minimum_path_count == 2
+             else f"筛选后 Sionna 有效路径少于 {minimum_path_count} 条；")
+            + "请调整 UE/BS 位置、阵列朝向、角度范围或射线采样数"
         )
 
     phase = np.exp(
@@ -448,8 +503,12 @@ def extract_planar_uplink_csi(
         "aoa_global_rad": aoa_global_rad,
         "aoa_local_rad": aoa_local_rad,
         "interaction_order": interaction_order,
+        "reflection_order": reflection_order,
+        "diffraction_order": diffraction_order,
         "vertices_m": vertices,
         "interactions": interactions,
+        "finite_nonzero_coefficient_mask": finite_nonzero,
+        "path_coefficients": path_coefficients,
         "front_facing_only": np.asarray(bool(front_facing_only)),
         "bs_boresight_rad": np.asarray(boresight),
         "local_angle_min_rad": np.asarray(angle_min),
@@ -700,11 +759,11 @@ def _generate_sionna_deepmimo_bundle_locked(
     scene.add(receiver)
 
     rt_params = {
-        "max_depth": int(scene_config["max_reflections"]),
+        "max_depth": int(scene_config["max_reflections"]) + int(scene_config.get("max_diffractions", 0)),
         "los": True,
         "specular_reflection": True,
         "diffuse_reflection": False,
-        "diffraction": False,
+        "diffraction": bool(scene_config.get("max_diffractions", 0)),
         "refraction": False,
         "samples_per_src": int(simulation["samples_per_source"]),
         "max_num_paths_per_src": int(
@@ -713,6 +772,8 @@ def _generate_sionna_deepmimo_bundle_locked(
         "synthetic_array": True,
         "seed": int(config["project"]["random_seed"]),
     }
+    if scene_config.get("max_diffractions", 0):
+        rt_params.update(edge_diffraction=True, diffraction_lit_region=False)
     paths = PathSolver()(scene=scene, **rt_params)
     if int(paths.tau.shape[-1]) == 0:
         raise RuntimeError("Sionna RT 没有找到传播路径")
@@ -757,6 +818,7 @@ def _generate_sionna_deepmimo_bundle_locked(
         fixed_height_m=fixed_height,
         vertical_tolerance_m=float(scene_config["vertical_path_tolerance_m"]),
         max_reflections=int(scene_config["max_reflections"]),
+        max_diffractions=int(scene_config.get("max_diffractions", 0)),
         bs_boresight_rad=math.radians(float(radio["bs_boresight_deg"])),
         local_angle_min_rad=math.radians(float(config["music"]["angle_min_deg"])),
         local_angle_max_rad=math.radians(float(config["music"]["angle_max_deg"])),

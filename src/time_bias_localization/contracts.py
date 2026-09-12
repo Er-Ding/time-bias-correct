@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import hashlib
+import json
 import math
 from pathlib import Path
 import re
@@ -15,7 +17,8 @@ from .provenance import generation_artifact_record, generation_bundle_id
 
 
 _SUPPORTED_GENERATION_STAGES = frozenset(
-    {"synthetic_csi_generation", "sionna_rt_to_deepmimo_v4"}
+    {"synthetic_csi_generation", "sionna_rt_to_deepmimo_v4",
+     "sionna_rt_boundary_v1", "synthetic_rt_boundary_fixture_v1"}
 )
 _CORE_ARTIFACT_NAMES = (
     "scene_json",
@@ -222,14 +225,22 @@ def _validate_stage_model(manifest: Mapping[str, Any], stage: str) -> None:
                 "max_num_paths_per_src",
                 "synthetic_array",
                 "seed",
-            },
+            } | ({"edge_diffraction", "diffraction_lit_region"} if model.get("diffraction") is True else set()),
             "Sionna rt_params ",
         )
         _require_bool(model, "los", True, "Sionna rt_params")
         _require_bool(model, "specular_reflection", True, "Sionna rt_params")
-        _require_reflection_depth(model.get("max_depth"), "Sionna rt_params.max_depth")
-        for key in ("diffuse_reflection", "diffraction", "refraction"):
+        if not isinstance(model.get("diffraction"), bool):
+            raise ValueError("Sionna rt_params.diffraction 必须为布尔值")
+        depth = model.get("max_depth")
+        if isinstance(depth, bool) or not isinstance(depth, int):
+            raise ValueError("Sionna rt_params.max_depth 必须为整数")
+        _require_reflection_depth(depth - int(model["diffraction"]), "Sionna rt_params.max_depth 对应的反射次数上限")
+        for key in ("diffuse_reflection", "refraction"):
             _require_bool(model, key, False, "Sionna rt_params")
+        if model["diffraction"]:
+            _require_bool(model, "edge_diffraction", True, "Sionna rt_params")
+            _require_bool(model, "diffraction_lit_region", False, "Sionna rt_params")
         _require_bool(model, "synthetic_array", True, "Sionna rt_params")
         return
 
@@ -252,9 +263,80 @@ def _validate_stage_model(manifest: Mapping[str, Any], stage: str) -> None:
     _require_reflection_depth(
         model.get("max_reflections"), "离线 rt_model.max_reflections"
     )
-    for key in ("diffraction", "diffuse_reflection", "transmission"):
+    if not isinstance(model.get("diffraction"), bool):
+        raise ValueError("离线 rt_model.diffraction 必须为布尔值")
+    for key in ("diffuse_reflection", "transmission"):
         _require_bool(model, key, False, "离线 rt_model")
     _require_bool(model, "front_facing_only", True, "离线 rt_model")
+    if stage == "sionna_rt_boundary_v1":
+        delegated = dict(manifest)
+        delegated.update(localization_scene_geometry_source="sionna_exported_triangle_mesh",
+                         bounds_source="fixed_config_not_ue_or_truth_paths")
+        _validate_stage_model(delegated, "sionna_rt_to_deepmimo_v4")
+        rt = manifest["rt_params"]
+        for key in ("samples_per_src", "max_num_paths_per_src"):
+            _positive_integer(rt.get(key), f"边界实验 rt_params.{key}")
+        if type(rt.get("seed")) is not int or rt["seed"] < 0:
+            raise ValueError("边界实验 rt_params.seed 必须是非负整数")
+        if rt["diffraction"] != model["diffraction"] or rt["max_depth"] != model["max_reflections"] + int(model["diffraction"]):
+            raise ValueError("边界实验的 rt_params 与 rt_model 不一致")
+
+
+def _validate_boundary_channel_setup(manifest: Mapping[str, Any], stage: str) -> Mapping[str, Any]:
+    """将公共设置绑定到同一生成后端、地图及传播规则；不读取评估真值。"""
+    record = _require_mapping(manifest.get("channel_setup"), "公开信道设置")
+    _require_exact_keys(record, {"path", "sha256"}, "公开信道设置 ")
+    _require_nonempty_string(record["path"], "公开信道设置路径")
+    if not isinstance(record["sha256"], str) or not _SHA256_PATTERN.fullmatch(record["sha256"]):
+        raise ValueError("公开信道设置 sha256 无效")
+    encoded = Path(record["path"]).read_bytes()
+    if hashlib.sha256(encoded).hexdigest() != record["sha256"]:
+        raise ValueError("公开信道设置文件摘要不一致")
+    try:
+        setup = _require_mapping(json.loads(encoded), "公开信道设置内容")
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise ValueError("公开信道设置必须是有效 JSON") from error
+    _reject_prohibited_keys(setup, location="公开信道设置内容")
+    if type(setup.get("schema_version")) is not int or setup["schema_version"] != 1:
+        raise ValueError("公开信道设置 schema_version 必须为 1")
+    expected_backend = "sionna" if stage == "sionna_rt_boundary_v1" else "synthetic_fixture"
+    if setup.get("backend") != expected_backend:
+        raise ValueError("公开信道设置 backend 与生成阶段不一致")
+    scene_record = _require_mapping(setup.get("scene_fingerprint"), "公开设置场景指纹")
+    _require_exact_keys(scene_record, {"path", "sha256"}, "公开设置场景指纹 ")
+    manifest_scene = manifest["artifact_hashes"]["scene_json"]
+    _assert_same_path(scene_record["path"], manifest_scene["path"], "公开设置场景")
+    if scene_record["sha256"] != manifest_scene["sha256"]:
+        raise ValueError("公开设置场景指纹与生成清单不一致")
+    scene_artifacts = _require_mapping(setup.get("scene_artifacts"), "公开设置场景产物")
+    _assert_same_path(scene_artifacts.get("scene_json"), manifest_scene["path"], "公开设置场景产物")
+    model = _require_mapping(manifest.get("rt_model"), "边界实验 rt_model")
+    propagation = _require_mapping(setup.get("propagation"), "公开设置传播规则")
+    _require_exact_keys(propagation, {"max_reflections", "max_diffractions"}, "公开设置传播规则 ")
+    if _require_reflection_depth(propagation["max_reflections"], "公开设置反射上限") != model["max_reflections"]:
+        raise ValueError("公开设置的反射上限与生成清单不一致")
+    if type(propagation["max_diffractions"]) is not int or propagation["max_diffractions"] not in (0, 1):
+        raise ValueError("公开设置的绕射上限必须为 0 或 1")
+    if bool(propagation["max_diffractions"]) != model["diffraction"]:
+        raise ValueError("公开设置的绕射上限与生成清单不一致")
+    _finite_vector(setup.get("bs_position_m"), 2, "公开设置 BS 位置")
+    _require_mapping(setup.get("radio"), "公开设置无线参数")
+    region = _require_mapping(setup.get("legal_region"), "公开设置可放置区域")
+    _finite_bounds(region.get("bounds_m"), "公开设置可放置区域范围")
+    if setup.get("coverage_rule") != "at_least_one_finite_nonzero_supported_path":
+        raise ValueError("公开设置的有信号判据与边界实验不一致")
+    if _finite_scalar(setup.get("coefficient_zero_threshold"), "公开设置系数零阈值") != 0.0:
+        raise ValueError("第一版边界实验的系数零阈值必须为 0")
+    if expected_backend == "sionna":
+        setup_rt = _require_mapping(setup.get("rt_parameters"), "公开设置 RT 参数")
+        if type(setup_rt.get("seed")) is not int or setup_rt["seed"] < 0:
+            raise ValueError("公开设置 RT seed 必须为非负整数")
+        # 每个位置有独立 RT 种子，其余参数必须与公共设置完全一致。
+        if {key: value for key, value in setup_rt.items() if key != "seed"} != {
+            key: value for key, value in manifest["rt_params"].items() if key != "seed"
+        }:
+            raise ValueError("公开设置的 RT 参数与生成清单不一致")
+    return setup
 
 
 def _validate_manifest_metadata_shape(
@@ -262,7 +344,7 @@ def _validate_manifest_metadata_shape(
 ) -> None:
     """限制清单的嵌套结构；只核类型，不用路径数量决定是否定位。"""
 
-    if stage == "synthetic_csi_generation":
+    if stage != "sionna_rt_to_deepmimo_v4":
         for key in ("scene_json", "online_input", "truth_input", "separation_rule"):
             _require_nonempty_string(manifest.get(key), f"离线生成清单 {key} ")
         if manifest.get("separation_rule") != "localization 只允许读取 online 目录":
@@ -320,10 +402,11 @@ def _validate_manifest_metadata_shape(
             "reflected_path_count",
             "position_tolerance_m",
             "passed",
-        },
+        } | ({"diffracted_path_count"} if "diffracted_path_count" in scene_consistency else set()),
         "Sionna scene_consistency ",
     )
-    for key in ("checked_path_count", "los_path_count", "reflected_path_count"):
+    for key in ("checked_path_count", "los_path_count", "reflected_path_count",
+                *(("diffracted_path_count",) if "diffracted_path_count" in scene_consistency else ())):
         value = scene_consistency[key]
         if isinstance(value, bool) or not isinstance(value, int):
             raise ValueError(f"Sionna scene_consistency.{key} 必须是整数")
@@ -426,7 +509,9 @@ def validate_generation_manifest_envelope(
         (
             _SIONNA_TOP_LEVEL_FIELDS
             if stage == "sionna_rt_to_deepmimo_v4"
-            else _SYNTHETIC_TOP_LEVEL_FIELDS
+            else (_SYNTHETIC_TOP_LEVEL_FIELDS
+                  | ({"channel_setup"} if stage.endswith("boundary_v1") or stage == "synthetic_rt_boundary_fixture_v1" else set())
+                  | ({"rt_params"} if stage == "sionna_rt_boundary_v1" else set()))
         ),
         "生成清单顶层 ",
     )
@@ -476,6 +561,8 @@ def validate_generation_manifest_envelope(
     if declared_bundle_id != computed_bundle_id:
         raise ValueError("生成清单 bundle_id 与三个核心产物摘要的重算结果不一致")
 
+    if stage in {"sionna_rt_boundary_v1", "synthetic_rt_boundary_fixture_v1"}:
+        _validate_boundary_channel_setup(manifest, stage)
     _validate_stage_model(manifest, stage)
     _validate_manifest_metadata_shape(manifest, stage)
     path_selection = _require_mapping(
@@ -515,7 +602,7 @@ def validate_generation_manifest_envelope(
     if path_selection.get("rule") != _PATH_SELECTION_RULE:
         raise ValueError("生成清单 path_selection.rule 与固定二维筛选规则不一致")
 
-    if stage == "synthetic_csi_generation":
+    if stage != "sionna_rt_to_deepmimo_v4":
         if manifest.get("link_direction") != "uplink_ue_to_bs":
             raise ValueError("离线生成清单的 link_direction 必须为 uplink_ue_to_bs")
         if manifest.get("absolute_delay_normalization") is not False:
@@ -544,15 +631,35 @@ def validate_localization_input_contract(
     scene_config = _require_mapping(config.get("scene"), "定位配置 scene")
     radio_config = _require_mapping(config.get("radio"), "定位配置 radio")
     music_config = _require_mapping(config.get("music"), "定位配置 music")
+    if stage in {"sionna_rt_boundary_v1", "synthetic_rt_boundary_fixture_v1"}:
+        setup = _validate_boundary_channel_setup(manifest, stage)
+        _assert_vector_close(
+            _finite_vector(setup["bs_position_m"], 2, "公开设置 BS 位置"),
+            _finite_vector(radio_config.get("bs_position_m"), 2, "定位配置 BS 位置"),
+            "公开信道设置 BS 位置",
+        )
+        _assert_vector_close(
+            _finite_bounds(setup["legal_region"]["bounds_m"], "公开设置可放置区域范围"),
+            _finite_bounds(scene_config.get("bounds_m"), "定位配置场景范围"),
+            "公开设置可放置区域范围",
+        )
+        setup_radio = setup["radio"]
+        for key in ("carrier_hz", "bandwidth_hz", "num_subcarriers", "num_bs_antennas",
+                    "antenna_spacing_wavelength", "bs_boresight_deg", "num_snapshots"):
+            _assert_close(_finite_scalar(setup_radio.get(key), f"公开设置无线参数 {key}"),
+                          _finite_scalar(radio_config.get(key), f"定位无线参数 {key}"),
+                          f"公开设置无线参数 {key}")
+        if setup_radio.get("front_facing_only") is not True:
+            raise ValueError("公开信道设置必须声明 front_facing_only=true")
 
     configured_scene_name = scene_config.get("name")
     if not isinstance(configured_scene_name, str) or not configured_scene_name:
         raise ValueError("定位配置 scene.name 必须是非空字符串")
-    if stage == "sionna_rt_to_deepmimo_v4":
+    if stage in {"sionna_rt_to_deepmimo_v4", "sionna_rt_boundary_v1"}:
         expected_scene_name = f"{configured_scene_name}_bev"
         expected_config_source = "sionna_builtin"
         expected_scene_source = "sionna_exported_triangle_mesh"
-        if manifest.get("sionna_scene") != configured_scene_name:
+        if stage == "sionna_rt_to_deepmimo_v4" and manifest.get("sionna_scene") != configured_scene_name:
             raise ValueError("Sionna 生成清单的场景名称与公开配置不一致")
     else:
         expected_scene_name = configured_scene_name
@@ -612,9 +719,15 @@ def validate_localization_input_contract(
     reflection_key = (
         "max_depth" if stage == "sionna_rt_to_deepmimo_v4" else "max_reflections"
     )
-    manifest_reflections = _require_reflection_depth(
-        model.get(reflection_key), f"生成清单 {model_key}.{reflection_key}"
-    )
+    configured_diffractions = scene_config.get("max_diffractions", 0)
+    if isinstance(configured_diffractions, bool) or configured_diffractions not in (0, 1):
+        raise ValueError("公开定位配置只允许 0 或 1 次绕射")
+    if model["diffraction"] != bool(configured_diffractions):
+        raise ValueError("生成清单的绕射开关与公开定位配置不一致")
+    depth = model.get(reflection_key)
+    if stage == "sionna_rt_to_deepmimo_v4":
+        depth -= int(model["diffraction"])
+    manifest_reflections = _require_reflection_depth(depth, f"生成清单 {model_key}.{reflection_key}")
     if manifest_reflections != configured_reflections:
         raise ValueError("生成清单的最大反射次数与公开定位配置不一致")
 

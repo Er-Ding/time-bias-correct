@@ -42,6 +42,7 @@ def forward_check_solution(
     beta_m: float,
     *,
     max_reflections: int = 2,
+    max_diffractions: int = 0,
     observed_peaks: Mapping[Hashable, Mapping[str, float]] | None = None,
     validity_tolerance_m: float = 1e-7,
     reflection_tolerance_deg: float = 1e-4,
@@ -58,6 +59,8 @@ def forward_check_solution(
 
     if max_reflections not in (0, 1, 2):
         raise ValueError("正向检查仅支持直射及最多二次镜面反射")
+    if isinstance(max_diffractions, bool) or max_diffractions not in (0, 1):
+        raise ValueError("正向检查最多支持一次绕射")
     source = np.asarray(position_m, dtype=float)
     receiver = np.asarray(bs_position_m, dtype=float)
     if (
@@ -86,6 +89,52 @@ def forward_check_solution(
     rows: list[dict[str, Any]] = []
     for candidate in candidates:
         metadata = candidate.metadata
+        interactions = tuple(tuple(item) for item in reversed(metadata.get("propagation_interactions", [])))
+        if any(kind == "diffraction" for kind, _ in interactions):
+            from .diffraction import rebuild_path
+            reasons = []
+            beta_valid = bool(candidate.is_valid(beta_m, validity_tolerance_m))
+            if not beta_valid:
+                reasons.append("beta_outside_candidate_interval")
+            if sum(kind == "diffraction" for kind, _ in interactions) > max_diffractions:
+                reasons.append("diffraction_order_exceeds_limit")
+            if sum(kind == "reflection" for kind, _ in interactions) > max_reflections:
+                reasons.append("reflection_order_exceeds_limit")
+            path = rebuild_path(scene, source, receiver, interactions) if not reasons else None
+            row = {
+                "observation_id": str(candidate.observation_id), "candidate_id": str(candidate.candidate_id),
+                "representative_sample_id": metadata.get("representative_sample_id"),
+                "propagation_interactions": [list(item) for item in interactions],
+                "reflection_wall_ids": [key for kind, key in interactions if kind == "reflection"],
+                "beta_in_candidate_interval": beta_valid,
+                "trajectory_position_residual_m": float(np.linalg.norm(source - candidate.point(beta_m))),
+                "visible": path is not None, "specular_reflection_error_deg": None,
+                "path_nodes_m": None, "prediction": None, "sample_residuals": None,
+                "original_peak_residuals": None,
+            }
+            if path is None:
+                reasons.append("no_visible_single_diffraction_path_for_selected_topology")
+            else:
+                nodes = path.nodes
+                directions = np.diff(nodes, axis=0)
+                directions /= np.linalg.norm(directions, axis=1)[:, None]
+                errors = [float(np.degrees(np.arccos(np.clip(np.dot(
+                    reflect_direction(directions[i], wall_lookup[key]), directions[i + 1]), -1., 1.))))
+                    for i, (kind, key) in enumerate(interactions) if kind == "reflection"]
+                if any(error > reflection_tolerance_deg for error in errors):
+                    reasons.append("specular_reflection_law_mismatch")
+                angle, delay = float(np.deg2rad(path.arrival_aoa_deg)), path.delay_s + bias_s
+                row.update(path_nodes_m=nodes.tolist(), specular_reflection_error_deg=errors,
+                    diffraction_shadow_valid=True,
+                    prediction={"aoa_global_rad": angle, "aoa_global_deg": path.arrival_aoa_deg,
+                                "geometric_delay_s": path.delay_s, "predicted_observed_delay_s": delay,
+                                "length_m": path.length_m},
+                    sample_residuals=_observation_residuals(angle, delay, metadata),
+                    original_peak_residuals=_observation_residuals(
+                        angle, delay, observed_peaks.get(candidate.observation_id) if observed_peaks else None))
+            row.update(valid=not reasons, failure_reasons=reasons)
+            rows.append(row)
+            continue
         # 候选的序列从 BS 反向出发；正向传播顺序必须反转。
         wall_ids = list(reversed(metadata.get("reflection_wall_ids", [])))
         reasons: list[str] = []
@@ -169,7 +218,8 @@ def forward_check_solution(
         row["failure_reasons"] = reasons
         rows.append(row)
     return {
-        "scope": "selected_topologies_2d_specular",
+        "scope": ("selected_topologies_2d_specular_and_single_diffraction" if max_diffractions else
+                  "selected_topologies_2d_specular"),
         "checks_all_scene_path_topologies": False,
         "checks_csi_reconstruction": False,
         "changes_solver_result": False,

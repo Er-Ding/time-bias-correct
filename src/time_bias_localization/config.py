@@ -21,6 +21,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "fixed_height_m": 1.5,
         "bev_resolution_m": 0.05,
         "max_reflections": 2,
+        "max_diffractions": 0,
     },
     "radio": {
         "carrier_hz": 3.5e9,
@@ -77,6 +78,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # DBSCAN 的邻域距离 eps，允许一个连续簇的总跨度超过此值。
         "candidate_cluster_radius_m": 1.5,
         "candidate_cluster_min_samples": 5,
+        "diffraction_directions_per_sample": 4,
+        "diffraction_angle_tolerance_deg": 3.0,
+        "diffraction_coverage_distance_m": 1.0,
+        "diffraction_representative_policy": "coverage",
         # 兼容旧配置快照；点聚类主流程不再使用方向阈值。
         "candidate_direction_radius_deg": 5.0,
     },
@@ -95,6 +100,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "fixed_height_m",
             "bev_resolution_m",
             "max_reflections",
+            "max_diffractions",
         }
     ),
     "radio": frozenset(
@@ -135,6 +141,10 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "initial_reference_bias_s",
             "candidate_cluster_radius_m",
             "candidate_cluster_min_samples",
+            "diffraction_directions_per_sample",
+            "diffraction_angle_tolerance_deg",
+            "diffraction_coverage_distance_m",
+            "diffraction_representative_policy",
             "candidate_direction_radius_deg",
             "huber_delta_m",
             "max_iterations",
@@ -426,6 +436,16 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
             raise ValueError("radio.bs_position_m 必须是二维坐标") from error
         for value in position:
             _finite_float("radio.bs_position_m", value)
+    max_diffractions = _nonnegative_integer("max_diffractions", scene.get("max_diffractions", 0))
+    if max_diffractions not in (0, 1):
+        raise ValueError("当前只支持最多一次绕射")
+    _positive_integer("diffraction_directions_per_sample", localization.get("diffraction_directions_per_sample", 4))
+    if localization.get("diffraction_representative_policy", "coverage") not in {"single", "coverage"}:
+        raise ValueError("diffraction_representative_policy 只能为 single 或 coverage")
+    _positive_float("diffraction_coverage_distance_m", localization.get("diffraction_coverage_distance_m", 1.0))
+    angle_tolerance = _positive_float("diffraction_angle_tolerance_deg", localization.get("diffraction_angle_tolerance_deg", 3.0))
+    if angle_tolerance >= 90:
+        raise ValueError("绕射角度容差必须小于 90 度")
     max_reflections = _nonnegative_integer("max_reflections", scene["max_reflections"])
     if max_reflections not in (0, 1, 2):
         raise ValueError("第一版只支持 0、1 或 2 次镜面反射")

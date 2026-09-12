@@ -313,7 +313,7 @@ def test_manifest_envelope_rejects_invalid_core_records(
         ("synthetic", ("rt_model", "los"), False, "los"),
         ("synthetic", ("rt_model", "specular_reflection"), False, "specular"),
         ("synthetic", ("rt_model", "max_reflections"), 3, "max_reflections"),
-        ("synthetic", ("rt_model", "diffraction"), True, "diffraction"),
+        ("synthetic", ("rt_model", "diffraction"), "true", "diffraction"),
         ("synthetic", ("rt_model", "diffuse_reflection"), True, "diffuse"),
         ("synthetic", ("rt_model", "transmission"), True, "transmission"),
     ],
@@ -345,6 +345,21 @@ def test_localization_input_contract_accepts_publicly_consistent_inputs(
     validate_localization_input_contract(
         manifest, stage, config, scene, measurement
     )
+
+
+@pytest.mark.parametrize("stage", ["synthetic_csi_generation", "sionna_rt_to_deepmimo_v4"])
+def test_diffraction_contract_requires_matching_public_model(stage):
+    manifest, config, scene, measurement = _contract_case(stage)
+    key = "rt_params" if stage == "sionna_rt_to_deepmimo_v4" else "rt_model"
+    manifest[key]["diffraction"] = True
+    if key == "rt_params":
+        manifest[key].update(max_depth=3, edge_diffraction=True, diffraction_lit_region=False)
+    manifest["bundle_id"] = generation_bundle_id(manifest)
+    validate_generation_manifest_envelope(manifest)
+    with pytest.raises(ValueError, match="绕射"):
+        validate_localization_input_contract(manifest, stage, config, scene, measurement)
+    config["scene"]["max_diffractions"] = 1
+    validate_localization_input_contract(manifest, stage, config, scene, measurement)
 
 
 def test_synthetic_scene_source_is_compared_directly_to_public_config() -> None:

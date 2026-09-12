@@ -42,7 +42,7 @@ def checked_record(record: dict[str, str]) -> Path:
 
 def _candidate_artifacts(artifacts: dict, workflow: str | None) -> dict[str, Any]:
     """按原始工作流保留点、点簇和轨迹的不同含义，缺失阶段不伪造。"""
-    if workflow in {"music_point_clustering_v2", "music_fine_spectrum_dbscan_v3"}:
+    if workflow in {"music_point_clustering_v2", "music_fine_spectrum_dbscan_v3", "music_diffraction_cover_v4"}:
         return {
             "initial_candidates": read_json(artifacts["initial_candidates"]) if "initial_candidates" in artifacts else None,
             "representative_points": read_json(artifacts["representative_points"]) if "representative_points" in artifacts else None,
@@ -135,7 +135,7 @@ def load_failed_run(root: Path, progress_path: str | Path) -> dict[str, Any]:
     if not progress_path.is_relative_to(failure_root):
         raise ValueError("失败进度文件不属于本次样本的 localization_failures 目录")
     progress = read_json(progress_path)
-    if progress.get("workflow") not in {"music_spectrum_sampling_v1", "music_point_clustering_v2", "music_fine_spectrum_dbscan_v3"}:
+    if progress.get("workflow") not in {"music_spectrum_sampling_v1", "music_point_clustering_v2", "music_fine_spectrum_dbscan_v3", "music_diffraction_cover_v4"}:
         raise ValueError("失败进度记录的工作流不受支持")
     if progress_path.parent.name != progress["run_id"]:
         raise ValueError("失败进度目录与运行编号不一致")

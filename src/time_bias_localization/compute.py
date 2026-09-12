@@ -23,6 +23,7 @@ from .signal import (
     _validate_subarray_size,
     ula_steering_vector,
 )
+from .timing import register_synchronizer, stage
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,12 @@ class MusicComputer:
 
     _CACHE_MAX_ENTRIES = 4
     _CACHE_MAX_BYTES = 64 * 1024 * 1024
+
+    def synchronize(self) -> None:
+        """计时时等待本计算器所在 GPU 完成；CPU 不需要额外操作。"""
+        if self._device is not None:
+            with self._device:
+                self._xp.cuda.get_current_stream().synchronize()
 
     def __init__(self, settings: ComputeSettings | None = None) -> None:
         self.settings = settings or ComputeSettings()
@@ -141,34 +148,39 @@ class MusicComputer:
         diagonal_loading: float = 0.0,
     ) -> "PreparedMusic":
         """仅对这一份观测构造一次协方差并分解，随后复用以查询任意谱坐标。"""
-        frequencies = _validate_frequency_vector(
-            subcarrier_frequencies_hz, require_uniform_spacing=True
-        ).copy()
-        observation = _prepare_music_input(csi, frequencies.size)
-        spatial_size = _validate_subarray_size(
-            "spatial_subarray_size", spatial_subarray_size, observation.shape[-2]
-        )
-        frequency_size = _validate_subarray_size(
-            "frequency_subarray_size", frequency_subarray_size, frequencies.size
-        )
-        dimension = spatial_size * frequency_size
-        if isinstance(num_sources, bool) or int(num_sources) != num_sources:
-            raise ValueError("num_sources 必须是整数")
-        source_count = int(num_sources)
-        if source_count < 1 or source_count >= dimension:
-            raise ValueError(f"num_sources 必须位于 [1, {dimension - 1}]")
-        loading = float(diagonal_loading)
-        if not np.isfinite(loading) or loading < 0.0:
-            raise ValueError("diagonal_loading 必须是有限非负数")
-        # 在进行特征分解之前验证物理阵列参数。
-        ula_steering_vector(
-            [0.0], num_bs_antennas=spatial_size,
-            carrier_frequency_hz=carrier_frequency_hz,
-            antenna_spacing_m=antenna_spacing_m,
-        )
+        if self._device is not None:
+            register_synchronizer(self.synchronize)
+        with stage('T01_covariance'):
+            frequencies = _validate_frequency_vector(
+                subcarrier_frequencies_hz, require_uniform_spacing=True
+            ).copy()
+            observation = _prepare_music_input(csi, frequencies.size)
+            spatial_size = _validate_subarray_size(
+                "spatial_subarray_size", spatial_subarray_size, observation.shape[-2]
+            )
+            frequency_size = _validate_subarray_size(
+                "frequency_subarray_size", frequency_subarray_size, frequencies.size
+            )
+            dimension = spatial_size * frequency_size
+            if isinstance(num_sources, bool) or int(num_sources) != num_sources:
+                raise ValueError("num_sources 必须是整数")
+            source_count = int(num_sources)
+            if source_count < 1 or source_count >= dimension:
+                raise ValueError(f"num_sources 必须位于 [1, {dimension - 1}]")
+            loading = float(diagonal_loading)
+            if not np.isfinite(loading) or loading < 0.0:
+                raise ValueError("diagonal_loading 必须是有限非负数")
+            # 在进行特征分解之前验证物理阵列参数。
+            ula_steering_vector(
+                [0.0], num_bs_antennas=spatial_size,
+                carrier_frequency_hz=carrier_frequency_hz,
+                antenna_spacing_m=antenna_spacing_m,
+            )
         with self._device if self._device is not None else nullcontext():
+            with stage("T01_covariance", component="csi_to_device"):
+                device_observation = self._xp.asarray(observation[None])
             signal_adjoint = self._prepare_subspaces(
-                self._xp.asarray(observation[None]), spatial_size,
+                device_observation, spatial_size,
                 frequency_size, source_count, loading,
             )[0]
         self._batch_count += 1
@@ -333,31 +345,35 @@ class MusicComputer:
         xp = self._xp
         batch_count, snapshot_count, antenna_count, subcarrier_count = observations.shape
         dimension = spatial_size * frequency_size
-        covariance = xp.zeros((batch_count, dimension, dimension), dtype=xp.complex128)
-        window_count = (
-            (antenna_count - spatial_size + 1)
-            * (subcarrier_count - frequency_size + 1)
-        )
-        # 逐快照累计，控制滑窗内存；批次维度一次交给矩阵乘法。
-        # 展平顺序保持 (空间阵元, 子载波)，与 _smoothed_covariance 相同。
-        for snapshot in range(snapshot_count):
-            windows = xp.lib.stride_tricks.sliding_window_view(
-                observations[:, snapshot], (spatial_size, frequency_size),
-                axis=(-2, -1),
+        if self._device is not None:
+            register_synchronizer(self.synchronize)
+        with stage("T01_covariance", csi_count=int(batch_count)):
+            covariance = xp.zeros((batch_count, dimension, dimension), dtype=xp.complex128)
+            window_count = (
+                (antenna_count - spatial_size + 1)
+                * (subcarrier_count - frequency_size + 1)
             )
-            vectors = windows.reshape(batch_count, window_count, dimension)
-            covariance += xp.matmul(vectors.swapaxes(-1, -2), vectors.conj())
-        covariance /= snapshot_count * window_count
-        covariance = (covariance + covariance.conj().swapaxes(-1, -2)) / 2.0
-        if loading > 0.0:
-            mean_power = xp.trace(covariance, axis1=-2, axis2=-1).real / dimension
-            covariance += loading * mean_power[:, None, None] * xp.eye(dimension)
-        # CuPy 默认忽略 cuSOLVER 的失败状态；实验中必须显式报告不收敛。
-        with self._cupyx.errstate(linalg="raise") if self._cupyx else nullcontext():
-            _, eigenvectors = xp.linalg.eigh(covariance)
+            # 逐快照累计，控制滑窗内存；展平顺序保持 (空间阵元, 子载波)。
+            for snapshot in range(snapshot_count):
+                windows = xp.lib.stride_tricks.sliding_window_view(
+                    observations[:, snapshot], (spatial_size, frequency_size),
+                    axis=(-2, -1),
+                )
+                vectors = windows.reshape(batch_count, window_count, dimension)
+                covariance += xp.matmul(vectors.swapaxes(-1, -2), vectors.conj())
+            covariance /= snapshot_count * window_count
+            covariance = (covariance + covariance.conj().swapaxes(-1, -2)) / 2.0
+            if loading > 0.0:
+                mean_power = xp.trace(covariance, axis1=-2, axis2=-1).real / dimension
+                covariance += loading * mean_power[:, None, None] * xp.eye(dimension)
+        with stage("T02_subspace", csi_count=int(batch_count)):
+            # CuPy 默认忽略 cuSOLVER 的失败状态；实验中必须显式报告不收敛。
+            with self._cupyx.errstate(linalg="raise") if self._cupyx else nullcontext():
+                _, eigenvectors = xp.linalg.eigh(covariance)
+            signal_adjoint = eigenvectors[:, :, -source_count:].conj().swapaxes(-1, -2)
         self._covariance_count += batch_count
         self._eigendecomposition_count += batch_count
-        return eigenvectors[:, :, -source_count:].conj().swapaxes(-1, -2)
+        return signal_adjoint
 
     def _evaluate_grid(self, signal_adjoint: Any, spatial: Any, frequency: Any) -> Any:
         xp = self._xp

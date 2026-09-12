@@ -68,6 +68,7 @@ from .signal import (
     music_2d_spectrum,
 )
 from .solver import CandidateTrajectory, SolverConfig, SolverError, solve_position_and_bias
+from .timing import mark, register_synchronizer, stage
 
 
 @dataclass(frozen=True)
@@ -330,6 +331,12 @@ _SPECTRUM_TRAJECTORY_ARTIFACT_FILENAMES = {
 
 POINT_CLUSTERING_WORKFLOW = "music_point_clustering_v2"
 WORKFLOW = "music_fine_spectrum_dbscan_v3"
+DIFFRACTION_WORKFLOW = "music_diffraction_cover_v4"
+
+
+def workflow_for_config(config):
+    return DIFFRACTION_WORKFLOW if config["scene"].get("max_diffractions", 0) else WORKFLOW
+
 _LOCALIZATION_ARTIFACT_FILENAMES = {
     "result": "localization_result.json",
     "music_spectrum": "music_spectrum.npz",
@@ -343,6 +350,10 @@ _LOCALIZATION_ARTIFACT_FILENAMES = {
 
 
 def _manifest_artifact_filenames(manifest: dict[str, Any]) -> dict[str, str]:
+    if manifest.get("schema_version") == 7:
+        if manifest.get("workflow") != DIFFRACTION_WORKFLOW:
+            raise ValueError("第 7 版定位清单必须明确记录绕射多代表流程")
+        return _LOCALIZATION_ARTIFACT_FILENAMES
     if manifest.get("schema_version") == 6:
         if manifest.get("workflow") != WORKFLOW:
             raise ValueError("第 6 版定位清单必须明确记录统一细谱与 DBSCAN 流程")
@@ -402,7 +413,7 @@ def _archive_previous_evaluation(
         recorded_result_sha256 = str(result_record["sha256"])
     except (KeyError, TypeError, ValueError, OSError) as error:
         raise ValueError("旧定位清单的评估来源记录不完整，拒绝发布新定位产物") from error
-    if manifest_schema_version not in (2, 3, 4, 5, 6):
+    if manifest_schema_version not in (2, 3, 4, 5, 6, 7):
         raise ValueError(
             f"旧定位清单版本 {manifest_schema_version} 不支持无损归档"
         )
@@ -891,7 +902,7 @@ def _generate_data_locked(
             "los": True,
             "specular_reflection": True,
             "max_reflections": int(config["scene"]["max_reflections"]),
-            "diffraction": False,
+            "diffraction": bool(config["scene"].get("max_diffractions", 0)),
             "diffuse_reflection": False,
             "transmission": False,
             "front_facing_only": bool(
@@ -1498,46 +1509,49 @@ def localize(
 def _localize_locked(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     """运行单份观测；异常时保存已完成步骤，不覆盖上一轮成功产物。"""
     progress: dict[str, Any] = {
-        "workflow": WORKFLOW, "run_id": str(uuid4()),
+        "workflow": workflow_for_config(config), "run_id": str(uuid4()),
         "completed_steps": [], "failed_step": "01_csi_input", "payloads": {},
     }
     try:
         return _localize_locked_impl(config, progress=progress, **kwargs)
     except Exception as error:
-        if "inputs" in progress:
-            try:
-                directory = Path(kwargs["output_root"]) / "localization_failures" / progress["run_id"]
-                directory.mkdir(parents=True, exist_ok=False)
-                records = {}
-                for key, payload in progress["payloads"].items():
-                    path = directory / _LOCALIZATION_ARTIFACT_FILENAMES[key]
-                    if path.suffix == ".npz":
-                        np.savez_compressed(path, **payload)
-                    else:
-                        _write_json(path, payload)
-                    records[key] = artifact_record(path)
-                snapshot_path = directory / "localization_config.json"
-                snapshot = progress["config_snapshot_data"]
-                _write_json(snapshot_path, snapshot)
-                metadata = {
-                    key: value for key, value in progress.items()
-                    if key not in {"payloads", "config_snapshot_data"}
-                }
-                metadata.update(
-                    status="failed", error=f"{type(error).__name__}: {error}",
-                    artifacts=records,
-                    config_snapshot={
-                        "path": str(snapshot_path.resolve()),
-                        "file_sha256": file_sha256(snapshot_path),
-                        "canonical_sha256": snapshot["canonical_sha256"],
-                        "source_config_path": snapshot["source_config_path"],
-                    },
-                )
-                progress_path = directory / "progress.json"
-                _write_json(progress_path, metadata)
-                error.failure_progress = str(progress_path.resolve())
-            except Exception as save_error:
-                error.add_note(f"保存失败步骤时另遇到错误：{save_error}")
+        mark("online_failed", failed_step=progress["failed_step"],
+             error_type=type(error).__name__)
+        with stage("failure_artifact_publication"):
+            if "inputs" in progress:
+                try:
+                    directory = Path(kwargs["output_root"]) / "localization_failures" / progress["run_id"]
+                    directory.mkdir(parents=True, exist_ok=False)
+                    records = {}
+                    for key, payload in progress["payloads"].items():
+                        path = directory / _LOCALIZATION_ARTIFACT_FILENAMES[key]
+                        if path.suffix == ".npz":
+                            np.savez_compressed(path, **payload)
+                        else:
+                            _write_json(path, payload)
+                        records[key] = artifact_record(path)
+                    snapshot_path = directory / "localization_config.json"
+                    snapshot = progress["config_snapshot_data"]
+                    _write_json(snapshot_path, snapshot)
+                    metadata = {
+                        key: value for key, value in progress.items()
+                        if key not in {"payloads", "config_snapshot_data"}
+                    }
+                    metadata.update(
+                        status="failed", error=f"{type(error).__name__}: {error}",
+                        artifacts=records,
+                        config_snapshot={
+                            "path": str(snapshot_path.resolve()),
+                            "file_sha256": file_sha256(snapshot_path),
+                            "canonical_sha256": snapshot["canonical_sha256"],
+                            "source_config_path": snapshot["source_config_path"],
+                        },
+                    )
+                    progress_path = directory / "progress.json"
+                    _write_json(progress_path, metadata)
+                    error.failure_progress = str(progress_path.resolve())
+                except Exception as save_error:
+                    error.add_note(f"保存失败步骤时另遇到错误：{save_error}")
         raise
 
 
@@ -1564,71 +1578,76 @@ def _localize_locked_impl(
         stage_timings[name] = now - stage_started
         stage_started = now
 
-    root = output_root
-    scene_path = Path(scene_json).expanduser().resolve()
-    online_path = Path(online_input).expanduser().resolve()
-    generation_manifest_path = _resolve_generation_manifest(root, generation_manifest)
-    (
-        generation_manifest_data,
-        generation_manifest_record,
-        bundle_id,
-    ) = load_generation_manifest(generation_manifest_path)
-    generation_stage, validated_bundle_id = validate_generation_manifest_envelope(
-        generation_manifest_data
-    )
-    if validated_bundle_id != bundle_id:
-        raise ValueError("生成清单批次编号的两次独立校验结果不一致")
-    scene_capture = capture_file(scene_path)
-    online_capture = capture_file(online_path)
-    scene_input_record = verify_generation_artifact(
-        generation_manifest_data, "scene_json", scene_capture
-    )
-    online_input_record = verify_generation_artifact(
-        generation_manifest_data, "online_measurement", online_capture
-    )
-    output_dir = root / "localization"
-    run_receipt_path = (
-        Path(run_receipt).expanduser().resolve() if run_receipt is not None else None
-    )
-    if run_receipt_path is not None and (
-        run_receipt_path == output_dir or output_dir in run_receipt_path.parents
-    ):
-        raise ValueError("运行回执不能写入将被整体切换的 localization 目录")
-    localization_run_id = progress["run_id"]
-    config_snapshot = localization_config_snapshot(config)
-    try:
-        scene_data = json.loads(scene_capture.data.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        raise ValueError(f"二维场景不是有效 JSON：{scene_path}") from error
-    if not isinstance(scene_data, dict):
-        raise ValueError("二维场景顶层必须是键值映射")
-    scene = Scene2D.from_dict(scene_data)
-    measurement = load_online_measurement_bytes(
-        online_capture.data, source_path=online_capture.path
-    )
-    validate_localization_input_contract(
-        generation_manifest_data,
-        generation_stage,
-        config,
-        scene,
-        measurement,
-    )
-    progress.update(
-        generation_bundle={"bundle_id": bundle_id, "manifest": generation_manifest_record},
-        inputs={"scene": scene_input_record, "online_measurement": online_input_record},
-        config_snapshot_data=config_snapshot,
-        truth_was_loaded=False,
-    )
-    progress["completed_steps"].append("01_csi_input")
+    with stage('input_read_validation'):
+        root = output_root
+        scene_path = Path(scene_json).expanduser().resolve()
+        online_path = Path(online_input).expanduser().resolve()
+        generation_manifest_path = _resolve_generation_manifest(root, generation_manifest)
+        (
+            generation_manifest_data,
+            generation_manifest_record,
+            bundle_id,
+        ) = load_generation_manifest(generation_manifest_path)
+        generation_stage, validated_bundle_id = validate_generation_manifest_envelope(
+            generation_manifest_data
+        )
+        if validated_bundle_id != bundle_id:
+            raise ValueError("生成清单批次编号的两次独立校验结果不一致")
+        scene_capture = capture_file(scene_path)
+        online_capture = capture_file(online_path)
+        scene_input_record = verify_generation_artifact(
+            generation_manifest_data, "scene_json", scene_capture
+        )
+        online_input_record = verify_generation_artifact(
+            generation_manifest_data, "online_measurement", online_capture
+        )
+        output_dir = root / "localization"
+        run_receipt_path = (
+            Path(run_receipt).expanduser().resolve() if run_receipt is not None else None
+        )
+        if run_receipt_path is not None and (
+            run_receipt_path == output_dir or output_dir in run_receipt_path.parents
+        ):
+            raise ValueError("运行回执不能写入将被整体切换的 localization 目录")
+        localization_run_id = progress["run_id"]
+        config_snapshot = localization_config_snapshot(config)
+        try:
+            scene_data = json.loads(scene_capture.data.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"二维场景不是有效 JSON：{scene_path}") from error
+        if not isinstance(scene_data, dict):
+            raise ValueError("二维场景顶层必须是键值映射")
+        scene = Scene2D.from_dict(scene_data)
+        measurement = load_online_measurement_bytes(
+            online_capture.data, source_path=online_capture.path
+        )
+        validate_localization_input_contract(
+            generation_manifest_data,
+            generation_stage,
+            config,
+            scene,
+            measurement,
+        )
+        progress.update(
+            generation_bundle={"bundle_id": bundle_id, "manifest": generation_manifest_record},
+            inputs={"scene": scene_input_record, "online_measurement": online_input_record},
+            config_snapshot_data=config_snapshot,
+            truth_was_loaded=False,
+        )
+        progress["completed_steps"].append("01_csi_input")
     music_config = config["music"]
     localization_config = config["localization"]
     compute_config = config.get("compute", {})
-    computer = get_music_computer(
-        compute_config.get("backend", "numpy"), int(compute_config.get("device_id", 0)),
-        int(compute_config.get("batch_size", 4)), int(compute_config.get("angle_chunk_size", 32)),
-    )
-    compute_before = computer.metadata()
+    with stage('device_setup'):
+        computer = get_music_computer(
+            compute_config.get("backend", "numpy"), int(compute_config.get("device_id", 0)),
+            int(compute_config.get("batch_size", 4)), int(compute_config.get("angle_chunk_size", 32)),
+        )
+        compute_before = computer.metadata()
+        if computer.settings.backend == "cuda":
+            register_synchronizer(computer.synchronize)
     mark_stage("input_validation_and_device_setup")
+    mark("csi_map_ready")
     progress["failed_step"] = "02_music"
     unambiguous_delay_period_s = _validate_unambiguous_delay_window(
         music_config, measurement.subcarrier_frequencies_hz
@@ -1646,14 +1665,17 @@ def _localize_locked_impl(
         frequency_subarray_size=int(music_config["frequency_subarray_size"]),
         diagonal_loading=float(music_config["diagonal_loading"]),
     )
-    spectrum = prepared.spectrum(aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid)
-    coarse_peaks = extract_local_music_peaks(
-        spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
-        max_peaks=num_paths, minimum_relative_height=0.0,
-        minimum_separation_bins=_separation_bins(music_config),
-    )
+    with stage('coarse_music_total'):
+        with stage('T03_coarse_spectrum'):
+            spectrum = prepared.spectrum(aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid)
+        with stage('T04_coarse_peaks'):
+            coarse_peaks = extract_local_music_peaks(
+                spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
+                max_peaks=num_paths, minimum_relative_height=0.0,
+                minimum_separation_bins=_separation_bins(music_config),
+            )
     peak_output = {
-        "workflow": WORKFLOW,
+        "workflow": workflow_for_config(config),
         "note": "谱值用于候选搜索，不是经过校准的路径概率；不对观测 CSI 额外加噪",
         "coarse": [asdict(peak) for peak in coarse_peaks],
         "nominal": [],
@@ -1671,21 +1693,22 @@ def _localize_locked_impl(
         raise RuntimeError(f"二维 MUSIC 只找到 {len(coarse_peaks)} 个搜索区域，无法联合求解")
 
     progress["failed_step"] = "03_spectrum_sampling"
-    sampled = sample_music_spectrum(
-        prepared, coarse_peaks, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
-        bs_boresight_rad=measurement.bs_boresight_rad,
-        settings=music_config["spectrum_sampling"],
-        seed=int(config["project"]["random_seed"]) + 2,
-        minimum_angle_separation_rad=np.deg2rad(float(music_config["min_angle_separation_deg"])),
-        minimum_delay_separation_s=float(music_config["min_delay_separation_s"]),
-    )
+    with stage('spectrum_processing_total'):
+        sampled = sample_music_spectrum(
+            prepared, coarse_peaks, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
+            bs_boresight_rad=measurement.bs_boresight_rad,
+            settings=music_config["spectrum_sampling"],
+            seed=int(config["project"]["random_seed"]) + 2,
+            minimum_angle_separation_rad=np.deg2rad(float(music_config["min_angle_separation_deg"])),
+            minimum_delay_separation_s=float(music_config["min_delay_separation_s"]),
+        )
     nominal_peaks = sampled.refined_peaks
     nominal_source_indices = sampled.refined_peak_source_indices
     peak_output["nominal"] = [asdict(peak) for peak in nominal_peaks]
     peak_output["nominal_source_indices"] = nominal_source_indices
     peak_output["observation_samples"] = [asdict(sample) for sample in sampled.samples]
     progress["payloads"]["spectrum_samples"] = {
-        "workflow": WORKFLOW, "samples": sampled.records,
+        "workflow": workflow_for_config(config), "samples": sampled.records,
         "regions": sampled.regions, "diagnostics": sampled.diagnostics,
     }
     progress["completed_steps"].append("03_spectrum_sampling")
@@ -1695,11 +1718,15 @@ def _localize_locked_impl(
 
     progress["failed_step"] = "04_initial_candidates"
     reference_bias_s = float(localization_config["initial_reference_bias_s"])
-    initial = generate_initial_candidate_points(
-        scene, measurement.bs_position_m, sampled.samples,
-        reference_bias_s=reference_bias_s,
-        max_reflections=int(config["scene"]["max_reflections"]),
-    )
+    with stage('T08_reverse_rt'):
+        initial = generate_initial_candidate_points(
+            scene, measurement.bs_position_m, sampled.samples,
+            reference_bias_s=reference_bias_s,
+            max_reflections=int(config["scene"]["max_reflections"]),
+            max_diffractions=int(config["scene"].get("max_diffractions", 0)),
+            diffraction_directions_per_sample=int(localization_config.get("diffraction_directions_per_sample", 4)),
+            diffraction_angle_tolerance_deg=float(localization_config.get("diffraction_angle_tolerance_deg", 3.0)),
+        )
     progress["payloads"]["initial_candidates"] = {
         "reference_bias_s": reference_bias_s,
         "points": [asdict(point) for point in initial.points],
@@ -1708,14 +1735,20 @@ def _localize_locked_impl(
     }
     progress["completed_steps"].append("04_initial_candidates")
     mark_stage("initial_candidates")
+    mark("initial_candidates_available", count=len(initial.points), diagnostics=initial.diagnostics)
 
     progress["failed_step"] = "05_point_clustering"
-    clustering = cluster_initial_candidate_points(
-        initial.points,
-        position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
-        min_samples=int(localization_config["candidate_cluster_min_samples"]),
-        return_diagnostics=True,
-    )
+    with stage('clustering_total'):
+        clustering = cluster_initial_candidate_points(
+            initial.points,
+            position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
+            min_samples=int(localization_config["candidate_cluster_min_samples"]),
+            diffraction_coverage_distance_m=float(localization_config.get("diffraction_coverage_distance_m", 1.0)),
+            diffraction_representative_policy=localization_config.get("diffraction_representative_policy", "coverage"),
+            beta_interval_m=(float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
+                             float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S),
+            return_diagnostics=True,
+        )
     representatives = clustering.representatives
     progress["payloads"]["representative_points"] = {
         "reference_bias_s": reference_bias_s,
@@ -1726,6 +1759,8 @@ def _localize_locked_impl(
     }
     progress["completed_steps"].append("05_point_clustering")
     mark_stage("point_clustering")
+    mark("representatives_available", count=len(representatives), diagnostics=clustering.diagnostics,
+         diffraction_count=sum(rep.point.has_diffraction for rep in representatives))
 
     # 只有点簇代表进入此步；此前从未构建任何随 beta 变化的候选轨迹。
     progress["failed_step"] = "06_representative_trajectories"
@@ -1733,9 +1768,10 @@ def _localize_locked_impl(
         float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
         float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S,
     )
-    representative_trajectories = build_representative_trajectories(
-        representatives, beta_interval_m=beta_interval_m,
-    )
+    with stage('T11_trajectories'):
+        representative_trajectories = build_representative_trajectories(
+            representatives, beta_interval_m=beta_interval_m,
+        )
     progress["payloads"]["representative_trajectories"] = [
         _clustered_candidate_dict(candidate) for candidate in representative_trajectories
     ]
@@ -1743,7 +1779,10 @@ def _localize_locked_impl(
     mark_stage("representative_trajectories")
 
     progress["failed_step"] = "07_joint_solution"
-    central = solve_position_and_bias(representative_trajectories, _solver_config(localization_config))
+    with stage('T12_solver'):
+        central = solve_position_and_bias(representative_trajectories, _solver_config(localization_config))
+    mark("position_available", mu_m=central.mu.tolist(),
+         clock_bias_s=float(central.beta / SPEED_OF_LIGHT_M_S))
     progress["completed_steps"].append("07_joint_solution")
     mark_stage("joint_solution")
     selected = {
@@ -1753,7 +1792,7 @@ def _localize_locked_impl(
     # 此协方差来自最终几何残差近似；未把采样数当成独立观测数，
     # 也未标定谱面采样本身的不确定性。采样会通过代表选择间接影响残差。
     result = {
-        "schema_version": 4, "workflow": WORKFLOW,
+        "schema_version": 4, "workflow": workflow_for_config(config),
         "localization_run_id": localization_run_id,
         "output_type": "point_estimate_with_geometric_residual_covariance",
         "mu_m": central.mu, "sigma_m2": central.sigma,
@@ -1785,8 +1824,15 @@ def _localize_locked_impl(
                 **clustering.diagnostics,
                 "space": "initial_position_xy_at_reference_bias",
                 "position_radius_m": float(localization_config["candidate_cluster_radius_m"]),
-                "grouping": "source_observation_and_reflection_wall_sequence",
-                "representative": "actual_member_medoid",
+                "grouping": clustering.diagnostics["grouping_rule"],
+                "representative": (
+                    "diffraction_members_with_continuous_bias_coverage"
+                    if (config["scene"].get("max_diffractions", 0)
+                        and localization_config.get("diffraction_representative_policy", "coverage") == "coverage")
+                    else "actual_member_medoid"
+                ),
+                "diffraction_representative_policy": localization_config.get(
+                    "diffraction_representative_policy", "coverage"),
                 "uses_trajectory_distance": False,
                 "uses_direction_threshold": False,
             },
@@ -1799,22 +1845,32 @@ def _localize_locked_impl(
             "no_accept_reject_output": True,
         },
     }
+    progress["failed_step"] = "08_forward_check"
+    with stage('T13_online_checks'):
+        if config["scene"].get("max_diffractions", 0):
+            from .diffraction_diagnostics import physical_constraint_rank
+            result["diagnostics"]["diffraction_physical_constraints"] = physical_constraint_rank(
+                scene, central.selected_candidates, central.mu)
+            result["output_type"] = "discrete_candidate_estimate_with_conditional_covariance"
     progress["payloads"]["result"] = result
     progress["failed_step"] = "08_forward_check"
-    forward_check = forward_check_solution(
-        scene, measurement.bs_position_m, central.selected_candidates,
-        central.mu, central.beta, max_reflections=int(config["scene"]["max_reflections"]),
-        observed_peaks={
-            f"music_path_{index:02d}": {
-                "aoa_global_rad": local_to_global_aoa(peak.aoa_rad, measurement.bs_boresight_rad),
-                "delay_s": peak.delay_s,
-            }
-            for index, peak in zip(nominal_source_indices, nominal_peaks, strict=True)
-        },
-    )
+    with stage('T13_online_checks'):
+        forward_check = forward_check_solution(
+            scene, measurement.bs_position_m, central.selected_candidates,
+            central.mu, central.beta, max_reflections=int(config["scene"]["max_reflections"]),
+            max_diffractions=int(config["scene"].get("max_diffractions", 0)),
+            observed_peaks={
+                f"music_path_{index:02d}": {
+                    "aoa_global_rad": local_to_global_aoa(peak.aoa_rad, measurement.bs_boresight_rad),
+                    "delay_s": peak.delay_s,
+                }
+                for index, peak in zip(nominal_source_indices, nominal_peaks, strict=True)
+            },
+        )
     progress["payloads"]["forward_check"] = forward_check
     progress["completed_steps"].append("08_forward_check")
     mark_stage("forward_check")
+    mark("checked_complete")
     result["forward_check"] = forward_check
     compute_report = computer.metadata()
     compute_report["counter_scope"] = "worker_lifetime"
@@ -1826,97 +1882,99 @@ def _localize_locked_impl(
     result["diagnostics"]["compute"] = compute_report
     progress["failed_step"] = "artifact_publication"
 
-    remove_fixed_metrics = (
-        _archive_previous_evaluation(root, output_dir)
-        if archive_previous
-        else previous_evaluation_archived
-    )
-    staging_dir = Path(
-        tempfile.mkdtemp(prefix=".localization-staging-", dir=root)
-    ).resolve()
-    try:
-        staged_paths = {
-            artifact_name: staging_dir / filename
-            for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
-        }
-        for artifact_name, payload in progress["payloads"].items():
-            staged_path = staged_paths[artifact_name]
-            if staged_path.suffix == ".npz":
-                np.savez_compressed(staged_path, **payload)
-            else:
-                _write_json(staged_path, payload)
-        staged_config_path = staging_dir / "localization_config.json"
-        _write_json(staged_config_path, config_snapshot)
-        config_snapshot_record = {
-            "path": str((output_dir / "localization_config.json").resolve()),
-            "source_config_path": config_snapshot["source_config_path"],
-            "canonical_sha256": config_snapshot["canonical_sha256"],
-            "file_sha256": file_sha256(staged_config_path),
-        }
-        _write_json(staged_paths["result"], result)
-        artifact_records = {
-            artifact_name: _staged_record(
-                staged_paths[artifact_name], output_dir / filename
-            )
-            for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
-        }
-        localization_manifest = {
-            "schema_version": 6,
-            "workflow": WORKFLOW,
-            "stage": "localization",
-            "run_id": localization_run_id,
-            "generation_bundle": {
-                "bundle_id": bundle_id,
-                "manifest": generation_manifest_record,
-            },
-            "config_snapshot": config_snapshot_record,
-            "scene_input": str(scene_path),
-            "online_measurement_input": str(online_path),
-            "truth_was_loaded": False,
-            "truth_access": {
-                "truth_file_content_loaded": False,
-                "generation_manifest_truth_metadata_visible": True,
-                "note": "生成清单整体可见，但定位未打开真值文件或使用真值内容",
-            },
-            "result": artifact_records["result"]["path"],
-            "inputs": {
-                "scene": scene_input_record,
-                "online_measurement": online_input_record,
-            },
-            "artifacts": artifact_records,
-            "evaluation_pending": True,
-        }
-        _write_json(
-            staging_dir / "localization_manifest.json", localization_manifest
+    with stage('artifact_publication'):
+        remove_fixed_metrics = (
+            _archive_previous_evaluation(root, output_dir)
+            if archive_previous
+            else previous_evaluation_archived
         )
-        _verify_staged_localization(staging_dir, output_dir, localization_manifest)
-        run_receipt_data = (
-            {
-                "run_id": localization_run_id,
-                "result": artifact_records["result"],
-                "manifest": {
-                    "path": str(
-                        (output_dir / "localization_manifest.json").resolve()
-                    ),
-                    "sha256": file_sha256(
-                        staging_dir / "localization_manifest.json"
-                    ),
-                },
+        staging_dir = Path(
+            tempfile.mkdtemp(prefix=".localization-staging-", dir=root)
+        ).resolve()
+        try:
+            staged_paths = {
+                artifact_name: staging_dir / filename
+                for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
             }
-            if run_receipt_path is not None
-            else None
-        )
-        _publish_staged_localization(
-            root=root,
-            staging_dir=staging_dir,
-            output_dir=output_dir,
-            remove_fixed_metrics=remove_fixed_metrics,
-            run_receipt_path=run_receipt_path,
-            run_receipt=run_receipt_data,
-        )
-    finally:
-        if staging_dir.exists():
-            shutil.rmtree(staging_dir)
+            for artifact_name, payload in progress["payloads"].items():
+                staged_path = staged_paths[artifact_name]
+                if staged_path.suffix == ".npz":
+                    np.savez_compressed(staged_path, **payload)
+                else:
+                    _write_json(staged_path, payload)
+            staged_config_path = staging_dir / "localization_config.json"
+            _write_json(staged_config_path, config_snapshot)
+            config_snapshot_record = {
+                "path": str((output_dir / "localization_config.json").resolve()),
+                "source_config_path": config_snapshot["source_config_path"],
+                "canonical_sha256": config_snapshot["canonical_sha256"],
+                "file_sha256": file_sha256(staged_config_path),
+            }
+            _write_json(staged_paths["result"], result)
+            artifact_records = {
+                artifact_name: _staged_record(
+                    staged_paths[artifact_name], output_dir / filename
+                )
+                for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
+            }
+            localization_manifest = {
+                "schema_version": 7 if config["scene"].get("max_diffractions", 0) else 6,
+                "workflow": workflow_for_config(config),
+                "stage": "localization",
+                "run_id": localization_run_id,
+                "generation_bundle": {
+                    "bundle_id": bundle_id,
+                    "manifest": generation_manifest_record,
+                },
+                "config_snapshot": config_snapshot_record,
+                "scene_input": str(scene_path),
+                "online_measurement_input": str(online_path),
+                "truth_was_loaded": False,
+                "truth_access": {
+                    "truth_file_content_loaded": False,
+                    "generation_manifest_truth_metadata_visible": True,
+                    "note": "生成清单整体可见，但定位未打开真值文件或使用真值内容",
+                },
+                "result": artifact_records["result"]["path"],
+                "inputs": {
+                    "scene": scene_input_record,
+                    "online_measurement": online_input_record,
+                },
+                "artifacts": artifact_records,
+                "evaluation_pending": True,
+            }
+            _write_json(
+                staging_dir / "localization_manifest.json", localization_manifest
+            )
+            _verify_staged_localization(staging_dir, output_dir, localization_manifest)
+            run_receipt_data = (
+                {
+                    "run_id": localization_run_id,
+                    "result": artifact_records["result"],
+                    "manifest": {
+                        "path": str(
+                            (output_dir / "localization_manifest.json").resolve()
+                        ),
+                        "sha256": file_sha256(
+                            staging_dir / "localization_manifest.json"
+                        ),
+                    },
+                }
+                if run_receipt_path is not None
+                else None
+            )
+            _publish_staged_localization(
+                root=root,
+                staging_dir=staging_dir,
+                output_dir=output_dir,
+                remove_fixed_metrics=remove_fixed_metrics,
+                run_receipt_path=run_receipt_path,
+                run_receipt=run_receipt_data,
+            )
+        finally:
+            if staging_dir.exists():
+                shutil.rmtree(staging_dir)
+    mark("files_published")
     return result
 
 

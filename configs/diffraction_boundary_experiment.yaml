@@ -1,0 +1,19 @@
+# ======================= 实验参数区 =======================
+generation_config: diffraction_boundary_generation.yaml
+channel_backend: sionna
+pilot_ue_count: 30
+formal_ue_count: 300
+noise_repeats: 5
+random_seed: 20260911
+max_proposals: 100000
+# 超过预算仍记为实验结果，不换 UE。正式实验与预跑使用相同预算。
+trial_timeout_s: 600.0
+warmup_per_strategy: 5
+# 持久化计时现场，硬超时后仍可查看最后阶段；写盘开销另列并计入真实总用时。
+timing_snapshots: true
+plots: true
+legal_region:
+  wall_clearance_m: 0.5
+  bs_min_distance_m: 2.0
+# 默认：固定地图范围内、离墙和 BS 足够远、原始网格顶面不覆盖的露天位置。
+# 可在 legal_region 下增加 include_polygons / exclude_polygons，顶点为 [x,y]。

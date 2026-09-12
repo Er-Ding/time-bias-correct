@@ -447,6 +447,25 @@ def test_sionna_planar_filter_preserves_absolute_delay() -> None:
     assert np.allclose(metadata["absolute_delays_s"], [10e-9, 20e-9, 30e-9])
 
 
+@pytest.mark.parametrize("max_diffractions,expected", [
+    (0, [True, True, False, False, False, False]),
+    (1, [True, True, True, True, False, False]),
+])
+def test_sionna_filters_by_interaction_type_and_excludes_multiple_diffractions(max_diffractions, expected):
+    paths = FakePaths()
+    paths._a = np.ones((1, 2, 1, 1, 6, 1), dtype=complex)
+    paths._tau = np.arange(1, 7).reshape(1, 1, 6) * 10e-9
+    paths.vertices = np.zeros((2, 1, 1, 6, 3))
+    paths.vertices[..., 2] = 1.5
+    paths.interactions = np.asarray([[0, 1, 8, 1, 8, 2], [0, 0, 0, 8, 8, 0]]).reshape(2, 1, 1, 6)
+    paths.phi_r = np.zeros((1, 1, 6))
+    _, metadata = extract_planar_uplink_csi(paths, np.array([0., 1e6]), fixed_height_m=1.5,
+        vertical_tolerance_m=.1, max_reflections=1, max_diffractions=max_diffractions)
+    assert metadata["retained_mask"].tolist() == expected
+    assert metadata["reflection_order"].tolist() == [0, 1, 0, 1, 0, 0]
+    assert metadata["diffraction_order"].tolist() == [0, 0, 1, 1, 2, 0]
+
+
 def test_sionna_front_filter_uses_boresight_and_records_both_counts(tmp_path) -> None:
     paths = FakePaths()
     # 让三条路径都先通过二维高度筛选；相对 30° 阵列朝向，它们的局部角是

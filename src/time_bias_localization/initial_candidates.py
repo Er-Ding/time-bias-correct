@@ -29,7 +29,7 @@ _ENDPOINT_TOLERANCE_M = 1e-7
 
 @dataclass(frozen=True)
 class InitialCandidatePoint:
-    """一次角度/时延采样在参考偏差下的实际终点，不含候选轨迹。"""
+    """角度/时延采样的一种传播解释在参考偏差下的实际终点。"""
 
     observation_id: str
     sample_id: str
@@ -45,6 +45,17 @@ class InitialCandidatePoint:
     endpoint_direction: tuple[float, float]
     endpoint_free_distance_m: float
     weight: float = 1.0
+    propagation_interactions: tuple[tuple[str, str], ...] = ()
+    interaction_points_m: tuple[tuple[float, float], ...] = ()
+    parent_sample_id: str | None = None
+
+    @property
+    def interactions(self) -> tuple[tuple[str, str], ...]:
+        return self.propagation_interactions or tuple(("reflection", key) for key in self.reflection_wall_ids)
+
+    @property
+    def has_diffraction(self) -> bool:
+        return any(kind == "diffraction" for kind, _ in self.interactions)
 
     def __post_init__(self) -> None:
         for name in ("position_m", "endpoint_origin_m", "endpoint_direction"):
@@ -63,6 +74,18 @@ class InitialCandidatePoint:
             raise ValueError("末段可用长度和权重必须为正数")
         if len(self.reflection_wall_ids) != len(self.reflection_points_m):
             raise ValueError("反射墙数量必须与反射点数量一致")
+        if self.propagation_interactions:
+            if len(self.propagation_interactions) != len(self.interaction_points_m):
+                raise ValueError("完整传播顺序必须与交互点一一对应")
+            if any(kind not in {"reflection", "diffraction"} or not key
+                   for kind, key in self.propagation_interactions):
+                raise ValueError("传播类型只允许 reflection 和 diffraction，编号不能为空")
+            if tuple(key for kind, key in self.interactions if kind == "reflection") != self.reflection_wall_ids:
+                raise ValueError("完整传播顺序中的反射墙与反射字段不一致")
+            if sum(kind == "diffraction" for kind, _ in self.interactions) > 1:
+                raise ValueError("当前只支持最多一次绕射")
+            if not np.all(np.isfinite(np.asarray(self.interaction_points_m, dtype=float))):
+                raise ValueError("传播交互点必须为有限坐标")
 
 
 @dataclass(frozen=True)
@@ -84,8 +107,8 @@ class RepresentativeCandidatePoint:
     def __post_init__(self) -> None:
         if not self.members or self.point not in self.members:
             raise ValueError("代表点必须是非空点簇中的真实成员")
-        key = (self.point.observation_id, self.point.reflection_wall_ids, self.point.reference_bias_s)
-        if any((member.observation_id, member.reflection_wall_ids, member.reference_bias_s) != key
+        key = (self.point.observation_id, self.point.interactions, self.point.reference_bias_s)
+        if any((member.observation_id, member.interactions, member.reference_bias_s) != key
                for member in self.members):
             raise ValueError("点簇成员必须来自同一观测、反射墙序列和参考 bias")
 
@@ -120,6 +143,9 @@ def _distance_to_scene_exit(scene: Scene2D, origin: np.ndarray, direction: np.nd
     return float(max(0.0, min(distances))) if distances else 0.0
 
 
+from .timing import stage
+
+
 def generate_initial_candidate_points(
     scene: Scene2D,
     bs_position_m: Sequence[float],
@@ -129,8 +155,14 @@ def generate_initial_candidate_points(
     max_reflections: int = 2,
     backend: str = "numpy",
     wall_chunk_size: int = 8192,
+    max_diffractions: int = 0,
+    diffraction_directions_per_sample: int = 4,
+    diffraction_angle_tolerance_deg: float = 3.0,
 ) -> InitialCandidateGenerationResult:
-    """每次采样沿反向射线走完参考传播长度，只生成一个初始位置点。
+    """按参考传播长度反向追踪；默认每次采样生成一个镜面路径终点。
+
+    开启绕射时，另加入匹配边缘前缀和扇面方向形成的候选，保存采样来源与
+    完整传播顺序。分支类型是地图解释，不是对观测传播机制的真值判断。
 
     先后经过的墙只在射线确实到达墙面后计入反射。终点恰落在墙面、地图
     边界或反向段起点（容差 1e-7 米）时拒绝，避免零长末段的歧义。
@@ -145,6 +177,9 @@ def generate_initial_candidate_points(
         raise ValueError("reference_bias_s 必须为有限数")
     if backend not in {"numpy", "reference"}:
         raise ValueError("初始点反向追踪 backend 只能为 numpy 或 reference")
+    if isinstance(max_diffractions, (bool, np.bool_)) or max_diffractions not in (0, 1):
+        raise ValueError("当前只支持 0 或 1 次绕射")
+    samples = list(samples)
     bs = np.asarray(bs_position_m, dtype=float)
     if bs.shape != (2,) or not np.all(np.isfinite(bs)) or not scene.contains(bs):
         raise ValueError("bs_position_m 必须是场景内的有限二维坐标")
@@ -158,87 +193,88 @@ def generate_initial_candidate_points(
     accepted_counts: dict[str, int] = {}
     rejection_counts: dict[str, int] = {}
     seen: set[tuple[str, str]] = set()
-    for sample in samples:
-        key = (sample.observation_id, sample.sample_id)
-        if key in seen:
-            raise ValueError(f"同一观测内的 sample_id 不能重复：{key}")
-        seen.add(key)
-        sample_counts[sample.observation_id] = sample_counts.get(sample.observation_id, 0) + 1
-        target_length = float((sample.delay_s - reference_bias_s) * SPEED_OF_LIGHT_M_S)
-        direction = np.asarray([math.cos(sample.aoa_global_rad), math.sin(sample.aoa_global_rad)])
-        direction /= np.linalg.norm(direction)
-        origin = bs.copy()
-        prefix = 0.0
-        walls: list[str] = []
-        reflection_points: list[tuple[float, float]] = []
-        reason = "nonpositive_reference_length" if target_length <= _ENDPOINT_TOLERANCE_M else None
-        if reason is None:
-            for reflection_order in range(max_reflections + 1):
-                hit = (
-                    _nearest_wall(scene, origin, direction)
-                    if intersector is None else intersector.nearest(origin, direction)
-                )
-                boundary_distance = _distance_to_scene_exit(scene, origin, direction)
-                hit_inside_scene = hit is not None and hit[0] <= boundary_distance + _ENDPOINT_TOLERANCE_M
-                free_distance = min(float(hit[0]), boundary_distance) if hit_inside_scene else boundary_distance
-                remaining = target_length - prefix
-                if remaining <= _ENDPOINT_TOLERANCE_M:
-                    reason = "endpoint_on_segment_origin"
-                    break
-                if remaining < free_distance - _ENDPOINT_TOLERANCE_M:
-                    endpoint = origin + remaining * direction
-                    if np.linalg.norm(endpoint - bs) <= _ENDPOINT_TOLERANCE_M:
-                        reason = "endpoint_at_bs"
-                        break
-                    point = InitialCandidatePoint(
-                        observation_id=sample.observation_id,
-                        sample_id=sample.sample_id,
-                        topology_id="los" if not walls else "-".join(walls),
-                        reference_bias_s=float(reference_bias_s),
-                        position_m=(float(endpoint[0]), float(endpoint[1])),
-                        reflection_wall_ids=tuple(walls),
-                        reflection_points_m=tuple(reflection_points),
-                        observed_aoa_global_rad=float(sample.aoa_global_rad),
-                        observed_delay_s=float(sample.delay_s),
-                        prefix_length_m=float(prefix),
-                        endpoint_origin_m=(float(origin[0]), float(origin[1])),
-                        endpoint_direction=(float(direction[0]), float(direction[1])),
-                        endpoint_free_distance_m=float(free_distance),
-                        weight=float(sample.weight),
+    with stage("T08_specular"):
+        for sample in samples:
+            key = (sample.observation_id, sample.sample_id)
+            if key in seen:
+                raise ValueError(f"同一观测内的 sample_id 不能重复：{key}")
+            seen.add(key)
+            sample_counts[sample.observation_id] = sample_counts.get(sample.observation_id, 0) + 1
+            target_length = float((sample.delay_s - reference_bias_s) * SPEED_OF_LIGHT_M_S)
+            direction = np.asarray([math.cos(sample.aoa_global_rad), math.sin(sample.aoa_global_rad)])
+            direction /= np.linalg.norm(direction)
+            origin = bs.copy()
+            prefix = 0.0
+            walls: list[str] = []
+            reflection_points: list[tuple[float, float]] = []
+            reason = "nonpositive_reference_length" if target_length <= _ENDPOINT_TOLERANCE_M else None
+            if reason is None:
+                for reflection_order in range(max_reflections + 1):
+                    hit = (
+                        _nearest_wall(scene, origin, direction)
+                        if intersector is None else intersector.nearest(origin, direction)
                     )
-                    points.append(point)
-                    accepted_counts[sample.observation_id] = accepted_counts.get(sample.observation_id, 0) + 1
-                    break
-                if remaining <= free_distance + _ENDPOINT_TOLERANCE_M:
-                    reason = "endpoint_on_wall" if hit_inside_scene else "endpoint_on_scene_boundary"
-                    break
-                if not hit_inside_scene:
-                    reason = "leaves_scene_before_endpoint"
-                    break
-                if reflection_order == max_reflections:
-                    reason = "exceeds_max_reflections"
-                    break
-                assert hit is not None
-                distance, wall, reflection_point = hit
-                prefix += distance
-                walls.append(wall.wall_id)
-                reflection_points.append((float(reflection_point[0]), float(reflection_point[1])))
-                origin = reflection_point
-                direction = reflect_direction(direction, wall)
-        if reason is not None:
-            rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
-            rejected.append({
-                "observation_id": sample.observation_id,
-                "sample_id": sample.sample_id,
-                "reference_bias_s": float(reference_bias_s),
-                "observed_aoa_global_rad": float(sample.aoa_global_rad),
-                "observed_delay_s": float(sample.delay_s),
-                "reference_path_length_m": target_length,
-                "completed_prefix_length_m": float(prefix),
-                "reflection_wall_ids": list(walls),
-                "reason": reason,
-            })
-    return InitialCandidateGenerationResult(points=points, rejected_samples=rejected, diagnostics={
+                    boundary_distance = _distance_to_scene_exit(scene, origin, direction)
+                    hit_inside_scene = hit is not None and hit[0] <= boundary_distance + _ENDPOINT_TOLERANCE_M
+                    free_distance = min(float(hit[0]), boundary_distance) if hit_inside_scene else boundary_distance
+                    remaining = target_length - prefix
+                    if remaining <= _ENDPOINT_TOLERANCE_M:
+                        reason = "endpoint_on_segment_origin"
+                        break
+                    if remaining < free_distance - _ENDPOINT_TOLERANCE_M:
+                        endpoint = origin + remaining * direction
+                        if np.linalg.norm(endpoint - bs) <= _ENDPOINT_TOLERANCE_M:
+                            reason = "endpoint_at_bs"
+                            break
+                        point = InitialCandidatePoint(
+                            observation_id=sample.observation_id,
+                            sample_id=sample.sample_id,
+                            topology_id="los" if not walls else "-".join(walls),
+                            reference_bias_s=float(reference_bias_s),
+                            position_m=(float(endpoint[0]), float(endpoint[1])),
+                            reflection_wall_ids=tuple(walls),
+                            reflection_points_m=tuple(reflection_points),
+                            observed_aoa_global_rad=float(sample.aoa_global_rad),
+                            observed_delay_s=float(sample.delay_s),
+                            prefix_length_m=float(prefix),
+                            endpoint_origin_m=(float(origin[0]), float(origin[1])),
+                            endpoint_direction=(float(direction[0]), float(direction[1])),
+                            endpoint_free_distance_m=float(free_distance),
+                            weight=float(sample.weight),
+                        )
+                        points.append(point)
+                        accepted_counts[sample.observation_id] = accepted_counts.get(sample.observation_id, 0) + 1
+                        break
+                    if remaining <= free_distance + _ENDPOINT_TOLERANCE_M:
+                        reason = "endpoint_on_wall" if hit_inside_scene else "endpoint_on_scene_boundary"
+                        break
+                    if not hit_inside_scene:
+                        reason = "leaves_scene_before_endpoint"
+                        break
+                    if reflection_order == max_reflections:
+                        reason = "exceeds_max_reflections"
+                        break
+                    assert hit is not None
+                    distance, wall, reflection_point = hit
+                    prefix += distance
+                    walls.append(wall.wall_id)
+                    reflection_points.append((float(reflection_point[0]), float(reflection_point[1])))
+                    origin = reflection_point
+                    direction = reflect_direction(direction, wall)
+            if reason is not None:
+                rejection_counts[reason] = rejection_counts.get(reason, 0) + 1
+                rejected.append({
+                    "observation_id": sample.observation_id,
+                    "sample_id": sample.sample_id,
+                    "reference_bias_s": float(reference_bias_s),
+                    "observed_aoa_global_rad": float(sample.aoa_global_rad),
+                    "observed_delay_s": float(sample.delay_s),
+                    "reference_path_length_m": target_length,
+                    "completed_prefix_length_m": float(prefix),
+                    "reflection_wall_ids": list(walls),
+                    "reason": reason,
+                })
+    diagnostics = {
         "reference_bias_s": float(reference_bias_s),
         "reference_bias_source": "configured_reference_not_estimate_or_ground_truth",
         "input_sample_count": len(seen),
@@ -253,7 +289,27 @@ def generate_initial_candidate_points(
         "one_point_per_sample": True,
         "builds_bias_trajectories": False,
         "backend": backend,
-    })
+    }
+    if max_diffractions:
+        from .diffraction_candidates import generate_diffraction_points
+        with stage("T08_diffraction"):
+            extra, diffraction_diagnostics = generate_diffraction_points(
+                scene, bs, samples, reference_bias_s=reference_bias_s,
+                max_reflections=max_reflections, directions_per_sample=diffraction_directions_per_sample,
+                angle_tolerance_deg=diffraction_angle_tolerance_deg,
+            )
+        points.extend(extra)
+        diagnostics.update({
+            "one_point_per_sample": False,
+            "specular_branch_rejected_count": len(rejected),
+            "rejected_sample_semantics": "rejected_specular_branch_not_all_hypotheses",
+            "initial_point_count": len(points), "diffraction": diffraction_diagnostics,
+            "max_diffractions": 1,
+            "observation_initial_point_counts": {
+                key: sum(p.observation_id == key for p in points) for key in sample_counts
+            },
+        })
+    return InitialCandidateGenerationResult(points=points, rejected_samples=rejected, diagnostics=diagnostics)
 
 
 @dataclass(frozen=True)
@@ -269,16 +325,20 @@ class InitialCandidateClusteringResult:
 def cluster_initial_candidate_points(
     points: Sequence[InitialCandidatePoint], *, position_radius_m: float = 1.5,
     min_samples: int = 5, return_diagnostics: bool = False,
+    diffraction_coverage_distance_m: float = 1.0,
+    diffraction_representative_policy: str = "coverage",
+    beta_interval_m: tuple[float, float] | None = None,
 ) -> list[RepresentativeCandidatePoint] | InitialCandidateClusteringResult:
-    """同一来源峰、同一墙序列内，对参考位置进行确定性 DBSCAN 聚类。
+    """同一来源峰、完整传播顺序内，对参考位置进行确定性 DBSCAN 聚类。
 
     ``position_radius_m`` 保留原参数名，但现在表示邻近距离 eps，不限制整簇
     的最大跨度。邻域内点数包含自身；达到 ``min_samples`` 的点为核心点，
     核心点通过相邻关系连接成簇。非核心点只归入最近核心点所在的簇；距离
     并列时按簇最小 sample_id 选择，不能通过边界点连接两个核心簇。
 
-    密度只计等权样本数量，不使用谱值。每簇代表仍为加权距离和最小的真实
-    成员；并列按 sample_id。离群点不生成代表，开启 return_diagnostics
+    密度只计等权候选点数量，不使用谱值。镜面簇代表为加权距离和最小的真实
+    成员；并列按 sample_id。绕射簇以该成员开始按覆盖距离补充实际代表，
+    并补足整个合法偏差区间的成员覆盖。离群点不生成代表，开启 return_diagnostics
     可取得核心点、边界点、离群点及全部成员归属。方向与轨迹不参与聚类。
     """
 
@@ -289,10 +349,12 @@ def cluster_initial_candidate_points(
     if (isinstance(min_samples, (bool, np.bool_))
             or not isinstance(min_samples, (int, np.integer)) or min_samples <= 0):
         raise ValueError("min_samples 必须为正整数，包含点自身，不能为布尔值")
+    if diffraction_representative_policy not in {"single", "coverage"}:
+        raise ValueError("绕射代表策略必须为 single 或 coverage")
     references = {point.reference_bias_s for point in points}
     if len(references) > 1:
         raise ValueError("同一轮初始点必须使用相同 reference_bias_s")
-    grouped: dict[tuple[str, tuple[str, ...]], list[InitialCandidatePoint]] = {}
+    grouped: dict[tuple[str, tuple[tuple[str, str], ...]], list[InitialCandidatePoint]] = {}
     valid_samples: dict[str, set[str]] = {}
     seen: set[tuple[str, str]] = set()
     for point in points:
@@ -300,88 +362,124 @@ def cluster_initial_candidate_points(
         if key in seen:
             raise ValueError(f"初始点 sample_id 重复：{key}")
         seen.add(key)
-        grouped.setdefault((point.observation_id, point.reflection_wall_ids), []).append(point)
+        grouped.setdefault((point.observation_id, point.interactions), []).append(point)
         valid_samples.setdefault(point.observation_id, set()).add(point.sample_id)
 
     representatives: list[RepresentativeCandidatePoint] = []
     noise_points: list[InitialCandidatePoint] = []
     memberships: list[dict[str, Any]] = []
     group_summaries: list[dict[str, Any]] = []
-    for (observation_id, wall_ids), group in sorted(grouped.items()):
-        group = sorted(group, key=lambda point: point.sample_id)
-        positions = np.asarray([point.position_m for point in group])
-        distances = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2)
-        neighbors = distances <= position_radius_m
-        neighbor_counts = np.sum(neighbors, axis=1)
-        core_mask = neighbor_counts >= min_samples
-        labels = np.full(len(group), -1, dtype=int)
-        core_components: list[list[int]] = []
-        # 只遍历核心点之间的边，边界点不能把两团核心点连接起来。
-        for seed in np.flatnonzero(core_mask):
-            if labels[seed] != -1:
-                continue
-            label = len(core_components)
-            labels[seed] = label
-            pending = [int(seed)]
-            component: list[int] = []
-            while pending:
-                index = pending.pop()
-                component.append(index)
-                adjacent = np.flatnonzero(neighbors[index] & core_mask & (labels == -1))
-                labels[adjacent] = label
-                pending.extend(int(item) for item in adjacent)
-            core_components.append(sorted(component))
-        core_indices = np.flatnonzero(core_mask)
-        for index in np.flatnonzero(~core_mask):
-            adjacent = core_indices[neighbors[index, core_indices]]
-            if len(adjacent):
-                # 最小核心距离优先；同距时簇序已由稳定的 sample_id 决定。
-                nearest = min(adjacent, key=lambda item: (distances[index, item], labels[item]))
-                labels[index] = labels[nearest]
+    cluster_count = 0
+    for (observation_id, interactions), group in sorted(grouped.items()):
+        with stage("T09_dbscan"):
+            wall_ids = tuple(key for kind, key in interactions if kind == "reflection")
+            group = sorted(group, key=lambda point: point.sample_id)
+            positions = np.asarray([point.position_m for point in group])
+            distances = np.linalg.norm(positions[:, None, :] - positions[None, :, :], axis=2)
+            neighbors = distances <= position_radius_m
+            neighbor_counts = np.sum(neighbors, axis=1)
+            core_mask = neighbor_counts >= min_samples
+            labels = np.full(len(group), -1, dtype=int)
+            core_components: list[list[int]] = []
+            # 只遍历核心点之间的边，边界点不能把两团核心点连接起来。
+            for seed in np.flatnonzero(core_mask):
+                if labels[seed] != -1:
+                    continue
+                label = len(core_components)
+                labels[seed] = label
+                pending = [int(seed)]
+                component: list[int] = []
+                while pending:
+                    index = pending.pop()
+                    component.append(index)
+                    adjacent = np.flatnonzero(neighbors[index] & core_mask & (labels == -1))
+                    labels[adjacent] = label
+                    pending.extend(int(item) for item in adjacent)
+                core_components.append(sorted(component))
+            core_indices = np.flatnonzero(core_mask)
+            for index in np.flatnonzero(~core_mask):
+                adjacent = core_indices[neighbors[index, core_indices]]
+                if len(adjacent):
+                    # 最小核心距离优先；同距时簇序已由稳定的 sample_id 决定。
+                    nearest = min(adjacent, key=lambda item: (distances[index, item], labels[item]))
+                    labels[index] = labels[nearest]
 
         candidate_ids: dict[int, str] = {}
+        representative_samples: dict[int, set[str]] = {}
         for component_index in range(len(core_components)):
-            component = np.flatnonzero(labels == component_index)
-            members = tuple(group[index] for index in component)
-            member_distances = distances[np.ix_(component, component)]
-            weights = np.asarray([member.weight for member in members], dtype=float)
-            weights /= np.max(weights)
-            weights /= np.sum(weights)
-            representative = members[int(np.argmin(member_distances @ weights))]
-            # 墙编号自身允许含 '-'，不能靠拼接墙编号保证候选 ID 唯一。
-            candidate_id = f"{observation_id}:point_cluster_{len(representatives):06d}"
-            candidate_ids[component_index] = candidate_id
-            core_sample_ids = [group[index].sample_id for index in component if core_mask[index]]
-            border_sample_ids = [group[index].sample_id for index in component if not core_mask[index]]
-            metadata = {
-                "topology_id": representative.topology_id,
-                "reflection_wall_ids": list(representative.reflection_wall_ids),
-                "raw_count": len(members),
-                "source_sample_ids": [member.sample_id for member in members],
-                "representative_sample_id": representative.sample_id,
-                "reference_bias_s": float(representative.reference_bias_s),
-                "initial_position_m": list(representative.position_m),
-                "representative_rule": "weighted_medoid_actual_member",
-                "cluster_algorithm": "dbscan",
-                "cluster_distance_rule": "euclidean_at_reference_bias",
-                "cluster_linkage_rule": "density_connected_core_points_with_border_assignment",
-                "position_radius_m": float(position_radius_m),
-                "eps_m": float(position_radius_m),
-                "min_samples": int(min_samples),
-                "min_samples_includes_self": True,
-                "density_weighting": "equal_sample_counts",
-                "core_sample_ids": core_sample_ids,
-                "border_sample_ids": border_sample_ids,
-                "core_point_count": len(core_sample_ids),
-                "border_point_count": len(border_sample_ids),
-                "maximum_member_point_distance_m": float(np.max(member_distances)),
-                "uses_trajectory_distance": False,
-                "uses_direction_threshold": False,
-                "observation_valid_sample_count": len(valid_samples[observation_id]),
-                "empirical_frequency": len(members) / len(valid_samples[observation_id]),
-                "empirical_frequency_denominator": "distinct_samples_with_valid_initial_point",
-            }
-            representatives.append(RepresentativeCandidatePoint(candidate_id, representative, members, metadata))
+            with stage("T10_representatives"):
+                component = np.flatnonzero(labels == component_index)
+                members = tuple(group[index] for index in component)
+                member_distances = distances[np.ix_(component, component)]
+                weights = np.asarray([member.weight for member in members], dtype=float)
+                weights /= np.max(weights)
+                weights /= np.sum(weights)
+                representative = members[int(np.argmin(member_distances @ weights))]
+                # 墙编号自身允许含 '-'，不能靠拼接墙编号保证候选 ID 唯一。
+                candidate_id = f"{observation_id}:point_cluster_{cluster_count:06d}"
+                cluster_count += 1
+                candidate_ids[component_index] = candidate_id
+                core_sample_ids = [group[index].sample_id for index in component if core_mask[index]]
+                border_sample_ids = [group[index].sample_id for index in component if not core_mask[index]]
+                metadata = {
+                    "topology_id": representative.topology_id,
+                    "reflection_wall_ids": list(representative.reflection_wall_ids),
+                    "raw_count": len(members),
+                    "source_sample_ids": [member.sample_id for member in members],
+                    "representative_sample_id": representative.sample_id,
+                    "reference_bias_s": float(representative.reference_bias_s),
+                    "initial_position_m": list(representative.position_m),
+                    "representative_rule": "weighted_medoid_actual_member",
+                    "cluster_algorithm": "dbscan",
+                    "cluster_distance_rule": "euclidean_at_reference_bias",
+                    "cluster_linkage_rule": "density_connected_core_points_with_border_assignment",
+                    "position_radius_m": float(position_radius_m),
+                    "eps_m": float(position_radius_m),
+                    "min_samples": int(min_samples),
+                    "min_samples_includes_self": True,
+                    "density_weighting": "equal_sample_counts",
+                    "core_sample_ids": core_sample_ids,
+                    "border_sample_ids": border_sample_ids,
+                    "core_point_count": len(core_sample_ids),
+                    "border_point_count": len(border_sample_ids),
+                    "maximum_member_point_distance_m": float(np.max(member_distances)),
+                    "uses_trajectory_distance": False,
+                    "uses_direction_threshold": False,
+                    "observation_valid_sample_count": len(valid_samples[observation_id]),
+                    "empirical_frequency": len(members) / len(valid_samples[observation_id]),
+                    "empirical_frequency_denominator": "distinct_samples_with_valid_initial_point",
+                }
+                if representative.has_diffraction:
+                    if beta_interval_m is None:
+                        raise ValueError("绕射簇代表选择必须提供 beta_interval_m 检查移动后的覆盖")
+                    from .representative_cover import select_cover_members
+                    if diffraction_representative_policy == "coverage":
+                        selected_indices, coverage = select_cover_members(
+                            members, members.index(representative), diffraction_coverage_distance_m, beta_interval_m,
+                        )
+                    else:
+                        selected_indices, coverage = [members.index(representative)], {
+                            "covers_full_bias_interval": False,
+                        }
+                    metadata.update(coverage)
+                    metadata.update({
+                        "representative_rule": ("farthest_actual_members_then_complete_bias_interval_coverage"
+                            if diffraction_representative_policy == "coverage" else "weighted_medoid_actual_member"),
+                        "diffraction_representative_policy": diffraction_representative_policy,
+                        "point_cluster_id": candidate_id,
+                        "propagation_interactions": [list(item) for item in interactions],
+                        "representative_count": len(selected_indices),
+                        "empirical_frequency_denominator": "generated_candidate_count_not_independent_observations",
+                    })
+                else:
+                    selected_indices = [members.index(representative)]
+                representative_samples[component_index] = {members[index].sample_id for index in selected_indices}
+                for rank, index in enumerate(selected_indices):
+                    member = members[index]
+                    member_metadata = {**metadata, "representative_sample_id": member.sample_id,
+                                       "initial_position_m": list(member.position_m)}
+                    representative_id = (f"{candidate_id}:rep_{rank:04d}" if member.has_diffraction else candidate_id)
+                    representatives.append(RepresentativeCandidatePoint(representative_id, member, members, member_metadata))
         for index, point in enumerate(group):
             label = int(labels[index])
             role = "core" if core_mask[index] else "border" if label >= 0 else "noise"
@@ -397,9 +495,9 @@ def cluster_initial_candidate_points(
                 "candidate_id": candidate_ids.get(label),
                 "role": role,
                 "neighbor_count": int(neighbor_counts[index]),
-                "is_representative": label >= 0 and point.sample_id == representatives[
-                    len(representatives) - len(core_components) + label
-                ].point.sample_id,
+                "is_representative": point.sample_id in representative_samples.get(label, set()),
+                **({"propagation_interactions": [list(item) for item in point.interactions],
+                    "parent_sample_id": point.parent_sample_id} if point.has_diffraction else {}),
             })
         group_summaries.append({
             "observation_id": observation_id,
@@ -420,10 +518,13 @@ def cluster_initial_candidate_points(
         "min_samples_includes_self": True,
         "density_weighting": "equal_sample_counts",
         "border_assignment_rule": "nearest_core_then_stable_component_order",
-        "grouping_rule": "same_observation_and_full_reflection_wall_sequence",
+        "grouping_rule": ("same_observation_and_full_typed_interaction_sequence"
+                          if any(point.has_diffraction for point in points) else
+                          "same_observation_and_full_reflection_wall_sequence"),
         "reference_bias_s": float(next(iter(references))) if references else None,
         "input_point_count": len(points),
-        "cluster_count": len(representatives),
+        "cluster_count": cluster_count,
+        "representative_count": len(representatives),
         "core_point_count": sum(row["role"] == "core" for row in memberships),
         "border_point_count": sum(row["role"] == "border" for row in memberships),
         "noise_point_count": len(noise_points),
@@ -474,9 +575,12 @@ def build_representative_trajectories(
         anchor = position + reference_beta * direction
         physical_max = reference_beta + remaining
         physical_min = physical_max - point.endpoint_free_distance_m
+        if point.has_diffraction:
+            physical_min += _ENDPOINT_TOLERANCE_M
+            physical_max -= _ENDPOINT_TOLERANCE_M
         metadata = dict(representative.metadata)
         metadata.update({
-            "point_cluster_id": representative.candidate_id,
+            "point_cluster_id": metadata.get("point_cluster_id", representative.candidate_id),
             "initial_position_m": list(point.position_m),
             "reference_bias_s": float(point.reference_bias_s),
             "representative_sample_id": point.sample_id,
@@ -492,6 +596,10 @@ def build_representative_trajectories(
             "initial_point": asdict(point),
             "members": [asdict(member) for member in representative.members],
         })
+        if point.has_diffraction:
+            metadata["propagation_interactions"] = [list(item) for item in point.interactions]
+            metadata["interaction_points_m"] = [list(p) for p in point.interaction_points_m]
+            metadata["trajectory_topology_policy"] = "fixed_to_reference_point_full_interaction_sequence"
         trajectories.append(CandidateTrajectory(
             observation_id=point.observation_id,
             candidate_id=representative.candidate_id,

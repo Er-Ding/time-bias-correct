@@ -1,0 +1,73 @@
+# 固定的公开场景与 OFDM 参数。正式实验沿用预跑参数；如需调参，请新建实验目录重新预跑。
+project:
+  random_seed: 20260911
+compute:
+  # CUDA_VISIBLE_DEVICES 由启动脚本按用户选择设置；0 表示所选列表中的第一张卡。
+  backend: cuda
+  device_id: 0
+  batch_size: 4
+  angle_chunk_size: 32
+scene:
+  source: sionna_builtin
+  name: munich
+  bounds_m: [-100.0, 160.0, -80.0, 180.0]
+  localization_bounds_m: [-100.0, 160.0, -80.0, 180.0]
+  fixed_height_m: 1.5
+  bev_resolution_m: 0.10
+  max_reflections: 2
+  max_diffractions: 1
+  vertical_path_tolerance_m: 0.10
+radio:
+  carrier_hz: 3.5e9
+  bandwidth_hz: 400.0e6
+  num_subcarriers: 512
+  num_bs_antennas: 12
+  antenna_spacing_wavelength: 0.5
+  bs_boresight_deg: -45.0
+  front_facing_only: true
+  num_snapshots: 1
+  snr_db: 35.0
+simulation:
+  bs_position_m: [20.0, 50.0]
+  # 仅满足生成配置格式；实验程序使用冻结随机采样位置，不用此示例位置选点。
+  ue_position_m: [50.0, 50.0]
+  clock_bias_s: 25.0e-9
+  samples_per_source: 2000000
+  max_num_paths_per_source: 100000
+music:
+  num_paths: 3
+  signal_subspace_rank: 6
+  angle_min_deg: -89.0
+  angle_max_deg: 89.0
+  angle_step_deg: 1.0
+  delay_min_s: 0.0
+  delay_max_s: 1150.0e-9
+  delay_step_s: 1.0e-9
+  min_angle_separation_deg: 5.0
+  min_delay_separation_s: 3.0e-9
+  spectrum_sampling:
+    samples_per_peak: 128
+    aoa_half_width_grid_steps: 1.5
+    delay_half_width_grid_steps: 1.5
+    local_grid_points_per_axis: 25
+    spectrum_power: 1.0
+    uniform_mixture: 0.1
+    include_nominal: true
+  spatial_subarray_size: 8
+  frequency_subarray_size: 64
+  diagonal_loading: 1.0e-8
+localization:
+  bias_min_s: -80.0e-9
+  bias_max_s: 80.0e-9
+  initial_reference_bias_s: 0.0
+  candidate_cluster_radius_m: 1.5
+  candidate_cluster_min_samples: 5
+  diffraction_directions_per_sample: 4
+  diffraction_angle_tolerance_deg: 3.0
+  diffraction_coverage_distance_m: 1.0
+  diffraction_representative_policy: coverage
+  huber_delta_m: 0.75
+  max_iterations: 20
+  max_seed_pairs: 100000
+output:
+  root: outputs/diffraction_boundary
