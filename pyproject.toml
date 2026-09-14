@@ -12,6 +12,7 @@ dependencies = [
   "numpy>=1.26",
   "Pillow>=10",
   "PyYAML>=6",
+  "scipy>=1.11",
 ]
 
 [project.optional-dependencies]

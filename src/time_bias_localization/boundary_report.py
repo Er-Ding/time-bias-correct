@@ -14,11 +14,13 @@ from typing import Any, Iterable
 import numpy as np
 
 from .visualization import _plotting, _save, write_json
+from .localization_status import NO_POSITION_STATUSES
 
 
 STAGE_LABELS = {
     "T01_covariance": "CSI 整理与协方差",
     "T02_subspace": "子空间计算",
+    "T02_path_detection": "CSI 残差检验与路径验收",
     "T03_coarse_spectrum": "粗 MUSIC 谱",
     "T04_coarse_peaks": "粗谱找峰",
     "T05_fine_spectrum": "局部细 MUSIC 谱",
@@ -32,6 +34,12 @@ STAGE_LABELS = {
     "T13_online_checks": "在线几何诊断",
 }
 SUBSTAGE_LABELS = {
+    "T02a_observed_noise": "路径验收：观测噪声估计",
+    "T02b_search_calibration": "路径验收：二维整体门槛校准",
+    "T02c_residual_search": "路径验收：残差搜索",
+    "T02d_joint_csi_refit": "路径验收：联合 CSI 拟合",
+    "T02e_duplicate_refit": "路径验收：重复解释检查",
+    "T08_reference_groups": "反向 RT：合法参考点分组",
     "T08_specular": "反向 RT：直射和镜面反射分支",
     "T08_diffraction": "反向 RT：绕射分支",
     "T12_seed_generation": "求解：初值候选对生成",
@@ -41,7 +49,7 @@ SUBSTAGE_LABELS = {
 }
 THRESHOLDS_M = (0.5, 1.0, 2.0, 5.0)
 _SUCCESS_STAGE_STATES = {"success", "completed", "complete", "ok"}
-_TRIAL_STATUSES = {"success", "localization_failed", "timeout", "data_failed", "pending"}
+_TRIAL_STATUSES = {"success", "localization_failed", "timeout", "data_failed", "pending"} | NO_POSITION_STATUSES
 _KEYS = ("cohort", "ue_id", "repeat_index", "strategy")
 _CHANNEL_FIELDS = ("channel_category", "has_diffraction")
 _CHANNEL_LABELS = {
@@ -148,6 +156,10 @@ def _materialize_trials(records, points, metadata):
             raise ValueError(f"未知的定位终态：{trial['status']}")
         for field in _NUMERIC_FIELDS:
             trial[field] = _number(trial.get(field))
+        if trial["status"] in NO_POSITION_STATUSES and any(
+            trial.get(field) is not None for field in ("position_error_m", "clock_bias_error_ns")
+        ):
+            raise ValueError(f"无位置输出的终态不能包含定位误差：{key}")
         for field in ("position_error_m", "processing_seconds", "localization_seconds", "checked_seconds"):
             if trial[field] is not None and trial[field] < 0:
                 raise ValueError(f"{field} 不能是负数：{key}")
@@ -195,6 +207,14 @@ def _group_summary(trials: list[dict[str, Any]]) -> dict[str, Any]:
         "numeric_output_count": len(output),
         "output_fraction_all_planned": _fraction(len(output), len(trials)),
         "status_counts": {status: counts[status] for status in sorted(_TRIAL_STATUSES)},
+        "unlocalizable_fraction_all_planned":_fraction(counts["unlocalizable"], len(trials)),
+        "unlocalizable_reason_counts":dict(Counter(trial.get("unlocalizable_reason", "unknown")
+            for trial in trials if trial["status"] == "unlocalizable")),
+        "detection_incomplete_fraction_all_planned": _fraction(counts["detection_incomplete"], len(trials)),
+        "solver_budget_exhausted_fraction_all_planned": _fraction(counts["solver_budget_exhausted"], len(trials)),
+        "computation_incomplete_reason_counts": dict(Counter(
+            trial.get("stop_reason") or "unknown" for trial in trials
+            if trial["status"] in {"detection_incomplete", "solver_budget_exhausted"})),
         "position_error_m": _stats((trial["position_error_m"] for trial in trials), rmse=True),
         "clock_bias_error_ns": _stats((trial["clock_bias_error_ns"] for trial in trials), rmse=True),
         "clock_bias_mae_ns": _stats(abs(trial["clock_bias_error_ns"]) for trial in trials
@@ -395,7 +415,8 @@ def _flatten_precision(cohort, strategy, summary):
                "numeric_output_count", "output_fraction_all_planned", "forward_checked_count",
                "forward_valid_count", "forward_valid_fraction_checked", "forward_valid_fraction_all_planned",
                "identifiability_checked_count", "unidentifiable_count", "unidentifiable_fraction_checked",
-               "timeout_fraction_all_planned")}}
+               "timeout_fraction_all_planned", "unlocalizable_fraction_all_planned",
+               "detection_incomplete_fraction_all_planned", "solver_budget_exhausted_fraction_all_planned")}}
     row.update({f"status_{key}_count": value for key, value in summary["status_counts"].items()})
     row.update({f"position_error_{key}_m": value for key, value in summary["position_error_m"].items() if key != "count"})
     row["clock_bias_mae_ns"] = summary["clock_bias_mae_ns"]

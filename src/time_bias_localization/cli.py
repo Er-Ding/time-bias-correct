@@ -92,6 +92,8 @@ def main(argv: list[str] | None = None) -> int:
                 "sigma_m2": summary["result"]["sigma_m2"],
                 "clock_bias_s": summary["result"]["clock_bias_s"],
                 "metrics": summary["metrics"],
+                "status":summary["result"].get("status", "success"),
+                "reason":summary["result"].get("reason"),
             }
         )
         return 0
@@ -121,6 +123,8 @@ def main(argv: list[str] | None = None) -> int:
                 "sigma_m2": result["sigma_m2"],
                 "clock_bias_s": result["clock_bias_s"],
                 "localization_run_id": result["localization_run_id"],
+                "status":result.get("status", "success"), "reason":result.get("reason"),
+                "progress_path":result.get("progress_path"),
             }
         )
         return 0

@@ -1,5 +1,10 @@
 # 时间偏差校正的二维多径定位
 
+针对定位大误差的修复版提供 `run_accuracy_fixes.sh`：从观测 CSI 检验有效路径，
+保留整个时间偏差区间内的反射/绕射候选，并将约束不足记为无法定位。
+开关、验收及新一轮 30 UE × 5 噪声实验见
+[精度修复 v3](/data/zhujun/differt_projects/time-bias-correct/docs/accuracy_fixes_v3.md)。
+
 默认定位主流程为 `music_fine_spectrum_dbscan_v3`，定位清单格式为第 6 版。
 现已增加可选的一次绕射版本 `music_diffraction_cover_v4`（第 7 版清单）：
 保留 DBSCAN，在绕射簇内按覆盖距离选多个实际代表，并检查整个合法时间偏差区间的覆盖。

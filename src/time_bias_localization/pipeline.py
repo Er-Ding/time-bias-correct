@@ -67,8 +67,25 @@ from .signal import (
     extract_local_music_peaks,
     music_2d_spectrum,
 )
-from .solver import CandidateTrajectory, SolverConfig, SolverError, solve_position_and_bias
+from .solver import CandidateTrajectory, SolverConfig, SolverError, SolverBudgetError, solve_position_and_bias
+from .localization_status import NO_POSITION_STATUSES
 from .timing import mark, register_synchronizer, stage
+
+
+class LocalizationUnavailable(RuntimeError):
+    """无坐标终态；状态区分观测不足、检测未完成及求解预算不足。"""
+    def __init__(self, reason, diagnostics, candidate_result=None, *, status="unlocalizable"):
+        if status not in NO_POSITION_STATUSES:
+            raise ValueError(f"未知的无位置终态：{status}")
+        super().__init__(reason)
+        self.result = {
+            "status": status, "reason": reason,
+            "output_type": "no_unique_position" if status == "unlocalizable" else "no_position_computation_incomplete",
+            "mu_m": None, "clock_bias_s": None,
+            "sigma_m2": None, "distance_bias_m": None, "diagnostics": diagnostics,
+        }
+        if candidate_result is not None:
+            self.result["candidate_solution_for_diagnostics_only"] = candidate_result
 
 
 @dataclass(frozen=True)
@@ -1515,12 +1532,16 @@ def _localize_locked(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
     try:
         return _localize_locked_impl(config, progress=progress, **kwargs)
     except Exception as error:
-        mark("online_failed", failed_step=progress["failed_step"],
-             error_type=type(error).__name__)
+        unavailable = isinstance(error, LocalizationUnavailable)
+        if unavailable:
+            error.result["localization_run_id"] = progress["run_id"]
+            progress["payloads"]["result"] = error.result
+        mark("online_unavailable" if unavailable else "online_failed", failed_step=progress["failed_step"],
+             status=error.result["status"] if unavailable else "failed", error_type=type(error).__name__)
         with stage("failure_artifact_publication"):
             if "inputs" in progress:
                 try:
-                    directory = Path(kwargs["output_root"]) / "localization_failures" / progress["run_id"]
+                    directory = Path(kwargs["output_root"]) / ("localization_unavailable" if unavailable else "localization_failures") / progress["run_id"]
                     directory.mkdir(parents=True, exist_ok=False)
                     records = {}
                     for key, payload in progress["payloads"].items():
@@ -1538,7 +1559,7 @@ def _localize_locked(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
                         if key not in {"payloads", "config_snapshot_data"}
                     }
                     metadata.update(
-                        status="failed", error=f"{type(error).__name__}: {error}",
+                        status=error.result["status"] if unavailable else "failed", error=f"{type(error).__name__}: {error}",
                         artifacts=records,
                         config_snapshot={
                             "path": str(snapshot_path.resolve()),
@@ -1552,6 +1573,11 @@ def _localize_locked(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
                     error.failure_progress = str(progress_path.resolve())
                 except Exception as save_error:
                     error.add_note(f"保存失败步骤时另遇到错误：{save_error}")
+                    if unavailable:
+                        raise
+        if unavailable:
+            error.result["progress_path"] = getattr(error, "failure_progress", None)
+            return error.result
         raise
 
 
@@ -1655,26 +1681,99 @@ def _localize_locked_impl(
     num_paths = int(music_config["num_paths"])
     signal_subspace_rank = int(music_config.get("signal_subspace_rank", num_paths))
     aoa_grid, delay_grid = _make_grids(music_config)
-    prepared = computer.prepare(
-        measurement.csi_observed,
-        subcarrier_frequencies_hz=measurement.subcarrier_frequencies_hz,
-        carrier_frequency_hz=measurement.carrier_frequency_hz,
-        antenna_spacing_m=measurement.antenna_spacing_m,
-        num_sources=signal_subspace_rank,
-        spatial_subarray_size=int(music_config["spatial_subarray_size"]),
-        frequency_subarray_size=int(music_config["frequency_subarray_size"]),
-        diagonal_loading=float(music_config["diagonal_loading"]),
-    )
+    from .path_detection import detect_csi_paths, detection_settings
+    detector_options = detection_settings(music_config.get("path_detection", {}))
+    from .music_subspace import subspace_settings, SubspaceSelectionError
+    selection_options = subspace_settings(music_config.get("subspace_selection", {}))
+    automatic_subspace = selection_options["mode"] == "eigenvalue_threshold"
+    detection = None
+    if detector_options["enabled"] and not automatic_subspace:
+        with stage("T02_path_detection"):
+            detection = detect_csi_paths(measurement.csi_observed,
+                subcarrier_frequencies_hz=measurement.subcarrier_frequencies_hz,
+                carrier_frequency_hz=measurement.carrier_frequency_hz,
+                antenna_spacing_m=measurement.antenna_spacing_m,
+                aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
+                settings=detector_options, backend=computer.settings.backend,
+                device_id=computer.settings.device_id)
+        progress["payloads"]["music_peaks"] = {"path_detection": detection.diagnostics,
+            "nominal": [asdict(p) for p in detection.peaks],
+            "nominal_source_indices": list(range(len(detection.peaks)))}
+        progress["completed_steps"].append("02_path_detection")
+        detection_diagnostics = {"path_detection": detection.diagnostics,
+                                 "nominal_music_peak_count": len(detection.peaks)}
+        if detection.diagnostics["stop_reason"] in {"path_limit_reached", "noise_level_unresolved"}:
+            reason = ("path_detection_budget_exhausted" if detection.diagnostics["stop_reason"] == "path_limit_reached"
+                      else "noise_level_unresolved")
+            raise LocalizationUnavailable(reason, detection_diagnostics, status="detection_incomplete")
+        if len(detection.peaks) < 2:
+            raise LocalizationUnavailable(
+                "insufficient_reliable_paths", detection_diagnostics)
+        signal_subspace_rank = len(detection.peaks)
+    try:
+        prepared = computer.prepare(
+            measurement.csi_observed,
+            subcarrier_frequencies_hz=measurement.subcarrier_frequencies_hz,
+            carrier_frequency_hz=measurement.carrier_frequency_hz,
+            antenna_spacing_m=measurement.antenna_spacing_m,
+            num_sources=signal_subspace_rank,
+            subspace_selection=selection_options,
+            spatial_subarray_size=int(music_config["spatial_subarray_size"]),
+            frequency_subarray_size=int(music_config["frequency_subarray_size"]),
+            diagonal_loading=float(music_config["diagonal_loading"]),
+        )
+    except SubspaceSelectionError as error:
+        progress["payloads"]["music_peaks"] = {"subspace_selection": error.diagnostics}
+        raise LocalizationUnavailable("music_noise_reference_unresolved",
+            {"music_subspace_selection": error.diagnostics}, status="detection_incomplete") from error
+    subspace_diagnostics = prepared.subspace_diagnostics
+    signal_subspace_rank = subspace_diagnostics["signal_rank"]
+    progress["payloads"].setdefault("music_peaks", {}).update(subspace_selection=subspace_diagnostics)
+    if automatic_subspace and signal_subspace_rank == 0:
+        raise LocalizationUnavailable("no_signal_subspace_above_threshold",
+                                     {"music_subspace_selection": subspace_diagnostics})
     with stage('coarse_music_total'):
         with stage('T03_coarse_spectrum'):
             spectrum = prepared.spectrum(aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid)
         with stage('T04_coarse_peaks'):
-            coarse_peaks = extract_local_music_peaks(
+            coarse_peaks = detection.peaks if detection is not None else extract_local_music_peaks(
                 spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
-                max_peaks=num_paths, minimum_relative_height=0.0,
+                max_peaks=None if automatic_subspace and detector_options["enabled"] else num_paths,
+                minimum_relative_height=0.0,
                 minimum_separation_bins=_separation_bins(music_config),
             )
+    music_proposals = list(coarse_peaks)
+    if automatic_subspace and detector_options["enabled"]:
+        progress["payloads"]["music_spectrum"] = dict(
+            spectrum=spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid)
+        with stage("T02_path_detection"):
+            detection = detect_csi_paths(measurement.csi_observed,
+                subcarrier_frequencies_hz=measurement.subcarrier_frequencies_hz,
+                carrier_frequency_hz=measurement.carrier_frequency_hz,
+                antenna_spacing_m=measurement.antenna_spacing_m,
+                aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
+                settings=detector_options, backend=computer.settings.backend,
+                device_id=computer.settings.device_id, proposal_peaks=music_proposals)
+        progress["completed_steps"].append("02_path_detection")
+        progress["payloads"]["music_peaks"].update(
+            path_detection=detection.diagnostics, music_proposals=[asdict(p) for p in music_proposals],
+            nominal=[asdict(p) for p in detection.peaks])
+        diagnostics = {"music_subspace_selection": subspace_diagnostics,
+                       "path_detection": detection.diagnostics,
+                       "nominal_music_peak_count": len(detection.peaks)}
+        stop = detection.diagnostics["stop_reason"]
+        if stop in {"path_limit_reached", "noise_level_unresolved",
+                    "music_proposals_exhausted_with_significant_residual",
+                    "music_proposal_refit_incomplete", "music_duplicate_unresolved"}:
+            reason = ("path_detection_budget_exhausted" if stop == "path_limit_reached"
+                      else "music_peak_validation_incomplete")
+            raise LocalizationUnavailable(reason, diagnostics, status="detection_incomplete")
+        if len(detection.peaks) < 2:
+            raise LocalizationUnavailable("insufficient_reliable_paths", diagnostics)
+        coarse_peaks = detection.peaks
     peak_output = {
+        "subspace_selection": subspace_diagnostics,
+        "music_proposals": [asdict(p) for p in music_proposals] if automatic_subspace else [],
         "workflow": workflow_for_config(config),
         "note": "谱值用于候选搜索，不是经过校准的路径概率；不对观测 CSI 额外加噪",
         "coarse": [asdict(peak) for peak in coarse_peaks],
@@ -1683,6 +1782,10 @@ def _localize_locked_impl(
         "nominal_resolution": "local_fine_spectrum",
         "coarse_role": "search_region_proposals_only",
     }
+    if detection is not None:
+        peak_output.update(path_detection=detection.diagnostics,
+                           nominal_resolution="continuous_csi_refit_accepted_before_mc",
+                           coarse_role="accepted_csi_components; MUSIC_values_only_define_mc_proposals")
     progress["payloads"].update(
         music_spectrum=dict(spectrum=spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid),
         music_peaks=peak_output,
@@ -1701,6 +1804,7 @@ def _localize_locked_impl(
             seed=int(config["project"]["random_seed"]) + 2,
             minimum_angle_separation_rad=np.deg2rad(float(music_config["min_angle_separation_deg"])),
             minimum_delay_separation_s=float(music_config["min_delay_separation_s"]),
+            accepted_peak_centers=detection is not None,
         )
     nominal_peaks = sampled.refined_peaks
     nominal_source_indices = sampled.refined_peak_source_indices
@@ -1718,14 +1822,23 @@ def _localize_locked_impl(
 
     progress["failed_step"] = "04_initial_candidates"
     reference_bias_s = float(localization_config["initial_reference_bias_s"])
+    full_bias = localization_config.get("candidate_bias_mode", "reference") == "full_interval"
+    generator = generate_initial_candidate_points
+    generation_options = {}
+    if full_bias:
+        from .bias_interval_candidates import generate_bias_interval_points
+        generator = generate_bias_interval_points
+        generation_options["bias_interval_s"] = (float(localization_config["bias_min_s"]),
+                                                float(localization_config["bias_max_s"]))
     with stage('T08_reverse_rt'):
-        initial = generate_initial_candidate_points(
+        initial = generator(
             scene, measurement.bs_position_m, sampled.samples,
             reference_bias_s=reference_bias_s,
             max_reflections=int(config["scene"]["max_reflections"]),
             max_diffractions=int(config["scene"].get("max_diffractions", 0)),
             diffraction_directions_per_sample=int(localization_config.get("diffraction_directions_per_sample", 4)),
             diffraction_angle_tolerance_deg=float(localization_config.get("diffraction_angle_tolerance_deg", 3.0)),
+            **generation_options,
         )
     progress["payloads"]["initial_candidates"] = {
         "reference_bias_s": reference_bias_s,
@@ -1748,6 +1861,7 @@ def _localize_locked_impl(
             beta_interval_m=(float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
                              float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S),
             return_diagnostics=True,
+            allow_mixed_references=full_bias,
         )
     representatives = clustering.representatives
     progress["payloads"]["representative_points"] = {
@@ -1779,8 +1893,30 @@ def _localize_locked_impl(
     mark_stage("representative_trajectories")
 
     progress["failed_step"] = "07_joint_solution"
+    if (localization_config.get("require_identifiable_solution", False)
+            and len({t.observation_id for t in representative_trajectories}) < 2):
+        raise LocalizationUnavailable("insufficient_observations_after_clustering", {
+            "path_detection":detection.diagnostics if detection else None,
+            "nominal_music_peak_count":len(nominal_peaks), "point_clustering":clustering.diagnostics,
+            "initial_candidate_count":len(initial.points),"representative_point_count":len(representatives)})
     with stage('T12_solver'):
-        central = solve_position_and_bias(representative_trajectories, _solver_config(localization_config))
+        try:
+            central = solve_position_and_bias(representative_trajectories, _solver_config(localization_config))
+        except SolverBudgetError as error:
+            if localization_config.get("require_identifiable_solution", False):
+                raise LocalizationUnavailable("solver_pair_budget_exhausted", {
+                    "solver_reason": str(error), "candidate_pair_count": error.pair_count,
+                    "max_seed_pairs": error.max_seed_pairs, "pair_search_started": False,
+                    "path_detection": detection.diagnostics if detection else None,
+                    "nominal_music_peak_count": len(nominal_peaks), "point_clustering": clustering.diagnostics,
+                }, status="solver_budget_exhausted") from error
+            raise
+        except SolverError as error:
+            if localization_config.get("require_identifiable_solution", False):
+                raise LocalizationUnavailable("no_solvable_joint_candidate", {"solver_reason":str(error),
+                    "path_detection":detection.diagnostics if detection else None,
+                    "nominal_music_peak_count":len(nominal_peaks),"point_clustering":clustering.diagnostics}) from error
+            raise
     mark("position_available", mu_m=central.mu.tolist(),
          clock_bias_s=float(central.beta / SPEED_OF_LIGHT_M_S))
     progress["completed_steps"].append("07_joint_solution")
@@ -1810,6 +1946,7 @@ def _localize_locked_impl(
             "stage_timings_s": stage_timings,
             "stage_timing_scope": "输入验证到正向检查；不含文件发布及独立评估",
             "music_signal_subspace_rank": signal_subspace_rank,
+            "music_subspace_selection": subspace_diagnostics,
             "requested_music_peak_count": num_paths,
             "unambiguous_delay_period_s": unambiguous_delay_period_s,
             "nominal_music_peak_count": len(nominal_peaks),
@@ -1822,7 +1959,7 @@ def _localize_locked_impl(
             "initial_candidate_generation": initial.diagnostics,
             "point_clustering": {
                 **clustering.diagnostics,
-                "space": "initial_position_xy_at_reference_bias",
+                "space": "initial_position_xy_at_group_valid_reference" if full_bias else "initial_position_xy_at_reference_bias",
                 "position_radius_m": float(localization_config["candidate_cluster_radius_m"]),
                 "grouping": clustering.diagnostics["grouping_rule"],
                 "representative": (
@@ -1843,11 +1980,12 @@ def _localize_locked_impl(
             "covariance_source": "selected_candidate_geometric_residual_approximation",
             "covariance_calibrated": False,
             "no_accept_reject_output": True,
+            "path_detection": detection.diagnostics if detection else None,
         },
     }
     progress["failed_step"] = "08_forward_check"
     with stage('T13_online_checks'):
-        if config["scene"].get("max_diffractions", 0):
+        if config["scene"].get("max_diffractions", 0) or localization_config.get("require_identifiable_solution", False):
             from .diffraction_diagnostics import physical_constraint_rank
             result["diagnostics"]["diffraction_physical_constraints"] = physical_constraint_rank(
                 scene, central.selected_candidates, central.mu)
@@ -1872,6 +2010,13 @@ def _localize_locked_impl(
     mark_stage("forward_check")
     mark("checked_complete")
     result["forward_check"] = forward_check
+    if localization_config.get("require_identifiable_solution", False):
+        result["diagnostics"]["no_accept_reject_output"] = False
+        constraints = result["diagnostics"]["diffraction_physical_constraints"]
+        if not constraints["locally_identifiable"]:
+            raise LocalizationUnavailable("insufficient_independent_physical_constraints", result["diagnostics"], result)
+        result["status"] = "success"
+        result["diagnostics"]["acceptance_scope"] = "local_physical_rank_only; global_uniqueness_and_accuracy_not_guaranteed"
     compute_report = computer.metadata()
     compute_report["counter_scope"] = "worker_lifetime"
     compute_report["this_localization"] = {
@@ -2306,6 +2451,13 @@ def run_offline_demo(config_path: str | Path) -> dict[str, Any]:
             archive_previous=False,
             previous_evaluation_archived=previous_evaluation_archived,
         )
+        if result.get("status") in NO_POSITION_STATUSES:
+            _write_json(root / "run_manifest.json", {
+                "stage":"offline_end_to_end", "status":result["status"],
+                "config":str(Path(config_path).resolve()), "scene_artifacts":scene_artifacts,
+                "data_artifacts":data_artifacts, "localization_progress":result.get("progress_path"),
+                "evaluation_metrics":None, "reason":result["reason"]})
+            return {"result":result,"metrics":None,"output_root":str(root)}
         metrics = _evaluate_locked(
             result_path=(root / "localization" / "localization_result.json").resolve(),
             truth_path=Path(data_artifacts["truth_npz"]).resolve(),

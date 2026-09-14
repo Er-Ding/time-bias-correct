@@ -1,0 +1,15 @@
+# 原 CSI 已缺失，本配置重新生成数据；同一新批次内两组共享 CSI。
+generation_config: diffraction_boundary_generation_v3.yaml
+channel_backend: sionna
+pilot_ue_count: 30
+formal_ue_count: 300
+noise_repeats: 5
+random_seed: 20260911
+max_proposals: 100000
+trial_timeout_s: 600.0
+warmup_per_strategy: 5
+timing_snapshots: true
+plots: true
+legal_region:
+  wall_clearance_m: 0.5
+  bs_min_distance_m: 2.0

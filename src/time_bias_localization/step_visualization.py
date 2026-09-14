@@ -619,7 +619,10 @@ def _export_initial_points(plt, run, folder):
                                point_count=len(group), reflection_wall_ids=" | ".join(group[0]["reflection_wall_ids"])))
     _point_limits(ax, run, points)
     ax.legend(fontsize=6, loc="best")
-    fig.suptitle(f"参考 bias = {payload['reference_bias_s'] * 1e9:g} ns，只用于初始化；不是已知或估计的真实 bias；本步未生成轨迹", fontsize=8)
+    if payload.get("diagnostics", {}).get("candidate_generation_mode") == "full_bias_interval":
+        fig.suptitle("各传播分组使用合法参考偏差；逐点数值见 CSV，参考值不是时间偏差估计", fontsize=8)
+    else:
+        fig.suptitle(f"参考 bias = {payload['reference_bias_s'] * 1e9:g} ns，只用于初始化；不是已知或估计的真实 bias；本步未生成轨迹", fontsize=8)
     _save(plt, fig, folder, "initial_points")
     _table(folder / "observation_topologies.csv", groups)
 

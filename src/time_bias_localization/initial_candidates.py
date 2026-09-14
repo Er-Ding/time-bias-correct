@@ -328,6 +328,7 @@ def cluster_initial_candidate_points(
     diffraction_coverage_distance_m: float = 1.0,
     diffraction_representative_policy: str = "coverage",
     beta_interval_m: tuple[float, float] | None = None,
+    allow_mixed_references: bool = False,
 ) -> list[RepresentativeCandidatePoint] | InitialCandidateClusteringResult:
     """同一来源峰、完整传播顺序内，对参考位置进行确定性 DBSCAN 聚类。
 
@@ -352,9 +353,9 @@ def cluster_initial_candidate_points(
     if diffraction_representative_policy not in {"single", "coverage"}:
         raise ValueError("绕射代表策略必须为 single 或 coverage")
     references = {point.reference_bias_s for point in points}
-    if len(references) > 1:
+    if len(references) > 1 and not allow_mixed_references:
         raise ValueError("同一轮初始点必须使用相同 reference_bias_s")
-    grouped: dict[tuple[str, tuple[tuple[str, str], ...]], list[InitialCandidatePoint]] = {}
+    grouped: dict[tuple[str, tuple[tuple[str, str], ...], float], list[InitialCandidatePoint]] = {}
     valid_samples: dict[str, set[str]] = {}
     seen: set[tuple[str, str]] = set()
     for point in points:
@@ -362,7 +363,7 @@ def cluster_initial_candidate_points(
         if key in seen:
             raise ValueError(f"初始点 sample_id 重复：{key}")
         seen.add(key)
-        grouped.setdefault((point.observation_id, point.interactions), []).append(point)
+        grouped.setdefault((point.observation_id, point.interactions, point.reference_bias_s), []).append(point)
         valid_samples.setdefault(point.observation_id, set()).add(point.sample_id)
 
     representatives: list[RepresentativeCandidatePoint] = []
@@ -370,7 +371,7 @@ def cluster_initial_candidate_points(
     memberships: list[dict[str, Any]] = []
     group_summaries: list[dict[str, Any]] = []
     cluster_count = 0
-    for (observation_id, interactions), group in sorted(grouped.items()):
+    for (observation_id, interactions, group_reference), group in sorted(grouped.items()):
         with stage("T09_dbscan"):
             wall_ids = tuple(key for kind, key in interactions if kind == "reflection")
             group = sorted(group, key=lambda point: point.sample_id)
@@ -448,6 +449,7 @@ def cluster_initial_candidate_points(
                     "observation_valid_sample_count": len(valid_samples[observation_id]),
                     "empirical_frequency": len(members) / len(valid_samples[observation_id]),
                     "empirical_frequency_denominator": "distinct_samples_with_valid_initial_point",
+                    "candidate_generation_mode": "full_bias_interval" if allow_mixed_references else "reference",
                 }
                 if representative.has_diffraction:
                     if beta_interval_m is None:
@@ -518,10 +520,12 @@ def cluster_initial_candidate_points(
         "min_samples_includes_self": True,
         "density_weighting": "equal_sample_counts",
         "border_assignment_rule": "nearest_core_then_stable_component_order",
-        "grouping_rule": ("same_observation_and_full_typed_interaction_sequence"
+        "grouping_rule": ("same_observation_full_typed_interaction_sequence_and_valid_reference"
+                          if allow_mixed_references else "same_observation_and_full_typed_interaction_sequence"
                           if any(point.has_diffraction for point in points) else
                           "same_observation_and_full_reflection_wall_sequence"),
-        "reference_bias_s": float(next(iter(references))) if references else None,
+        "reference_bias_s": float(next(iter(references))) if len(references) == 1 else None,
+        "reference_bias_values_s": sorted(references),
         "input_point_count": len(points),
         "cluster_count": cluster_count,
         "representative_count": len(representatives),
@@ -575,7 +579,7 @@ def build_representative_trajectories(
         anchor = position + reference_beta * direction
         physical_max = reference_beta + remaining
         physical_min = physical_max - point.endpoint_free_distance_m
-        if point.has_diffraction:
+        if point.has_diffraction or representative.metadata.get("candidate_generation_mode") == "full_bias_interval":
             physical_min += _ENDPOINT_TOLERANCE_M
             physical_max -= _ENDPOINT_TOLERANCE_M
         metadata = dict(representative.metadata)

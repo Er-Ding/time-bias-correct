@@ -20,6 +20,7 @@ import numpy as np
 import yaml
 
 from .config import load_config, localization_config_view
+from .localization_status import NO_POSITION_STATUSES, COMPLETED_WORKER_STATUSES
 from .provenance import file_sha256, canonical_json_sha256
 
 STRATEGIES = ("single", "coverage")
@@ -264,9 +265,14 @@ def worker_loop(connection) -> None:
             with collect_timings(snapshot_path=job.get("snapshot_path")) as recorder:
                 result = localize(job["config"], scene_json=job["scene_json"], online_input=job["online_input"],
                                   generation_manifest=job["generation_manifest"], output_root=job["output_root"])
-            payload = {"status": "success", "position_m": np.asarray(result["mu_m"]).tolist(),
-                       "clock_bias_s": float(result["clock_bias_s"]), "diagnostics": result["diagnostics"],
-                       "forward_valid": result["forward_check"]["all_selected_paths_valid"]}
+            if result.get("status") in NO_POSITION_STATUSES:
+                payload = {"status":result["status"], "position_m":None, "clock_bias_s":None,
+                           "reason":result["reason"], "diagnostics":result["diagnostics"],
+                           "progress_path":result.get("progress_path")}
+            else:
+                payload = {"status": "success", "position_m": np.asarray(result["mu_m"]).tolist(),
+                           "clock_bias_s": float(result["clock_bias_s"]), "diagnostics": result["diagnostics"],
+                           "forward_valid": result["forward_check"]["all_selected_paths_valid"]}
         except Exception as error:
             payload = {"status": "localization_failed", "error": f"{type(error).__name__}: {error}",
                        "traceback": traceback.format_exc()}
@@ -375,6 +381,8 @@ def trial_record(point: dict, repeat: int, strategy: str, payload: dict, observa
     marks = timing.get("marks", {})
     position = payload.get("position_m", timing.get("mark_data", {}).get("position_available", {}).get("mu_m"))
     bias = payload.get("clock_bias_s", timing.get("mark_data", {}).get("position_available", {}).get("clock_bias_s"))
+    if payload["status"] in NO_POSITION_STATUSES:
+        position = bias = None
     # Ground truth is first opened here in the parent, after online timing has stopped.
     if file_sha256(observation["truth_npz"]) != observation["truth_sha256"]:
         raise ValueError("评估真值与冻结输入摘要不一致，拒绝产生精度结果")
@@ -388,7 +396,7 @@ def trial_record(point: dict, repeat: int, strategy: str, payload: dict, observa
         error = None
     def duration(end):
         return max(0.0, marks[end] - marks["csi_map_ready"]) if end in marks and "csi_map_ready" in marks else None
-    failed_online = duration("online_failed")
+    failed_online = duration("online_unavailable") if "online_unavailable" in marks else duration("online_failed")
     # perf_counter 在本机父子进程共享同一个单调时钟，可精确衔接硬超时边界。
     failure_at = payload.get("failure_at_perf_counter_s", payload.get("timeout_at_perf_counter_s"))
     if (payload["status"] != "success" and "csi_map_ready" in marks
@@ -396,7 +404,7 @@ def trial_record(point: dict, repeat: int, strategy: str, payload: dict, observa
             and failure_at is not None):
         failed_online = max(0.0, failure_at
                             - timing["started_perf_counter_s"] - marks["csi_map_ready"])
-    localization_seconds = duration("position_available")
+    localization_seconds = failed_online if payload["status"] in NO_POSITION_STATUSES else duration("position_available")
     checked_seconds = duration("checked_complete")
     if localization_seconds is None:
         localization_seconds = failed_online
@@ -412,6 +420,11 @@ def trial_record(point: dict, repeat: int, strategy: str, payload: dict, observa
     return {"cohort": point["cohort"], "ue_id": point["ue_id"], "repeat_index": repeat, "strategy": strategy,
             "noise_seed": point["noise_seeds"][repeat], "mc_seed": point["mc_seeds"][repeat],
             "input_sha256": observation["input_sha256"], "status": payload["status"],
+            "stop_reason":payload.get("reason"),
+            "unlocalizable_reason":payload.get("reason") if payload["status"] == "unlocalizable" else None,
+            "progress_path":payload.get("progress_path"),
+            "accepted_path_count":diagnostics.get("nominal_music_peak_count"),
+            "path_detection_diagnostics":diagnostics.get("path_detection"),
             "position_error_m": error, "clock_bias_error_ns": abs(float(bias) - truth_bias) * 1e9 if bias is not None else None,
             "localization_seconds": localization_seconds, "checked_seconds": checked_seconds,
             "failed_online_seconds": failed_online, "processing_seconds": payload.get("processing_seconds"),
@@ -537,7 +550,7 @@ def benchmark_cohort(root: Path, cohort: str, settings: dict, config: dict) -> N
                 write_json(target / "warmup_result.json", payload)
                 append_json(attempt / "warmups.jsonl", payload)
                 print(f"[{cohort} 预热结束] {strategy}: {payload['status']}", flush=True)
-                if payload["status"] != "success" or not worker.process.is_alive():
+                if payload["status"] not in COMPLETED_WORKER_STATUSES or not worker.process.is_alive():
                     warmup_failed = True
                     write_json(attempt / "warmup_failure.json", {
                         "status": payload["status"], "strategy": strategy,
@@ -597,7 +610,7 @@ def benchmark_cohort(root: Path, cohort: str, settings: dict, config: dict) -> N
                 record = trial_record(point, repeat, strategy, payload, observation, target)
                 append_json(log, record)
                 keys.add(key)
-                restart_after_pair |= payload["status"] != "success" or worker is None or not worker.process.is_alive()
+                restart_after_pair |= payload["status"] not in COMPLETED_WORKER_STATUSES or worker is None or not worker.process.is_alive()
                 print(f"[{cohort} 已记录] {len(keys)}/{plan['expected_requests']} {record['status']} 误差={record['position_error_m']} 米", flush=True)
             if restart_after_pair:
                 print(f"[{cohort} 进程恢复] 当前配对已保留；两组共同重新启动，下一配对标记冷启动。", flush=True)

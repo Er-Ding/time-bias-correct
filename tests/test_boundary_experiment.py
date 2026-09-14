@@ -35,6 +35,31 @@ def test_single_policy_changes_only_representative_selection():
     assert single.representatives[0].metadata['diffraction_representative_policy'] == 'single'
 
 
+def test_worker_preserves_budget_statuses_and_accepts_next_job(monkeypatch):
+    from time_bias_localization import pipeline
+    from time_bias_localization.boundary_experiment import worker_loop
+    outcomes = iter([
+        dict(status="detection_incomplete", reason="path_detection_budget_exhausted", diagnostics={}),
+        dict(status="solver_budget_exhausted", reason="solver_pair_budget_exhausted", diagnostics={}),
+    ])
+    monkeypatch.setattr(pipeline, "localize", lambda *args, **kwargs: next(outcomes))
+    class Connection:
+        def __init__(self):
+            job = dict(config={}, scene_json="unused", online_input="unused",
+                       generation_manifest=None, output_root="unused")
+            self.jobs = iter([job, job, None])
+            self.sent = []
+        def send(self, value):
+            self.sent.append(value)
+        def recv(self):
+            return next(self.jobs)
+    connection = Connection()
+    worker_loop(connection)
+    assert connection.sent[0]["ready"] is True
+    assert [r["status"] for r in connection.sent[1:]] == ["detection_incomplete", "solver_budget_exhausted"]
+    assert all(r["position_m"] is None and r["clock_bias_s"] is None for r in connection.sent[1:])
+
+
 def test_online_job_does_not_receive_truth_or_requested_noise(config, tmp_path):
     observation = dict(scene_json='scene.json', online_npz='observed.npz', truth_npz='secret_truth.npz',
                        generation_manifest='manifest.json', input_sha256='unused')

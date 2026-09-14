@@ -1,0 +1,101 @@
+# v4：观测 CSI 特征值阈值 -> MUSIC 候选峰 -> CSI 残差验收。
+# 阈值比例为首版参数，尚未通过 30 UE 同 CSI 对照校准。
+project:
+  random_seed: 20260911
+compute:
+  backend: cuda
+  device_id: 0
+  batch_size: 4
+  angle_chunk_size: 32
+scene:
+  source: sionna_builtin
+  name: munich
+  bounds_m:
+  - -100.0
+  - 160.0
+  - -80.0
+  - 180.0
+  localization_bounds_m:
+  - -100.0
+  - 160.0
+  - -80.0
+  - 180.0
+  fixed_height_m: 1.5
+  bev_resolution_m: 0.1
+  max_reflections: 2
+  max_diffractions: 1
+  vertical_path_tolerance_m: 0.1
+radio:
+  carrier_hz: 3.5e9
+  bandwidth_hz: 400.0e6
+  num_subcarriers: 512
+  num_bs_antennas: 12
+  antenna_spacing_wavelength: 0.5
+  bs_boresight_deg: -45.0
+  front_facing_only: true
+  num_snapshots: 1
+  snr_db: 35.0
+simulation:
+  bs_position_m:
+  - 20.0
+  - 50.0
+  ue_position_m:
+  - 50.0
+  - 50.0
+  clock_bias_s: 2.5e-08
+  samples_per_source: 2000000
+  max_num_paths_per_source: 100000
+music:
+  num_paths: 3
+  signal_subspace_rank: 6  # 仅为旧固定维数模式保留；本配置不使用它。
+  subspace_selection:
+    mode: eigenvalue_threshold
+    # minimum 为最小特征值倍数规则；median 取全部特征值中位数。
+    # 不建议直接套用小比例乘最小值：有限滑窗样本会让噪声特征值分散。
+    noise_reference: median
+    threshold_ratio: 6.0
+  angle_min_deg: -89.0
+  angle_max_deg: 89.0
+  angle_step_deg: 1.0
+  delay_min_s: 0.0
+  delay_max_s: 1.15e-06
+  delay_step_s: 1.0e-09
+  min_angle_separation_deg: 5.0
+  min_delay_separation_s: 3.0e-09
+  spectrum_sampling:
+    samples_per_peak: 128
+    aoa_half_width_grid_steps: 1.5
+    delay_half_width_grid_steps: 1.5
+    local_grid_points_per_axis: 25
+    spectrum_power: 1.0
+    uniform_mixture: 0.1
+    include_nominal: true
+  spatial_subarray_size: 8
+  frequency_subarray_size: 64
+  diagonal_loading: 1.0e-08
+  path_detection:
+    enabled: true
+    max_paths: 6  # 残差验收预算；不限制 MUSIC 子空间维数。
+    false_alarm_probability: 0.01
+    calibration_trials: 1023
+    calibration_seed: 20260912
+    calibration_batch_size: 8
+    duplicate_correlation: 0.98
+    max_refine_evaluations: 60
+localization:
+  bias_min_s: -8.0e-08
+  bias_max_s: 8.0e-08
+  initial_reference_bias_s: 0.0
+  candidate_cluster_radius_m: 1.5
+  candidate_cluster_min_samples: 5
+  diffraction_directions_per_sample: 4
+  diffraction_angle_tolerance_deg: 3.0
+  diffraction_coverage_distance_m: 1.0
+  diffraction_representative_policy: coverage
+  huber_delta_m: 0.75
+  max_iterations: 20
+  max_seed_pairs: 100000
+  candidate_bias_mode: full_interval
+  require_identifiable_solution: true
+output:
+  root: outputs/diffraction_boundary_v4

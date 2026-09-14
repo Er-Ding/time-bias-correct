@@ -73,6 +73,7 @@ def sample_music_spectrum(
     seed: int,
     minimum_angle_separation_rad: float = 0.0,
     minimum_delay_separation_s: float = 0.0,
+    accepted_peak_centers: bool = False,
 ) -> SpectrumSamplingResult:
     """在一份局部细谱上确定正式峰、构造单元概率并生成连续样本。
 
@@ -148,6 +149,15 @@ def sample_music_spectrum(
                 spectrum_value=float(local_spectrum[angle_index, delay_index]),
                 aoa_index=int(angle_index), delay_index=int(delay_index),
             )
+            if accepted_peak_centers:
+                # CSI 检验已确认该成分。局部 MUSIC 仅定义 MC 提议分布，
+                # 不能把中心移到尚未经过检验的另一个谱峰。
+                angle_index = int(np.argmin(abs(angle_edges-coarse_peak.aoa_rad)))
+                delay_index = int(np.argmin(abs(delay_edges-coarse_peak.delay_s)))
+                peak = MusicPeak2D(coarse_peak.aoa_rad, coarse_peak.delay_s,
+                    float(prepared.values(aoa_rad=np.array([coarse_peak.aoa_rad]),
+                                          delay_s=np.array([coarse_peak.delay_s]))[0]),
+                    angle_index, delay_index)
             boundary_axes = []
             if angle_index in (0, grid_size - 1):
                 boundary_axes.append("aoa")
@@ -174,7 +184,7 @@ def sample_music_spectrum(
         suppressed_peaks: list[dict[str, Any]] = []
         for region in sorted(local_regions, key=lambda item: (-item["peak"].spectrum_value, item["source_index"])):
             peak = region["peak"]
-            duplicate = next((other for other in selected_regions
+            duplicate = None if accepted_peak_centers else next((other for other in selected_regions
                               if abs(peak.aoa_rad - other["peak"].aoa_rad) <= minimum_angle_separation_rad
                               and abs(peak.delay_s - other["peak"].delay_s) <= minimum_delay_separation_s), None)
             if duplicate is None:
@@ -293,6 +303,7 @@ def sample_music_spectrum(
             "unresolved_window_peak_source_indices": [region["peak_index"] for region in regions
                                                        if region["unresolved_window_peak"]],
             "added_csi_noise": False, "proposal_is_calibrated_probability": False,
+            "peak_centers_preserved_after_csi_acceptance": accepted_peak_centers,
             "sample_weight_rule": "one; never multiply spectrum values again",
             "prepared_music": prepared.metadata(),
         },

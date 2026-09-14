@@ -43,6 +43,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "music": {
         "num_paths": 3,
         "signal_subspace_rank": 3,
+        "subspace_selection": {"mode": "fixed"},
         "angle_min_deg": -89.0,
         "angle_max_deg": 89.0,
         "angle_step_deg": 1.0,
@@ -63,12 +64,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "spatial_subarray_size": 8,
         "frequency_subarray_size": 32,
         "diagonal_loading": 1e-8,
+        "path_detection": {"enabled": False},
     },
     "localization": {
         "bias_min_s": -80e-9,
         "bias_max_s": 80e-9,
         # 初始候选点共用的公开参考偏差，不是已知真值或最终估计值。
         "initial_reference_bias_s": 0.0,
+        "candidate_bias_mode": "reference",
+        "require_identifiable_solution": False,
         # 仅为旧生成配置快照保持稳定；定位白名单不接收这两个未使用字段。
         "candidate_angle_samples": 5,
         "candidate_delay_samples": 5,
@@ -120,6 +124,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
         {
             "num_paths",
             "signal_subspace_rank",
+            "subspace_selection",
             "angle_min_deg",
             "angle_max_deg",
             "angle_step_deg",
@@ -132,6 +137,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "spatial_subarray_size",
             "frequency_subarray_size",
             "diagonal_loading",
+            "path_detection",
         }
     ),
     "localization": frozenset(
@@ -139,6 +145,8 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "bias_min_s",
             "bias_max_s",
             "initial_reference_bias_s",
+            "candidate_bias_mode",
+            "require_identifiable_solution",
             "candidate_cluster_radius_m",
             "candidate_cluster_min_samples",
             "diffraction_directions_per_sample",
@@ -490,8 +498,16 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
     if delay_min < 0.0 or delay_min >= delay_max:
         raise ValueError("MUSIC 时延范围必须非负且下界小于上界")
     num_paths = _positive_integer("num_paths", music["num_paths"])
-    if num_paths < 2:
+    from .music_subspace import subspace_settings
+    selection = subspace_settings(music.get("subspace_selection", {}))
+    from .path_detection import detection_settings
+    path_detection = detection_settings(music.get("path_detection", {}))
+    if num_paths < 2 and not path_detection["enabled"]:
         raise ValueError("联合位置与偏差估计至少需要两条 MUSIC 路径")
+    if localization.get("candidate_bias_mode", "reference") not in {"reference", "full_interval"}:
+        raise ValueError("candidate_bias_mode 必须为 reference 或 full_interval")
+    if not isinstance(localization.get("require_identifiable_solution", False), bool):
+        raise ValueError("require_identifiable_solution 必须为布尔值")
     spatial_size = _positive_integer(
         "spatial_subarray_size", music["spatial_subarray_size"]
     )
@@ -506,7 +522,7 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
         "signal_subspace_rank", music.get("signal_subspace_rank", num_paths)
     )
     subspace_dimension = spatial_size * frequency_size
-    if signal_subspace_rank >= subspace_dimension:
+    if selection["mode"] == "fixed" and signal_subspace_rank >= subspace_dimension:
         raise ValueError(
             "signal_subspace_rank 必须小于 spatial_subarray_size * "
             "frequency_subarray_size"

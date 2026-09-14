@@ -64,14 +64,22 @@ def test_two_observations_recover_exact_position_and_bias() -> None:
     assert max(result.residuals.values()) < 1e-9
 
 
-def test_seed_pair_budget_is_checked_before_generating_all_pairs() -> None:
+def test_seed_pair_budget_is_checked_before_generating_all_pairs(monkeypatch) -> None:
+    import time_bias_localization.solver as solver
+    from time_bias_localization.solver import SolverBudgetError
     candidates = [
         _candidate(f"path-{group}", f"candidate-{index}", np.array([1.0, 2.0]),
                    3.0, _unit(90.0 * group))
         for group in range(2) for index in range(3)
     ]
-    with pytest.raises(SolverError, match="9.*max_seed_pairs=8"):
-        solve_position_and_bias(candidates, SolverConfig(max_seed_pairs=8))
+    with monkeypatch.context() as patch:
+        def forbidden(*args, **kwargs):
+            pytest.fail("超过配对总量上限时，不应先计算一部分配对")
+        patch.setattr(solver, "_weighted_fit", forbidden)
+        with pytest.raises(SolverBudgetError, match="9.*max_seed_pairs=8") as caught:
+            solve_position_and_bias(candidates, SolverConfig(max_seed_pairs=8))
+        assert caught.value.pair_count == 9
+        assert caught.value.max_seed_pairs == 8
     result = solve_position_and_bias(candidates, SolverConfig(max_seed_pairs=9))
     np.testing.assert_allclose(result.mu, [1.0, 2.0], atol=1e-9)
 

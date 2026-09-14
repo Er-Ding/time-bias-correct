@@ -27,7 +27,19 @@ Array = np.ndarray
 
 
 class SolverError(ValueError):
-    """输入无法形成可辨识的位置与公共偏差解。"""
+    """求解未完成或未得到可辨识的位置与公共偏差解。"""
+
+
+class SolverBudgetError(SolverError):
+    """候选配对总量超过计算预算；尚未据此判断几何是否可解。"""
+
+    def __init__(self, pair_count: int, max_seed_pairs: int):
+        self.pair_count = pair_count
+        self.max_seed_pairs = max_seed_pairs
+        super().__init__(
+            f"跨观测候选对数量 {pair_count} 超过 max_seed_pairs={max_seed_pairs}；"
+            "配对搜索尚未执行，请检查第一次聚类半径与采样范围，或明确提高候选对预算"
+        )
 
 
 def _as_readonly_vector2(value: Sequence[float], name: str) -> Array:
@@ -554,10 +566,7 @@ def _make_seeds(
             for first_id, second_id in combinations(groups, 2)
         )
         if pair_count > config.max_seed_pairs:
-            raise SolverError(
-                f"跨观测候选对数量 {pair_count} 超过 max_seed_pairs={config.max_seed_pairs}；"
-                "请检查第一次聚类半径与采样范围，或明确提高候选对预算"
-            )
+            raise SolverBudgetError(pair_count, config.max_seed_pairs)
         seeds: list[Array] = []
         seen: set[tuple[float, float, float]] = set()
         for first_id, second_id in combinations(groups, 2):
@@ -730,6 +739,7 @@ __all__ = [
     "SolverConfig",
     "SolverDiagnostics",
     "SolverError",
+    "SolverBudgetError",
     "SolverResult",
     "solve_position_and_bias",
     "solve_trajectories",

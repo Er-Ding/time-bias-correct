@@ -24,6 +24,7 @@ from .signal import (
     ula_steering_vector,
 )
 from .timing import register_synchronizer, stage
+from .music_subspace import select_subspace_rank, subspace_settings
 
 
 @dataclass(frozen=True)
@@ -146,8 +147,12 @@ class MusicComputer:
         spatial_subarray_size: int | None = None,
         frequency_subarray_size: int | None = None,
         diagonal_loading: float = 0.0,
+        subspace_selection: dict | None = None,
     ) -> "PreparedMusic":
         """仅对这一份观测构造一次协方差并分解，随后复用以查询任意谱坐标。"""
+        options = subspace_settings(subspace_selection)
+        if options["mode"] == "eigenvalue_threshold":
+            num_sources = 1  # 只通过旧参数校验，实际维数由本份 CSI 的特征值决定。
         if self._device is not None:
             register_synchronizer(self.synchronize)
         with stage('T01_covariance'):
@@ -181,7 +186,7 @@ class MusicComputer:
                 device_observation = self._xp.asarray(observation[None])
             signal_adjoint = self._prepare_subspaces(
                 device_observation, spatial_size,
-                frequency_size, source_count, loading,
+                frequency_size, source_count, loading, options,
             )[0]
         self._batch_count += 1
         self._csi_count += 1
@@ -189,6 +194,7 @@ class MusicComputer:
         return PreparedMusic(
             self, signal_adjoint, frequencies, float(carrier_frequency_hz),
             antenna_spacing_m, spatial_size, frequency_size,
+            self._last_subspace_diagnostics[0],
         )
 
     def spectrum(self, csi: np.ndarray, **kwargs: Any) -> np.ndarray:
@@ -214,6 +220,7 @@ class MusicComputer:
         spatial_subarray_size: int | None = None,
         frequency_subarray_size: int | None = None,
         diagonal_loading: float = 0.0,
+        subspace_selection: dict | None = None,
     ) -> np.ndarray:
         """计算 ``[B,S,M,K]`` 中每份观测的谱，返回 ``[B,A,D]``。
 
@@ -249,6 +256,9 @@ class MusicComputer:
             "frequency_subarray_size", frequency_subarray_size, frequencies.size
         )
         dimension = spatial_size * frequency_size
+        options = subspace_settings(subspace_selection)
+        if options["mode"] == "eigenvalue_threshold":
+            num_sources = 1
         if isinstance(num_sources, bool) or int(num_sources) != num_sources:
             raise ValueError("num_sources 必须是整数")
         source_count = int(num_sources)
@@ -270,7 +280,7 @@ class MusicComputer:
                 stop = min(start + self.settings.batch_size, observations.shape[0])
                 device_result = self._compute_batch(
                     self._xp.asarray(observations[start:stop]), spatial, frequency,
-                    source_count, loading,
+                    source_count, loading, options,
                 )
                 result[start:stop] = (
                     self._xp.asnumpy(device_result)
@@ -332,15 +342,16 @@ class MusicComputer:
         frequency: Any,
         source_count: int,
         loading: float,
+        subspace_selection: dict | None = None,
     ) -> Any:
         signal_adjoint = self._prepare_subspaces(
-            observations, spatial.shape[0], frequency.shape[0], source_count, loading,
+            observations, spatial.shape[0], frequency.shape[0], source_count, loading, subspace_selection,
         )
         return self._evaluate_grid(signal_adjoint, spatial, frequency)
 
     def _prepare_subspaces(
         self, observations: Any, spatial_size: int, frequency_size: int,
-        source_count: int, loading: float,
+        source_count: int, loading: float, subspace_selection: dict | None = None,
     ) -> Any:
         xp = self._xp
         batch_count, snapshot_count, antenna_count, subcarrier_count = observations.shape
@@ -363,14 +374,26 @@ class MusicComputer:
                 covariance += xp.matmul(vectors.swapaxes(-1, -2), vectors.conj())
             covariance /= snapshot_count * window_count
             covariance = (covariance + covariance.conj().swapaxes(-1, -2)) / 2.0
+            loading_shift = xp.zeros(batch_count)
             if loading > 0.0:
                 mean_power = xp.trace(covariance, axis1=-2, axis2=-1).real / dimension
-                covariance += loading * mean_power[:, None, None] * xp.eye(dimension)
+                loading_shift = loading * mean_power
+                covariance += loading_shift[:, None, None] * xp.eye(dimension)
         with stage("T02_subspace", csi_count=int(batch_count)):
             # CuPy 默认忽略 cuSOLVER 的失败状态；实验中必须显式报告不收敛。
             with self._cupyx.errstate(linalg="raise") if self._cupyx else nullcontext():
-                _, eigenvectors = xp.linalg.eigh(covariance)
-            signal_adjoint = eigenvectors[:, :, -source_count:].conj().swapaxes(-1, -2)
+                eigenvalues, eigenvectors = xp.linalg.eigh(covariance)
+            raw_values = eigenvalues - loading_shift[:, None]
+            host_values = xp.asnumpy(raw_values) if self._device is not None else raw_values
+            selections = [select_subspace_rank(row, fixed_rank=source_count, settings=subspace_selection)
+                          for row in host_values]
+            self._last_subspace_diagnostics = [item[1] for item in selections]
+            # 各份 CSI 可以有不同维数。零填充只用于批量矩阵乘法，不增加信号方向。
+            ranks = [item[0] for item in selections]
+            signal_adjoint = xp.zeros((batch_count, max(ranks), dimension), dtype=xp.complex128)
+            for index, rank in enumerate(ranks):
+                if rank:
+                    signal_adjoint[index, :rank] = eigenvectors[index, :, -rank:].conj().T
         self._covariance_count += batch_count
         self._eigendecomposition_count += batch_count
         return signal_adjoint
@@ -404,7 +427,9 @@ class PreparedMusic:
         self, computer: MusicComputer, signal_adjoint: Any, frequencies: np.ndarray,
         carrier_frequency: float, spacing: float | None, spatial_size: int,
         frequency_size: int,
+        subspace_diagnostics: dict | None = None,
     ) -> None:
+        self.subspace_diagnostics = subspace_diagnostics or {}
         self._computer = computer
         self._signal_adjoint = signal_adjoint
         self._frequencies = frequencies

@@ -60,6 +60,33 @@ def test_all_frozen_requests_remain_denominator_and_diagnostics_do_not_filter_er
     assert "NaN" not in (tmp_path / "summary.json").read_text()
 
 
+def test_computation_budgets_are_separate_from_unlocalizable(tmp_path):
+    records = [
+        _record(status="detection_incomplete", stop_reason="path_detection_budget_exhausted", localization_seconds=2.),
+        _record(1, status="solver_budget_exhausted", stop_reason="solver_pair_budget_exhausted", localization_seconds=3.),
+        _record(2, status="unlocalizable", unlocalizable_reason="insufficient_reliable_paths", localization_seconds=1.),
+        _record(3, position_error_m=.2, localization_seconds=4.),
+    ]
+    result = create_boundary_report(tmp_path, records, [_point(repeats=4)], metadata={"plots": False})
+    group = next(g for g in result["groups"] if g["strategy"] == "single")
+    assert group["planned_count"] == 4 and group["numeric_output_count"] == 1
+    assert group["status_counts"]["detection_incomplete"] == 1
+    assert group["status_counts"]["solver_budget_exhausted"] == 1
+    assert group["unlocalizable_fraction_all_planned"] == .25
+    assert group["computation_incomplete_reason_counts"] == {
+        "path_detection_budget_exhausted": 1, "solver_pair_budget_exhausted": 1}
+    assert group["position_error_m"]["mean"] == .2
+    assert group["thresholds_m"][-1]["denominator"] == 4
+    assert group["latency_seconds"]["localization_seconds"]["all_measured_requests"]["count"] == 4
+
+
+@pytest.mark.parametrize("status", ["unlocalizable", "detection_incomplete", "solver_budget_exhausted"])
+def test_no_position_status_cannot_publish_numeric_error(tmp_path, status):
+    with pytest.raises(ValueError, match="无位置输出"):
+        create_boundary_report(tmp_path, [_record(status=status, position_error_m=.1)],
+                               [_point(repeats=1)], metadata={"plots": False})
+
+
 def test_repeated_stage_events_sum_per_request_and_failed_stage_has_separate_denominator(tmp_path):
     def stage(elapsed, status="completed", name="T05_fine_spectrum"):
         return dict(name=name, elapsed_s=elapsed, exclusive_s=elapsed / 2., status=status)
