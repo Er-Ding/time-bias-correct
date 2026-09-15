@@ -53,7 +53,7 @@ from .provenance import (
 )
 from .scene import Scene2D, make_synthetic_room
 from .music_stage import get_music_computer
-from .spectrum_sampling import sample_music_spectrum
+from .spectrum_sampling import sample_music_spectrum, refine_music_peaks
 from .initial_candidates import (
     generate_initial_candidate_points,
     cluster_initial_candidate_points,
@@ -87,6 +87,12 @@ class LocalizationUnavailable(RuntimeError):
         }
         if candidate_result is not None:
             self.result["candidate_solution_for_diagnostics_only"] = candidate_result
+            if candidate_result.get("workflow") == "music_continuous_propagation_v1":
+                for name in ("workflow", "output_type", "selected_paths", "alternatives",
+                             "best_candidate_for_diagnostics_only", "forward_check",
+                             "scientific_validation_status"):
+                    if name in candidate_result:
+                        self.result[name] = candidate_result[name]
 
 
 @dataclass(frozen=True)
@@ -350,9 +356,12 @@ _SPECTRUM_TRAJECTORY_ARTIFACT_FILENAMES = {
 POINT_CLUSTERING_WORKFLOW = "music_point_clustering_v2"
 WORKFLOW = "music_fine_spectrum_dbscan_v3"
 DIFFRACTION_WORKFLOW = "music_diffraction_cover_v4"
+CONTINUOUS_WORKFLOW = "music_continuous_propagation_v1"
 
 
 def workflow_for_config(config):
+    if config["localization"].get("solver_method") == "continuous":
+        return CONTINUOUS_WORKFLOW
     return DIFFRACTION_WORKFLOW if config["scene"].get("max_diffractions", 0) else WORKFLOW
 
 _LOCALIZATION_ARTIFACT_FILENAMES = {
@@ -366,8 +375,27 @@ _LOCALIZATION_ARTIFACT_FILENAMES = {
     "forward_check": "forward_check.json",
 }
 
+_CONTINUOUS_ARTIFACT_FILENAMES = {
+    "result": "localization_result.json",
+    "music_spectrum": "music_spectrum.npz",
+    "music_peaks": "music_peaks.json",
+    "continuous_observations": "continuous_observations.json",
+    "propagation_hypotheses": "propagation_hypotheses.json",
+    "continuous_search": "continuous_search.json",
+    "forward_check": "forward_check.json",
+}
+
+
+def _artifact_filenames_for_config(config):
+    return (_CONTINUOUS_ARTIFACT_FILENAMES if workflow_for_config(config) == CONTINUOUS_WORKFLOW
+            else _LOCALIZATION_ARTIFACT_FILENAMES)
+
 
 def _manifest_artifact_filenames(manifest: dict[str, Any]) -> dict[str, str]:
+    if manifest.get("schema_version") == 8:
+        if manifest.get("workflow") != CONTINUOUS_WORKFLOW:
+            raise ValueError("第 8 版定位清单必须记录连续传播函数流程")
+        return _CONTINUOUS_ARTIFACT_FILENAMES
     if manifest.get("schema_version") == 7:
         if manifest.get("workflow") != DIFFRACTION_WORKFLOW:
             raise ValueError("第 7 版定位清单必须明确记录绕射多代表流程")
@@ -431,7 +459,7 @@ def _archive_previous_evaluation(
         recorded_result_sha256 = str(result_record["sha256"])
     except (KeyError, TypeError, ValueError, OSError) as error:
         raise ValueError("旧定位清单的评估来源记录不完整，拒绝发布新定位产物") from error
-    if manifest_schema_version not in (2, 3, 4, 5, 6, 7):
+    if manifest_schema_version not in (2, 3, 4, 5, 6, 7, 8):
         raise ValueError(
             f"旧定位清单版本 {manifest_schema_version} 不支持无损归档"
         )
@@ -1542,6 +1570,9 @@ def _localize_locked(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         unavailable = isinstance(error, LocalizationUnavailable)
         if unavailable:
             error.result["localization_run_id"] = progress["run_id"]
+            if progress["workflow"] == CONTINUOUS_WORKFLOW:
+                error.result["workflow"] = CONTINUOUS_WORKFLOW
+                error.result["scientific_validation_status"] = "not_validated"
             progress["payloads"]["result"] = error.result
         mark("online_unavailable" if unavailable else "online_failed", failed_step=progress["failed_step"],
              status=error.result["status"] if unavailable else "failed", error_type=type(error).__name__)
@@ -1552,7 +1583,7 @@ def _localize_locked(config: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
                     directory.mkdir(parents=True, exist_ok=False)
                     records = {}
                     for key, payload in progress["payloads"].items():
-                        path = directory / _LOCALIZATION_ARTIFACT_FILENAMES[key]
+                        path = directory / _artifact_filenames_for_config(config)[key]
                         if path.suffix == ".npz":
                             np.savez_compressed(path, **payload)
                         else:
@@ -1836,9 +1867,11 @@ def _localize_locked_impl(
             "coarse_music_peaks": [asdict(peak) for peak in coarse_peaks],
         })
 
-    progress["failed_step"] = "03_spectrum_sampling"
+    continuous = workflow_for_config(config) == CONTINUOUS_WORKFLOW
+    progress["failed_step"] = "03_peak_refinement" if continuous else "03_spectrum_sampling"
+    process_spectrum = refine_music_peaks if continuous else sample_music_spectrum
     with stage('spectrum_processing_total'):
-        sampled = sample_music_spectrum(
+        sampled = process_spectrum(
             prepared, coarse_peaks, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
             bs_boresight_rad=measurement.bs_boresight_rad,
             settings=music_config["spectrum_sampling"],
@@ -1851,13 +1884,19 @@ def _localize_locked_impl(
     nominal_source_indices = sampled.refined_peak_source_indices
     peak_output["nominal"] = [asdict(peak) for peak in nominal_peaks]
     peak_output["nominal_source_indices"] = nominal_source_indices
-    peak_output["observation_samples"] = [asdict(sample) for sample in sampled.samples]
-    progress["payloads"]["spectrum_samples"] = {
-        "workflow": workflow_for_config(config), "samples": sampled.records,
-        "regions": sampled.regions, "diagnostics": sampled.diagnostics,
-    }
-    progress["completed_steps"].append("03_spectrum_sampling")
-    mark_stage("spectrum_sampling")
+    if continuous:
+        peak_output["refinement"] = sampled.diagnostics
+        peak_output["sampling_performed"] = False
+        progress["completed_steps"].append("03_peak_refinement")
+        mark_stage("peak_refinement")
+    else:
+        peak_output["observation_samples"] = [asdict(sample) for sample in sampled.samples]
+        progress["payloads"]["spectrum_samples"] = {
+            "workflow": workflow_for_config(config), "samples": sampled.records,
+            "regions": sampled.regions, "diagnostics": sampled.diagnostics,
+        }
+        progress["completed_steps"].append("03_spectrum_sampling")
+        mark_stage("spectrum_sampling")
     from .observation_screen import screen_music_observation
     with stage("T07_observation_screen"):
         screening = screen_music_observation(nominal_peaks,
@@ -1881,211 +1920,230 @@ def _localize_locked_impl(
             "sampling": sampled.diagnostics,
         })
 
-    progress["failed_step"] = "04_initial_candidates"
-    reference_bias_s = float(localization_config["initial_reference_bias_s"])
-    full_bias = localization_config.get("candidate_bias_mode", "reference") == "full_interval"
-    generator = generate_initial_candidate_points
-    generation_options = {}
-    if full_bias:
-        from .bias_interval_candidates import generate_bias_interval_points
-        generator = generate_bias_interval_points
-        generation_options["bias_interval_s"] = (float(localization_config["bias_min_s"]),
-                                                float(localization_config["bias_max_s"]))
-    with stage('T08_reverse_rt'):
-        initial = generator(
-            scene, measurement.bs_position_m, sampled.samples,
-            reference_bias_s=reference_bias_s,
-            max_reflections=int(config["scene"]["max_reflections"]),
-            max_diffractions=int(config["scene"].get("max_diffractions", 0)),
-            diffraction_directions_per_sample=int(localization_config.get("diffraction_directions_per_sample", 4)),
-            diffraction_angle_tolerance_deg=float(localization_config.get("diffraction_angle_tolerance_deg", 3.0)),
-            **generation_options,
-        )
-    progress["payloads"]["initial_candidates"] = {
-        "reference_bias_s": reference_bias_s,
-        "points": [asdict(point) for point in initial.points],
-        "rejected_samples": initial.rejected_samples,
-        "diagnostics": initial.diagnostics,
-    }
-    progress["completed_steps"].append("04_initial_candidates")
-    mark_stage("initial_candidates")
-    mark("initial_candidates_available", count=len(initial.points), diagnostics=initial.diagnostics)
+    if continuous:
+        from .continuous_pipeline import run_continuous_from_peaks
+        progress["failed_step"] = "04_continuous_functions_and_solution"
+        result, continuous_payloads, _bank, _solver_settings = run_continuous_from_peaks(
+            config, scene, nominal_peaks, nominal_source_indices,
+            measurement.bs_position_m, measurement.bs_boresight_rad,
+            run_id=localization_run_id, artifact_callback=progress["payloads"].update)
+        progress["payloads"].update(continuous_payloads)
+        progress["payloads"]["result"] = result
+        progress["completed_steps"].extend([
+            "04_continuous_functions", "05_continuous_optimization", "06_continuous_forward_check"])
+        mark_stage("continuous_model_and_solution")
+        result["diagnostics"].update(music_diagnostics)
+        result["diagnostics"]["peak_refinement"] = sampled.diagnostics
+        result["diagnostics"]["stage_timings_s"] = stage_timings
+        if result["status"] in NO_POSITION_STATUSES:
+            raise LocalizationUnavailable(result["reason"], result["diagnostics"], result,
+                                          status=result["status"])
+    else:
+        progress["failed_step"] = "04_initial_candidates"
+        reference_bias_s = float(localization_config["initial_reference_bias_s"])
+        full_bias = localization_config.get("candidate_bias_mode", "reference") == "full_interval"
+        generator = generate_initial_candidate_points
+        generation_options = {}
+        if full_bias:
+            from .bias_interval_candidates import generate_bias_interval_points
+            generator = generate_bias_interval_points
+            generation_options["bias_interval_s"] = (float(localization_config["bias_min_s"]),
+                                                    float(localization_config["bias_max_s"]))
+        with stage('T08_reverse_rt'):
+            initial = generator(
+                scene, measurement.bs_position_m, sampled.samples,
+                reference_bias_s=reference_bias_s,
+                max_reflections=int(config["scene"]["max_reflections"]),
+                max_diffractions=int(config["scene"].get("max_diffractions", 0)),
+                diffraction_directions_per_sample=int(localization_config.get("diffraction_directions_per_sample", 4)),
+                diffraction_angle_tolerance_deg=float(localization_config.get("diffraction_angle_tolerance_deg", 3.0)),
+                **generation_options,
+            )
+        progress["payloads"]["initial_candidates"] = {
+            "reference_bias_s": reference_bias_s,
+            "points": [asdict(point) for point in initial.points],
+            "rejected_samples": initial.rejected_samples,
+            "diagnostics": initial.diagnostics,
+        }
+        progress["completed_steps"].append("04_initial_candidates")
+        mark_stage("initial_candidates")
+        mark("initial_candidates_available", count=len(initial.points), diagnostics=initial.diagnostics)
 
-    progress["failed_step"] = "05_point_clustering"
-    with stage('clustering_total'):
-        clustering = cluster_initial_candidate_points(
-            initial.points,
-            position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
-            min_samples=int(localization_config["candidate_cluster_min_samples"]),
-            diffraction_coverage_distance_m=float(localization_config.get("diffraction_coverage_distance_m", 1.0)),
-            diffraction_representative_policy=localization_config.get("diffraction_representative_policy", "coverage"),
-            beta_interval_m=(float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
-                             float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S),
-            return_diagnostics=True,
-            allow_mixed_references=full_bias,
-            diffraction_cluster_representative_max=localization_config.get("diffraction_cluster_representative_max"),
-            diffraction_representative_max=localization_config.get("diffraction_representative_max"),
-        )
-    representatives = clustering.representatives
-    progress["payloads"]["representative_points"] = {
-        "reference_bias_s": reference_bias_s,
-        "representatives": [asdict(point) for point in representatives],
-        "noise_points": [asdict(point) for point in clustering.noise_points],
-        "memberships": clustering.memberships,
-        "diagnostics": clustering.diagnostics,
-    }
-    progress["completed_steps"].append("05_point_clustering")
-    mark_stage("point_clustering")
-    mark("representatives_available", count=len(representatives), diagnostics=clustering.diagnostics,
-         diffraction_count=sum(rep.point.has_diffraction for rep in representatives))
+        progress["failed_step"] = "05_point_clustering"
+        with stage('clustering_total'):
+            clustering = cluster_initial_candidate_points(
+                initial.points,
+                position_radius_m=float(localization_config["candidate_cluster_radius_m"]),
+                min_samples=int(localization_config["candidate_cluster_min_samples"]),
+                diffraction_coverage_distance_m=float(localization_config.get("diffraction_coverage_distance_m", 1.0)),
+                diffraction_representative_policy=localization_config.get("diffraction_representative_policy", "coverage"),
+                beta_interval_m=(float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
+                                 float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S),
+                return_diagnostics=True,
+                allow_mixed_references=full_bias,
+                diffraction_cluster_representative_max=localization_config.get("diffraction_cluster_representative_max"),
+                diffraction_representative_max=localization_config.get("diffraction_representative_max"),
+            )
+        representatives = clustering.representatives
+        progress["payloads"]["representative_points"] = {
+            "reference_bias_s": reference_bias_s,
+            "representatives": [asdict(point) for point in representatives],
+            "noise_points": [asdict(point) for point in clustering.noise_points],
+            "memberships": clustering.memberships,
+            "diagnostics": clustering.diagnostics,
+        }
+        progress["completed_steps"].append("05_point_clustering")
+        mark_stage("point_clustering")
+        mark("representatives_available", count=len(representatives), diagnostics=clustering.diagnostics,
+             diffraction_count=sum(rep.point.has_diffraction for rep in representatives))
 
-    # 只有点簇代表进入此步；此前从未构建任何随 beta 变化的候选轨迹。
-    progress["failed_step"] = "06_representative_trajectories"
-    beta_interval_m = (
-        float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
-        float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S,
-    )
-    with stage('T11_trajectories'):
-        representative_trajectories = build_representative_trajectories(
-            representatives, beta_interval_m=beta_interval_m,
+        # 只有点簇代表进入此步；此前从未构建任何随 beta 变化的候选轨迹。
+        progress["failed_step"] = "06_representative_trajectories"
+        beta_interval_m = (
+            float(localization_config["bias_min_s"]) * SPEED_OF_LIGHT_M_S,
+            float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S,
         )
-    progress["payloads"]["representative_trajectories"] = [
-        _clustered_candidate_dict(candidate) for candidate in representative_trajectories
-    ]
-    progress["completed_steps"].append("06_representative_trajectories")
-    mark_stage("representative_trajectories")
+        with stage('T11_trajectories'):
+            representative_trajectories = build_representative_trajectories(
+                representatives, beta_interval_m=beta_interval_m,
+            )
+        progress["payloads"]["representative_trajectories"] = [
+            _clustered_candidate_dict(candidate) for candidate in representative_trajectories
+        ]
+        progress["completed_steps"].append("06_representative_trajectories")
+        mark_stage("representative_trajectories")
 
-    progress["failed_step"] = "07_joint_solution"
-    if (localization_config.get("require_identifiable_solution", False)
-            and len({t.observation_id for t in representative_trajectories}) < 2):
-        raise LocalizationUnavailable("insufficient_observations_after_clustering", {
-            **music_diagnostics,
-            "path_detection":detection.diagnostics if detection else None,
-            "nominal_music_peak_count":len(nominal_peaks), "point_clustering":clustering.diagnostics,
-            "initial_candidate_count":len(initial.points),"representative_point_count":len(representatives)})
-    with stage('T12_solver'):
-        try:
-            central = solve_position_and_bias(representative_trajectories,
-                _solver_config(localization_config, int(config["project"]["random_seed"])), scene=scene)
-        except RansacSearchError as error:
-            raise LocalizationUnavailable("ransac_search_budget_exhausted", {
-                **music_diagnostics, "solver_reason": str(error), "search": error.diagnostics,
-                "nominal_music_peak_count": len(nominal_peaks), "point_clustering": clustering.diagnostics,
-            }, status="solver_budget_exhausted") from error
-        except SolverBudgetError as error:
-            if localization_config.get("require_identifiable_solution", False):
-                raise LocalizationUnavailable("solver_pair_budget_exhausted", {
-                    **music_diagnostics,
-                    "solver_reason": str(error), "candidate_pair_count": error.pair_count,
-                    "max_seed_pairs": error.max_seed_pairs, "pair_search_started": False,
-                    "path_detection": detection.diagnostics if detection else None,
+        progress["failed_step"] = "07_joint_solution"
+        if (localization_config.get("require_identifiable_solution", False)
+                and len({t.observation_id for t in representative_trajectories}) < 2):
+            raise LocalizationUnavailable("insufficient_observations_after_clustering", {
+                **music_diagnostics,
+                "path_detection":detection.diagnostics if detection else None,
+                "nominal_music_peak_count":len(nominal_peaks), "point_clustering":clustering.diagnostics,
+                "initial_candidate_count":len(initial.points),"representative_point_count":len(representatives)})
+        with stage('T12_solver'):
+            try:
+                central = solve_position_and_bias(representative_trajectories,
+                    _solver_config(localization_config, int(config["project"]["random_seed"])), scene=scene)
+            except RansacSearchError as error:
+                raise LocalizationUnavailable("ransac_search_budget_exhausted", {
+                    **music_diagnostics, "solver_reason": str(error), "search": error.diagnostics,
                     "nominal_music_peak_count": len(nominal_peaks), "point_clustering": clustering.diagnostics,
                 }, status="solver_budget_exhausted") from error
-            raise
-        except SolverError as error:
-            if localization_config.get("require_identifiable_solution", False):
-                raise LocalizationUnavailable("no_solvable_joint_candidate", {**music_diagnostics, "solver_reason":str(error),
-                    "path_detection":detection.diagnostics if detection else None,
-                    "nominal_music_peak_count":len(nominal_peaks),"point_clustering":clustering.diagnostics}) from error
-            raise
-    mark("position_available", mu_m=central.mu.tolist(),
-         clock_bias_s=float(central.beta / SPEED_OF_LIGHT_M_S))
-    progress["completed_steps"].append("07_joint_solution")
-    mark_stage("joint_solution")
-    selected = {
-        str(observation_id): _clustered_candidate_dict(candidate)
-        for observation_id, candidate in central.selected_candidates.items()
-    }
-    # 此协方差来自最终几何残差近似；未把采样数当成独立观测数，
-    # 也未标定谱面采样本身的不确定性。采样会通过代表选择间接影响残差。
-    result = {
-        "schema_version": 4, "workflow": workflow_for_config(config),
-        "localization_run_id": localization_run_id,
-        "output_type": "point_estimate_with_geometric_residual_covariance",
-        "mu_m": central.mu, "sigma_m2": central.sigma,
-        "distance_bias_m": central.beta,
-        "clock_bias_s": central.beta / SPEED_OF_LIGHT_M_S,
-        "central_solution": {
+            except SolverBudgetError as error:
+                if localization_config.get("require_identifiable_solution", False):
+                    raise LocalizationUnavailable("solver_pair_budget_exhausted", {
+                        **music_diagnostics,
+                        "solver_reason": str(error), "candidate_pair_count": error.pair_count,
+                        "max_seed_pairs": error.max_seed_pairs, "pair_search_started": False,
+                        "path_detection": detection.diagnostics if detection else None,
+                        "nominal_music_peak_count": len(nominal_peaks), "point_clustering": clustering.diagnostics,
+                    }, status="solver_budget_exhausted") from error
+                raise
+            except SolverError as error:
+                if localization_config.get("require_identifiable_solution", False):
+                    raise LocalizationUnavailable("no_solvable_joint_candidate", {**music_diagnostics, "solver_reason":str(error),
+                        "path_detection":detection.diagnostics if detection else None,
+                        "nominal_music_peak_count":len(nominal_peaks),"point_clustering":clustering.diagnostics}) from error
+                raise
+        mark("position_available", mu_m=central.mu.tolist(),
+             clock_bias_s=float(central.beta / SPEED_OF_LIGHT_M_S))
+        progress["completed_steps"].append("07_joint_solution")
+        mark_stage("joint_solution")
+        selected = {
+            str(observation_id): _clustered_candidate_dict(candidate)
+            for observation_id, candidate in central.selected_candidates.items()
+        }
+        # 此协方差来自最终几何残差近似；未把采样数当成独立观测数，
+        # 也未标定谱面采样本身的不确定性。采样会通过代表选择间接影响残差。
+        result = {
+            "schema_version": 4, "workflow": workflow_for_config(config),
+            "localization_run_id": localization_run_id,
+            "output_type": "point_estimate_with_geometric_residual_covariance",
             "mu_m": central.mu, "sigma_m2": central.sigma,
             "distance_bias_m": central.beta,
             "clock_bias_s": central.beta / SPEED_OF_LIGHT_M_S,
-        },
-        "central_selected_candidates": selected,
-        "central_residuals_m": central.residuals,
-        "diagnostics": {
-            **asdict(central.diagnostics),
-            "stage_timings_s": stage_timings,
-            "stage_timing_scope": "输入验证到正向检查；不含文件发布及独立评估",
-            **music_diagnostics,
-            "unambiguous_delay_period_s": unambiguous_delay_period_s,
-            "nominal_music_peak_count": len(nominal_peaks),
-            "spectrum_sample_count": len(sampled.samples),
-            "sampling": sampled.diagnostics,
-            "initial_reference_bias_s": reference_bias_s,
-            "initial_candidate_count": len(initial.points),
-            "representative_point_count": len(representatives),
-            "representative_trajectory_count": len(representative_trajectories),
-            "initial_candidate_generation": initial.diagnostics,
-            "point_clustering": {
-                **clustering.diagnostics,
-                "space": "initial_position_xy_at_group_valid_reference" if full_bias else "initial_position_xy_at_reference_bias",
-                "position_radius_m": float(localization_config["candidate_cluster_radius_m"]),
-                "grouping": clustering.diagnostics["grouping_rule"],
-                "representative": (
-                    "diffraction_members_with_recorded_bias_coverage_and_optional_count_limits"
-                    if (config["scene"].get("max_diffractions", 0)
-                        and localization_config.get("diffraction_representative_policy", "coverage") == "coverage")
-                    else "actual_member_medoid"
-                ),
-                "diffraction_representative_policy": localization_config.get(
-                    "diffraction_representative_policy", "coverage"),
-                "uses_trajectory_distance": False,
-                "uses_direction_threshold": False,
+            "central_solution": {
+                "mu_m": central.mu, "sigma_m2": central.sigma,
+                "distance_bias_m": central.beta,
+                "clock_bias_s": central.beta / SPEED_OF_LIGHT_M_S,
             },
-            # 汇总读取器的兼容计数；v2 的对象明确是点与点簇代表。
-            "raw_candidate_count": len(initial.points),
-            "clustered_candidate_count": len(representatives),
-            "candidate_count_semantics": "initial_points_then_representative_points",
-            "covariance_source": "selected_candidate_geometric_residual_approximation",
-            "covariance_calibrated": False,
-            "no_accept_reject_output": True,
-            "path_detection": detection.diagnostics if detection else None,
-        },
-    }
-    progress["failed_step"] = "08_forward_check"
-    with stage('T13_online_checks'):
-        if config["scene"].get("max_diffractions", 0) or localization_config.get("require_identifiable_solution", False):
-            from .diffraction_diagnostics import physical_constraint_rank
-            result["diagnostics"]["diffraction_physical_constraints"] = physical_constraint_rank(
-                scene, central.selected_candidates, central.mu)
-            result["output_type"] = "discrete_candidate_estimate_with_conditional_covariance"
-    progress["payloads"]["result"] = result
-    progress["failed_step"] = "08_forward_check"
-    with stage('T13_online_checks'):
-        forward_check = forward_check_solution(
-            scene, measurement.bs_position_m, central.selected_candidates,
-            central.mu, central.beta, max_reflections=int(config["scene"]["max_reflections"]),
-            max_diffractions=int(config["scene"].get("max_diffractions", 0)),
-            observed_peaks={
-                f"music_path_{index:02d}": {
-                    "aoa_global_rad": local_to_global_aoa(peak.aoa_rad, measurement.bs_boresight_rad),
-                    "delay_s": peak.delay_s,
-                }
-                for index, peak in zip(nominal_source_indices, nominal_peaks, strict=True)
+            "central_selected_candidates": selected,
+            "central_residuals_m": central.residuals,
+            "diagnostics": {
+                **asdict(central.diagnostics),
+                "stage_timings_s": stage_timings,
+                "stage_timing_scope": "输入验证到正向检查；不含文件发布及独立评估",
+                **music_diagnostics,
+                "unambiguous_delay_period_s": unambiguous_delay_period_s,
+                "nominal_music_peak_count": len(nominal_peaks),
+                "spectrum_sample_count": len(sampled.samples),
+                "sampling": sampled.diagnostics,
+                "initial_reference_bias_s": reference_bias_s,
+                "initial_candidate_count": len(initial.points),
+                "representative_point_count": len(representatives),
+                "representative_trajectory_count": len(representative_trajectories),
+                "initial_candidate_generation": initial.diagnostics,
+                "point_clustering": {
+                    **clustering.diagnostics,
+                    "space": "initial_position_xy_at_group_valid_reference" if full_bias else "initial_position_xy_at_reference_bias",
+                    "position_radius_m": float(localization_config["candidate_cluster_radius_m"]),
+                    "grouping": clustering.diagnostics["grouping_rule"],
+                    "representative": (
+                        "diffraction_members_with_recorded_bias_coverage_and_optional_count_limits"
+                        if (config["scene"].get("max_diffractions", 0)
+                            and localization_config.get("diffraction_representative_policy", "coverage") == "coverage")
+                        else "actual_member_medoid"
+                    ),
+                    "diffraction_representative_policy": localization_config.get(
+                        "diffraction_representative_policy", "coverage"),
+                    "uses_trajectory_distance": False,
+                    "uses_direction_threshold": False,
+                },
+                # 汇总读取器的兼容计数；v2 的对象明确是点与点簇代表。
+                "raw_candidate_count": len(initial.points),
+                "clustered_candidate_count": len(representatives),
+                "candidate_count_semantics": "initial_points_then_representative_points",
+                "covariance_source": "selected_candidate_geometric_residual_approximation",
+                "covariance_calibrated": False,
+                "no_accept_reject_output": True,
+                "path_detection": detection.diagnostics if detection else None,
             },
-        )
-    progress["payloads"]["forward_check"] = forward_check
-    progress["completed_steps"].append("08_forward_check")
-    mark_stage("forward_check")
-    mark("checked_complete")
-    result["forward_check"] = forward_check
-    if localization_config.get("require_identifiable_solution", False):
-        result["diagnostics"]["no_accept_reject_output"] = False
-        constraints = result["diagnostics"]["diffraction_physical_constraints"]
-        if not constraints["locally_identifiable"]:
-            raise LocalizationUnavailable("insufficient_independent_physical_constraints", result["diagnostics"], result)
-        result["status"] = "success"
-        result["diagnostics"]["acceptance_scope"] = "local_physical_rank_only; global_uniqueness_and_accuracy_not_guaranteed"
+        }
+        progress["failed_step"] = "08_forward_check"
+        with stage('T13_online_checks'):
+            if config["scene"].get("max_diffractions", 0) or localization_config.get("require_identifiable_solution", False):
+                from .diffraction_diagnostics import physical_constraint_rank
+                result["diagnostics"]["diffraction_physical_constraints"] = physical_constraint_rank(
+                    scene, central.selected_candidates, central.mu)
+                result["output_type"] = "discrete_candidate_estimate_with_conditional_covariance"
+        progress["payloads"]["result"] = result
+        progress["failed_step"] = "08_forward_check"
+        with stage('T13_online_checks'):
+            forward_check = forward_check_solution(
+                scene, measurement.bs_position_m, central.selected_candidates,
+                central.mu, central.beta, max_reflections=int(config["scene"]["max_reflections"]),
+                max_diffractions=int(config["scene"].get("max_diffractions", 0)),
+                observed_peaks={
+                    f"music_path_{index:02d}": {
+                        "aoa_global_rad": local_to_global_aoa(peak.aoa_rad, measurement.bs_boresight_rad),
+                        "delay_s": peak.delay_s,
+                    }
+                    for index, peak in zip(nominal_source_indices, nominal_peaks, strict=True)
+                },
+            )
+        progress["payloads"]["forward_check"] = forward_check
+        progress["completed_steps"].append("08_forward_check")
+        mark_stage("forward_check")
+        mark("checked_complete")
+        result["forward_check"] = forward_check
+        if localization_config.get("require_identifiable_solution", False):
+            result["diagnostics"]["no_accept_reject_output"] = False
+            constraints = result["diagnostics"]["diffraction_physical_constraints"]
+            if not constraints["locally_identifiable"]:
+                raise LocalizationUnavailable("insufficient_independent_physical_constraints", result["diagnostics"], result)
+            result["status"] = "success"
+            result["diagnostics"]["acceptance_scope"] = "local_physical_rank_only; global_uniqueness_and_accuracy_not_guaranteed"
     compute_report = computer.metadata()
     compute_report["counter_scope"] = "worker_lifetime"
     compute_report["this_localization"] = {
@@ -2108,7 +2166,7 @@ def _localize_locked_impl(
         try:
             staged_paths = {
                 artifact_name: staging_dir / filename
-                for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
+                for artifact_name, filename in _artifact_filenames_for_config(config).items()
             }
             for artifact_name, payload in progress["payloads"].items():
                 staged_path = staged_paths[artifact_name]
@@ -2129,10 +2187,10 @@ def _localize_locked_impl(
                 artifact_name: _staged_record(
                     staged_paths[artifact_name], output_dir / filename
                 )
-                for artifact_name, filename in _LOCALIZATION_ARTIFACT_FILENAMES.items()
+                for artifact_name, filename in _artifact_filenames_for_config(config).items()
             }
             localization_manifest = {
-                "schema_version": 7 if config["scene"].get("max_diffractions", 0) else 6,
+                "schema_version": 8 if continuous else 7 if config["scene"].get("max_diffractions", 0) else 6,
                 "workflow": workflow_for_config(config),
                 "stage": "localization",
                 "run_id": localization_run_id,

@@ -1,0 +1,43 @@
+# 连续传播主流程：原始细化峰 -> 地图函数 -> 位置/公共偏差联合优化。
+# 本文件是小场景默认配置。冻结观测对照会沿用源观测的地图、无线和 MUSIC 设置，
+# 仅取本文件的 continuous 参数；参数均为工程设置，未标定为置信概率。
+project:
+  random_seed: 20260915
+compute:
+  backend: numpy
+  device_id: 0
+scene:
+  max_reflections: 2
+  max_diffractions: 1
+radio:
+  bs_position_m: [2.0, 7.0]
+localization:
+  solver_method: continuous
+  require_identifiable_solution: true
+  bias_min_s: -8.0e-8
+  bias_max_s: 8.0e-8
+  continuous:
+    angle_scale_deg: 1.0
+    length_scale_m: 0.75
+    max_hypotheses: 4096
+    max_enumerated_sequences: 50000
+    aoa_gate_deg: 5.0
+    length_gate_sigma: 5.0
+    max_starts: 96
+    max_iterations: 80
+    max_association_iterations: 8
+    max_seed_combinations: 20000
+    huber_delta: 2.0
+    unmatched_cost: 16.0
+    max_residual_norm: 5.0
+    min_observations: 2
+    max_condition_number: 100000000.0
+    rank_relative_tolerance: 1.0e-8
+    convergence_step_m: 1.0e-7
+    convergence_cost: 1.0e-10
+    ambiguity_cost_tolerance: 0.5
+    distinct_position_m: 0.25
+    distinct_bias_m: 0.25
+    max_alternatives: 8
+output:
+  root: outputs/continuous_model_v1

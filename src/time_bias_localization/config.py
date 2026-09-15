@@ -164,6 +164,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "max_iterations",
             "max_seed_pairs",
             "solver_method",
+            "continuous",
             "ransac",
             "diffraction_cluster_representative_max",
             "diffraction_representative_max",
@@ -463,8 +464,11 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
     for name in ("diffraction_cluster_representative_max", "diffraction_representative_max"):
         if localization.get(name) is not None:
             _positive_integer(name, localization[name])
-    if localization.get("solver_method", "exhaustive") not in {"exhaustive", "ransac"}:
-        raise ValueError("solver_method 只能为 exhaustive 或 ransac")
+    if localization.get("solver_method", "exhaustive") not in {"exhaustive", "ransac", "continuous"}:
+        raise ValueError("solver_method 只能为 exhaustive、ransac 或 continuous")
+    if localization.get("solver_method") == "continuous" or "continuous" in localization:
+        from .continuous_config import continuous_settings
+        continuous_settings(localization.get("continuous", {}))
     ransac = localization.get("ransac", {})
     if not isinstance(ransac, Mapping) or set(ransac) - {"max_trials", "inlier_distance_m", "max_refinements"}:
         raise ValueError("ransac 含未知参数或不是字典")

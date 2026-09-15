@@ -38,6 +38,20 @@ DEFAULT_SPECTRUM_SAMPLING: dict[str, Any] = {
 }
 
 
+def sample_music_spectrum(prepared, nominal_peaks, **kwargs) -> SpectrumSamplingResult:
+    """旧流程：细化观测峰后生成其局部采样；保留原参数及随机序列。"""
+    return _process_music_spectrum(prepared, nominal_peaks, **kwargs, generate_samples=True)
+
+
+def refine_music_peaks(prepared, nominal_peaks, *, settings, seed=0, **kwargs) -> SpectrumSamplingResult:
+    """连续流程的观测接口：与旧流程同样细化，但完全跳过随机采样。"""
+    refinement_settings = {name: settings[name] for name in (
+        "aoa_half_width_grid_steps", "delay_half_width_grid_steps", "local_grid_points_per_axis"
+    ) if name in settings}
+    return _process_music_spectrum(prepared, nominal_peaks, settings=refinement_settings,
+                                  seed=0, **kwargs, generate_samples=False)
+
+
 def _sampling_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     unknown = set(settings) - set(DEFAULT_SPECTRUM_SAMPLING)
     if unknown:
@@ -62,7 +76,7 @@ def _sampling_settings(settings: Mapping[str, Any]) -> dict[str, Any]:
     return values
 
 
-def sample_music_spectrum(
+def _process_music_spectrum(
     prepared: PreparedMusic,
     nominal_peaks: Sequence[MusicPeak2D],
     *,
@@ -74,6 +88,7 @@ def sample_music_spectrum(
     minimum_angle_separation_rad: float = 0.0,
     minimum_delay_separation_s: float = 0.0,
     accepted_peak_centers: bool = False,
+    generate_samples: bool = True,
 ) -> SpectrumSamplingResult:
     """在一份局部细谱上确定正式峰、构造单元概率并生成连续样本。
 
@@ -101,7 +116,6 @@ def sample_music_spectrum(
                         ("minimum_delay_separation_s", minimum_delay_separation_s)):
         if isinstance(value, bool) or not np.isfinite(value) or value < 0:
             raise ValueError(f"{name} 必须为有限非负数")
-    rng = np.random.default_rng(seed)
     angle_width = float(np.median(np.diff(angles))) * options["aoa_half_width_grid_steps"]
     delay_width = float(np.median(np.diff(delays))) * options["delay_half_width_grid_steps"]
     samples: list[PathObservationSample] = []
@@ -203,6 +217,34 @@ def sample_music_spectrum(
                     "reason": "refined_peak_within_minimum_physical_separation",
                 })
         selected_regions.sort(key=lambda item: item["source_index"])
+    if not generate_samples:
+        # 连续定位只使用正式峰；不创建随机采样器、单元概率或反向候选点。
+        return SpectrumSamplingResult(
+            samples=[], records=[],
+            regions=[{
+                "observation_id": f"music_path_{r['source_index']:02d}",
+                "source_peak_index": r["source_index"],
+                "nominal_aoa_local_rad": float(r["peak"].aoa_rad),
+                "nominal_delay_s": float(r["peak"].delay_s),
+                "angle_grid_rad": r["angles"].tolist(),
+                "delay_grid_s": r["delays"].tolist(),
+                "local_spectrum": r["spectrum"].tolist(),
+                "boundary_axes": r["boundary_axes"],
+            } for r in selected_regions],
+            refined_peaks=[r["peak"] for r in selected_regions],
+            refined_peak_source_indices=[r["source_index"] for r in selected_regions],
+            diagnostics={
+                "method": "fine_music_peaks_without_sampling",
+                "coarse_peak_count": len(nominal_peaks),
+                "refined_peak_count": len(selected_regions),
+                "suppressed_refined_peaks": suppressed_peaks,
+                "total_samples": 0, "monte_carlo_samples": 0,
+                "sampling_performed": False, "added_csi_noise": False,
+                "proposal_is_calibrated_probability": False,
+                "peak_centers_preserved_after_csi_acceptance": accepted_peak_centers,
+            },
+        )
+    rng = np.random.default_rng(seed)
     with stage('T07_feature_sampling'):
         for region in selected_regions:
             peak_index = region["source_index"]

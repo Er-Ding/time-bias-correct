@@ -14,6 +14,7 @@ WORKFLOW = "music_spectrum_sampling_v1"
 POINT_WORKFLOW = "music_point_clustering_v2"
 FINE_WORKFLOW = "music_fine_spectrum_dbscan_v3"
 DIFFRACTION_WORKFLOW = "music_diffraction_cover_v4"
+CONTINUOUS_WORKFLOW = "music_continuous_propagation_v1"
 
 STEPS = [
     ("00_scene_truth", "场景与仿真真值（仅作参照）", "generate_synthetic_measurement / extract_planar_uplink_csi"),
@@ -148,7 +149,7 @@ def _position(plt, run, solution, directory, title):
     radii = np.sqrt(5.991 * np.maximum(eigenvalues, 0))
     angle = np.degrees(np.arctan2(eigenvectors[1, 1], eigenvectors[0, 1]))
     ellipse_label = ("几何残差近似椭圆（未校准，非采样置信区间）"
-                     if run.get("result", {}).get("workflow") in {WORKFLOW, POINT_WORKFLOW, FINE_WORKFLOW, DIFFRACTION_WORKFLOW}
+                     if run.get("result", {}).get("workflow") in {WORKFLOW, POINT_WORKFLOW, FINE_WORKFLOW, DIFFRACTION_WORKFLOW, CONTINUOUS_WORKFLOW}
                      else "名义 95% 椭圆（未校准）")
     ax.add_patch(Ellipse(estimate, 2 * radii[1], 2 * radii[0], angle=angle, fill=False,
                         color="#4477AA", label=ellipse_label))
@@ -861,10 +862,120 @@ def _export_point_steps(plt, run, directory, row):
     write_json(directory / "sources.json", run.get("sources", []))
 
 
+def _continuous_position(plt, run, directory):
+    """连续结果允许没有真值或唯一解，诊断候选始终明确标注。"""
+    result = run["result"]
+    formal = result.get("mu_m") is not None
+    best = result.get("best_candidate_for_diagnostics_only")
+    if formal:
+        main = {"position_m": result["mu_m"], "beta_m": result.get("distance_bias_m"),
+                "selected_paths": result.get("selected_paths", [])}
+    else:
+        main = best
+    candidates = ([main] if main else []) + list(result.get("alternatives", []))
+    fig, ax = plt.subplots(figsize=(7.2, 5.4), layout="constrained")
+    _scene_axes(ax, run["scene"], run["bs"], run["boresight"])
+    true = run.get("true")
+    if true is not None:
+        ax.scatter(*true, marker="*", color="#CC9239", s=75, label="独立真值（仅参照）", zorder=8)
+    for index, candidate in enumerate(candidates):
+        xy = np.asarray(candidate.get("position_m"), float)
+        if xy.shape != (2,) or not np.all(np.isfinite(xy)):
+            continue
+        label = "正式位置输出" if formal and index == 0 else f"诊断候选 {index + 1}"
+        ax.scatter(*xy, marker="x" if formal and index == 0 else "o", s=45,
+                   color="#4477AA" if index == 0 else "#AA7799", label=label, zorder=9)
+        ax.annotate(label, xy, fontsize=7, xytext=(4, 4), textcoords="offset points")
+    if main:
+        xy = np.asarray(main["position_m"], float)
+        for index, item in enumerate(main.get("selected_paths", [])):
+            nodes = np.asarray([xy, *item.get("interaction_points_m", []), run["bs"]], float)
+            ax.plot(*nodes.T, color=plt.get_cmap("tab10")(index % 10), lw=1.1, alpha=.8,
+                    label=f"{item.get('observation_id', index + 1)} 的入选路径")
+    if formal and result.get("sigma_m2") is not None:
+        from matplotlib.patches import Ellipse
+        covariance = np.asarray(result["sigma_m2"], float)
+        if covariance.shape == (2, 2) and np.all(np.isfinite(covariance)):
+            values, vectors = np.linalg.eigh(covariance)
+            if values.min() >= -1e-9:
+                radii = np.sqrt(np.maximum(values, 0))
+                angle = np.degrees(np.arctan2(vectors[1, 1], vectors[0, 1]))
+                ax.add_patch(Ellipse(result["mu_m"], 2*radii[1], 2*radii[0], angle=angle,
+                                    fill=False, color="#4477AA", label="局部敏感性椭圆（未统计校准）"))
+    if not candidates:
+        ax.text(.5, .04, "本次没有可显示的位置候选；请查看搜索记录与未搜索数量。",
+                transform=ax.transAxes, ha="center", fontsize=8)
+    ax.set_title(f"连续传播定位：{result.get('status', 'unknown')}")
+    ax.legend(fontsize=6, loc="best")
+    fig.suptitle("诊断候选不是正式输出；有限搜索不证明全局唯一性。", fontsize=8)
+    _save(plt, fig, directory, "position_and_paths")
+    selected = main.get("selected_paths", []) if main else []
+    write_json(directory / "displayed_candidates.json", {
+        "formal_position_available": formal, "candidates": candidates,
+        "truth_available": true is not None, "solver_reexecuted": False})
+    if selected:
+        residual_rows = [{"observation_id": item["observation_id"],
+                          "hypothesis_id": item["hypothesis_id"],
+                          "angle_residual_rad": item.get("angle_residual_rad"),
+                          "length_residual_m": item.get("length_residual_m"),
+                          "normalized_residual_norm": item.get("normalized_residual_norm"),
+                          "path_valid": item.get("path_valid")}
+                         for item in selected]
+        write_csv(directory / "displayed_path_residuals.csv", residual_rows)
+
+
+def _export_continuous_steps(plt, run, directory, row):
+    """连续模型单独列出真实阶段，不生成点簇或代表轨迹占位图。"""
+    directory.mkdir(parents=True, exist_ok=False)
+    artifacts = run.get("artifacts", {}) if run else {}
+    steps = [
+        ("01_observations", "角度、时延观测", ("music_peaks", "continuous_observations")),
+        ("02_functions", "由地图直接建立连续传播函数", ("propagation_hypotheses",)),
+        ("03_optimization", "位置与公共偏差连续优化", ("continuous_search", "result")),
+        ("04_validation", "传播路径与原始观测验证", ("forward_check",)),
+    ]
+    lines = ["# 连续传播定位过程", "", "观测 → 连续传播函数 → 联合残差优化 → 物理验证。", "",
+             "点云聚类、代表选择和旧 RANSAC 均未运行。", "",
+             f"本次状态：{row.get('status', 'unknown')}。", ""]
+    index = []
+    for name, title, keys in steps:
+        folder=directory/name
+        folder.mkdir()
+        available=[key for key in keys if key in artifacts]
+        for key in available:
+            source=Path(artifacts[key])
+            _copy(source,folder/source.name)
+        state = {"available_artifacts": available, "completed": all(key in artifacts for key in keys),
+                 "meaning": "所列阶段文件是否保存齐全，不表示定位或科学验证成功"}
+        write_json(folder/"status.json", state)
+        (folder/"README.md").write_text(f"# {title}\n\n"
+            + ("\n".join(f"- [{Path(artifacts[key]).name}]({Path(artifacts[key]).name})" for key in available)
+               if available else "此阶段没有保存结果；不补造中间数据。") + "\n", encoding="utf-8")
+        index.append({"step": name, "title": title, **state})
+        lines.append(f"- [{title}]({name}/)：{'有保存结果' if available else '未完成'}")
+    if run:
+        result=run.get("result", {})
+        if plt is not None:
+            _continuous_position(plt, run, directory/"03_optimization")
+        if run.get("metrics"):
+            folder=directory/"05_independent_evaluation"
+            folder.mkdir()
+            write_json(folder/"metrics.json",run["metrics"])
+            write_csv(folder/"result.csv",[row])
+            lines += ["", "独立真值评价保存在 05_independent_evaluation。"]
+        write_json(directory/"sources.json",run.get("sources",[]))
+    write_json(directory/"attempt.json", row)
+    write_json(directory/"step_index.json", index)
+    lines += ["", "局部路径拟合通过不代表全路径集合或定位效果已获得科学验证。", ""]
+    (directory/"README.md").write_text("\n".join(lines),encoding="utf-8")
+
+
 def export_steps(plt, run, directory: Path, row: dict) -> None:
     """按保存的工作流导出步骤；失败运行也保留已完成阶段。"""
     workflow = (run.get("result", {}).get("workflow", run.get("workflow"))
                 if run else row.get("workflow", FINE_WORKFLOW))
+    if workflow == CONTINUOUS_WORKFLOW:
+        return _export_continuous_steps(plt, run, directory, row)
     if workflow in {POINT_WORKFLOW, FINE_WORKFLOW, DIFFRACTION_WORKFLOW}:
         return _export_point_steps(plt, run, directory, row)
     if workflow != WORKFLOW:

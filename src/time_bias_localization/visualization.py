@@ -42,6 +42,9 @@ def checked_record(record: dict[str, str]) -> Path:
 
 def _candidate_artifacts(artifacts: dict, workflow: str | None) -> dict[str, Any]:
     """按原始工作流保留点、点簇和轨迹的不同含义，缺失阶段不伪造。"""
+    if workflow == "music_continuous_propagation_v1":
+        return {name: read_json(artifacts[name]) if name in artifacts else None
+                for name in ("continuous_observations", "propagation_hypotheses", "continuous_search")}
     if workflow in {"music_point_clustering_v2", "music_fine_spectrum_dbscan_v3", "music_diffraction_cover_v4"}:
         return {
             "initial_candidates": read_json(artifacts["initial_candidates"]) if "initial_candidates" in artifacts else None,
@@ -58,7 +61,10 @@ def _candidate_artifacts(artifacts: dict, workflow: str | None) -> dict[str, Any
 
 def load_run(root: Path) -> dict[str, Any]:
     """核对生成批次、主结果、诊断和评估；不修改原始产物。"""
+    root = Path(root).resolve()
     manifest_path = root / "localization/localization_manifest.json"
+    if not manifest_path.is_file() and (root / "localization/frozen_input_manifest.json").is_file():
+        return load_frozen_continuous_run(root)
     manifest = read_json(manifest_path)
     if manifest.get("evaluation_pending", True):
         raise ValueError(f"该次定位尚未完成独立评估：{root}")
@@ -128,6 +134,125 @@ def load_run(root: Path) -> dict[str, Any]:
                 **_candidate_artifacts(artifacts, result.get("workflow")), sources=sources)
 
 
+def load_frozen_continuous_run(root: Path, *, include_evaluation: bool = True) -> dict[str, Any]:
+    """读取冻结观测的新结果；成功、多解和预算用尽均保留，真值可选。
+
+    冻结清单与 CSI 主流程 v8 是不同来源格式。这里逐一验证冻结文件，
+    不伪造生成批次或声称完成了原始 v8 的独立评价。
+    """
+    root = Path(root).resolve()
+    folder = root / "localization"
+    manifest_path = folder / "frozen_input_manifest.json"
+    manifest = read_json(manifest_path)
+    if manifest.get("schema_version") != 1 or manifest.get("workflow") != "music_continuous_propagation_v1":
+        raise ValueError("不支持的冻结连续定位清单")
+    sources = [artifact_record(manifest_path)]
+    artifacts = {}
+    for name, record in manifest["artifacts"].items():
+        path = checked_record(record)
+        if not path.is_relative_to(folder):
+            raise ValueError("冻结结果产物不在本次定位目录内")
+        artifacts[name] = str(path)
+        sources.append(record)
+    if "localization_result" not in artifacts or "localization_config" not in artifacts:
+        raise ValueError("冻结清单缺少结果或配置")
+    artifacts["result"] = artifacts["localization_result"]
+    result = read_json(artifacts["result"])
+    if (result.get("workflow") != manifest["workflow"]
+            or result.get("localization_run_id") != manifest.get("localization_run_id")):
+        raise ValueError("冻结结果与清单的工作流或运行编号不一致")
+    snapshot = read_json(artifacts["localization_config"])
+    config = snapshot.get("resolved_config", snapshot)
+    radio = config["radio"]
+    bs = np.asarray(radio["bs_position_m"], float)
+    boresight = float(np.deg2rad(radio["bs_boresight_deg"]))
+    if bs.shape != (2,) or not np.all(np.isfinite(bs)) or not np.isfinite(boresight):
+        raise ValueError("冻结配置中的 BS 坐标或朝向无效")
+    public_json = []
+    input_paths = {}
+    for label, record in manifest["inputs"].items():
+        path = checked_record(record)
+        input_paths[label] = str(path)
+        sources.append(record)
+        if path.suffix.lower() == ".json":
+            public_json.append((path, read_json(path)))
+    scenes = [(path, value) for path, value in public_json
+              if isinstance(value, dict) and "bounds_m" in value and "walls" in value]
+    peaks = [(path, value) for path, value in public_json
+             if isinstance(value, dict) and "nominal" in value]
+    if len(scenes) != 1 or len(peaks) != 1:
+        raise ValueError("冻结输入必须唯一绑定地图与原始 MUSIC 峰")
+    scene_path, scene = scenes[0]
+    peaks_path, peak_document = peaks[0]
+    if not np.allclose(scene["bounds_m"], config["scene"]["bounds_m"], rtol=0, atol=1e-8):
+        raise ValueError("冻结地图范围与本次配置不一致")
+    input_paths.update(scene_json=str(scene_path), music_peaks=str(peaks_path))
+    artifacts["music_peaks"] = str(peaks_path)
+    if "continuous_observations" in artifacts:
+        observed = read_json(artifacts["continuous_observations"])["observations"]
+        nominal = peak_document["nominal"]
+        indices = peak_document.get("nominal_source_indices", list(range(len(nominal))))
+        if len(observed) != len(nominal) or len(indices) != len(nominal):
+            raise ValueError("连续观测与冻结原始峰数量不一致")
+        for item, peak, index in zip(observed, nominal, indices):
+            angle_difference = (item["aoa_rad"] - float(peak["aoa_rad"]) - boresight + np.pi) % (2*np.pi) - np.pi
+            if (item["observation_id"] != f"music_path_{int(index):02d}"
+                    or abs(angle_difference) > 1e-10
+                    or not np.isclose(item["observed_length_m"], SPEED_OF_LIGHT_M_S * peak["delay_s"], rtol=1e-12, atol=1e-9)):
+                raise ValueError("连续观测没有对应冻结原始峰")
+
+    true, metrics = None, {}
+    evaluation_binding = "not_loaded"
+    metrics_path = root / "evaluation/metrics.json"
+    if include_evaluation and metrics_path.is_file():
+        recorded_metrics = read_json(metrics_path)
+        sources.append(artifact_record(metrics_path))
+        estimate = np.asarray(result.get("mu_m"), float)
+        if (recorded_metrics.get("status") == "evaluated_after_online_solve"
+                and estimate.shape == (2,) and np.all(np.isfinite(estimate))):
+            truth_record = recorded_metrics["truth_input"]
+            truth_path = checked_record(truth_record)
+            # If the frozen source carries a generation binding, this also
+            # proves the evaluated truth belongs to that source batch.
+            bound_truth = []
+            for _, document in public_json:
+                bundle = document.get("generation_bundle") if isinstance(document, dict) else None
+                if not bundle:
+                    continue
+                generation_path = checked_record(bundle["manifest"])
+                generation, _, bundle_id = load_generation_manifest(generation_path)
+                if bundle_id != bundle["bundle_id"]:
+                    raise ValueError("冻结来源与生成批次不一致")
+                bound_truth.append(generation["artifact_hashes"]["ground_truth"])
+                sources.append(artifact_record(generation_path))
+            if bound_truth and not any(record["sha256"] == truth_record["sha256"] for record in bound_truth):
+                raise ValueError("连续结果的评价真值不属于冻结来源批次")
+            with np.load(truth_path, allow_pickle=False) as values:
+                true_array = np.asarray(values["ue_position_m"], float)
+                true_bias = np.asarray(values["clock_bias_s"], float)
+            if (true_array.shape != (2,) or true_bias.shape != ()
+                    or not np.all(np.isfinite(true_array)) or not np.isfinite(true_bias)):
+                raise ValueError("连续结果的评价真值形状或数值无效")
+            error = float(np.linalg.norm(estimate - true_array))
+            signed_bias_error = (float(result["clock_bias_s"]) - float(true_bias)) * 1e9
+            if (not np.isclose(error, recorded_metrics["position_error_m"], rtol=1e-10, atol=1e-10)
+                    or not np.isclose(abs(signed_bias_error), recorded_metrics["clock_bias_error_ns"], rtol=1e-10, atol=1e-9)):
+                raise ValueError("冻结结果与评价指标重新计算后不一致")
+            true = true_array.tolist()
+            metrics = {"localization_error_m": error, "clock_bias_error_ns": signed_bias_error,
+                       "absolute_clock_bias_error_ns": abs(signed_bias_error),
+                       "true_clock_bias_s": float(true_bias),
+                       "verification": "recomputed_from_frozen_result_and_hashed_truth"}
+            evaluation_binding = "verified_generation_batch" if bound_truth else "explicit_hashed_truth_only"
+            sources.append(truth_record)
+    return dict(root=str(root), workflow=manifest["workflow"], scene=scene, bs=bs.tolist(),
+                boresight=boresight, true=true, result=result, metrics=metrics, paths=[],
+                artifacts=artifacts, input_paths=input_paths,
+                config_path=artifacts["localization_config"], sources=sources,
+                frozen_manifest=manifest, evaluation_binding=evaluation_binding,
+                **_candidate_artifacts(artifacts, result.get("workflow")))
+
+
 def load_failed_run(root: Path, progress_path: str | Path) -> dict[str, Any]:
     """读取 attempt 明确绑定的失败记录；只保留已有阶段，不推断最终解。"""
     progress_path = Path(progress_path).resolve()
@@ -135,7 +260,7 @@ def load_failed_run(root: Path, progress_path: str | Path) -> dict[str, Any]:
     if not progress_path.is_relative_to(failure_root):
         raise ValueError("失败进度文件不属于本次样本的 localization_failures 目录")
     progress = read_json(progress_path)
-    if progress.get("workflow") not in {"music_spectrum_sampling_v1", "music_point_clustering_v2", "music_fine_spectrum_dbscan_v3", "music_diffraction_cover_v4"}:
+    if progress.get("workflow") not in {"music_spectrum_sampling_v1", "music_point_clustering_v2", "music_fine_spectrum_dbscan_v3", "music_diffraction_cover_v4", "music_continuous_propagation_v1"}:
         raise ValueError("失败进度记录的工作流不受支持")
     if progress_path.parent.name != progress["run_id"]:
         raise ValueError("失败进度目录与运行编号不一致")
@@ -317,8 +442,118 @@ def _same_scene_geometry(first: dict[str, Any], second: dict[str, Any]) -> bool:
     return first_walls == second_walls
 
 
-def create_report(output: Path, *, run_roots: list[Path] | None = None, experiment: Path | None = None, summary_only: bool = False) -> Path:
+def _create_frozen_continuous_report(output, *, run_roots=None, comparison=None,
+                                     summary_only=False, include_evaluation=True):
+    """冻结连续定位的诊断报告；不要求位置成功或存在真值。"""
+    from .step_visualization import export_steps
+    entries, sources = [], []
+    if comparison is not None:
+        comparison = Path(comparison).resolve()
+        plan_path, trials_path = comparison / "comparison_plan.json", comparison / "trials.json"
+        plan, trials = read_json(plan_path), read_json(trials_path)
+        if len(trials) != plan["planned_observation_count"]:
+            raise ValueError("冻结对照的逐次记录与计划总数不一致")
+        sources.extend([artifact_record(plan_path), artifact_record(trials_path)])
+        for item in trials:
+            root = Path(item.get("result_dir") or comparison / "trials" / item["ue_id"] / f"repeat_{item['repeat_index']:03d}").resolve()
+            entries.append((root, item))
+    else:
+        entries = [(Path(root).resolve(), {}) for root in run_roots or []]
+    if not entries:
+        raise ValueError("没有可读取的冻结连续结果")
+    loaded = []
+    for entry_index, (root, row) in enumerate(entries, 1):
+        print(f"[连续报告] 核对输入 {entry_index}/{len(entries)}：{root}", flush=True)
+        frozen = root / "localization/frozen_input_manifest.json"
+        if not frozen.is_file():
+            if comparison is None:
+                raise ValueError(f"冻结连续报告要求 frozen_input_manifest.json：{root}")
+            loaded.append((root, row, None))
+            continue
+        run = load_frozen_continuous_run(root, include_evaluation=include_evaluation)
+        if row.get("status") and row["status"] != run["result"]["status"]:
+            raise ValueError("冻结对照逐次状态与本次结果不一致")
+        sources.extend(run["sources"])
+        loaded.append((root, row, run))
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=False)
+    plt = _plotting() if any(run for _, _, run in loaded) and not summary_only else None
+    rows = []
+    links = []
+    for index, (root, recorded, run) in enumerate(loaded, 1):
+        print(f"[连续报告] 导出记录 {index}/{len(loaded)}：{root}", flush=True)
+        result = run["result"] if run else {}
+        metrics = run.get("metrics", {}) if run else {}
+        position = result.get("mu_m")
+        diagnostics = result.get("diagnostics", {})
+        search = diagnostics.get("hypothesis_search", {})
+        row = {
+            "run": f"run_{index:04d}", "ue_id": recorded.get("ue_id", ""),
+            "repeat_index": recorded.get("repeat_index", ""),
+            "status": result.get("status", recorded.get("status", "pending")),
+            "workflow": "music_continuous_propagation_v1", "root": str(root),
+            "position_x_m": position[0] if position is not None else None,
+            "position_y_m": position[1] if position is not None else None,
+            "clock_bias_ns": result["clock_bias_s"] * 1e9 if result.get("clock_bias_s") is not None else None,
+            "matched_observation_count": len(result.get("selected_paths", [])),
+            "alternative_count": len(result.get("alternatives", [])),
+            "hypothesis_budget_exhausted": search.get("budget_exhausted"),
+            "unsearched_sequences": search.get("unsearched_sequences"),
+            "position_error_m": metrics.get("localization_error_m"),
+            "signed_clock_bias_error_ns": metrics.get("clock_bias_error_ns"),
+            "evaluation_binding": run.get("evaluation_binding") if run else None,
+        }
+        rows.append(row)
+        if not summary_only:
+            directory = output / row["run"]
+            export_steps(plt, run, directory, row)
+            links.append(f"- [{row['run']}：{row['status']}]({row['run']}/README.md)")
+    write_csv(output / "results.csv", rows)
+    write_json(output / "results.json", rows)
+    summary = {
+        "recorded_request_count": len(rows), "readable_result_count": sum(run is not None for _, _, run in loaded),
+        "status_counts": dict(Counter(row["status"] for row in rows)),
+        "numeric_output_count": sum(row["position_x_m"] is not None for row in rows),
+        "independently_checked_metric_count": sum(row["position_error_m"] is not None for row in rows),
+        "evaluation_enabled": include_evaluation,
+        "scientific_validation_status": "not_established_by_report",
+    }
+    write_json(output / "summary.json", summary)
+    (output / "README.md").write_text(
+        "# 连续传播定位结果\n\n"
+        "观测 → 地图中的连续传播函数 → 位置与公共偏差优化 → 路径验证。\n\n"
+        "本报告读取已保存结果，不重新求解。成功、多解、预算用尽和未运行记录均保留；"
+        "没有唯一位置时展示诊断候选，不能把候选当作正式位置输出。\n\n"
+        "- [逐次状态与数值](results.csv)\n- [汇总](summary.json)\n"
+        + "\n".join(links)
+        + "\n\n真值可选；只有已有评价且能核对来源与数值时才显示误差。"
+        "椭圆仅表示固定传播解释下的局部敏感性，未校准为统计置信区间。"
+        "传播路线未搜完或有限初值未发现其它解，都不构成全局唯一性证明。\n",
+        encoding="utf-8")
+    write_json(output / "report_manifest.json", {
+        "schema_version": 1, "workflow": "frozen_continuous_diagnostic_report_v1",
+        "read_only_sources": True, "solver_rerun": False,
+        "evaluation_enabled": include_evaluation, "summary_only": summary_only,
+        "plotting_code": artifact_record(Path(__file__)),
+        "step_plotting_code": artifact_record(Path(__file__).with_name("step_visualization.py")),
+        "sources": list({record["path"]: record for record in sources}.values()),
+        "artifacts": [artifact_record(path) for path in sorted(output.rglob("*")) if path.is_file()],
+    })
+    print(f"[连续报告] 完成 {len(rows)}/{len(rows)}，报告目录：{output}", flush=True)
+    return output
+
+
+def create_report(output: Path, *, run_roots: list[Path] | None = None, experiment: Path | None = None,
+                  summary_only: bool = False, skip_evaluation: bool = False) -> Path:
     """单次已有结果或批量实验均可；缺失项保留为 pending。"""
+    if experiment is not None and (Path(experiment) / "comparison_plan.json").is_file():
+        return _create_frozen_continuous_report(output, comparison=experiment,
+                                                summary_only=summary_only, include_evaluation=not skip_evaluation)
+    if any((Path(root) / "localization/frozen_input_manifest.json").is_file() for root in run_roots or []):
+        return _create_frozen_continuous_report(output, run_roots=run_roots,
+                                                summary_only=summary_only, include_evaluation=not skip_evaluation)
+    if skip_evaluation:
+        raise ValueError("--skip-evaluation 当前只适用于冻结连续定位报告")
     from .step_visualization import export_steps, export_summary
     plt = _plotting()
     rows, runs, partial_runs, sources = [], [], [], []
@@ -497,14 +732,16 @@ def create_report(output: Path, *, run_roots: list[Path] | None = None, experime
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="生成场景、路径、初次聚类和定位误差图表")
+    parser = argparse.ArgumentParser(description="读取已有定位结果并导出场景、路径、步骤和可选误差图表")
     inputs = parser.add_mutually_exclusive_group(required=True)
     inputs.add_argument("--run-root", type=Path, action="append", help="已有单次结果目录，可重复指定")
     inputs.add_argument("--experiment", type=Path, help="批量实验目录")
     parser.add_argument("--output", type=Path, required=True, help="新的图表输出目录，禁止覆盖")
     parser.add_argument("--summary-only", action="store_true", help="仅汇总图表，不导出逐步骤图；仍校验全部成功结果的来源")
+    parser.add_argument("--skip-evaluation", action="store_true", help="冻结连续结果仅查看观测、候选、路径和预算，完全不打开评价真值")
     args = parser.parse_args(argv)
-    print(create_report(args.output.resolve(), run_roots=args.run_root, experiment=args.experiment, summary_only=args.summary_only))
+    print(create_report(args.output.resolve(), run_roots=args.run_root, experiment=args.experiment,
+                        summary_only=args.summary_only, skip_evaluation=args.skip_evaluation))
 
 
 if __name__ == "__main__":
