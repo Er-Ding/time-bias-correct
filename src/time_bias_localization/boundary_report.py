@@ -34,6 +34,8 @@ STAGE_LABELS = {
     "T13_online_checks": "在线几何诊断",
 }
 SUBSTAGE_LABELS = {
+    "T07_observation_screen": "观测筛选：完整 CSI 响应相似度",
+    "T12_ransac_sampling": "求解：RANSAC 抽样和逐次一致性检验",
     "T02a_observed_noise": "路径验收：观测噪声估计",
     "T02b_search_calibration": "路径验收：二维整体门槛校准",
     "T02c_residual_search": "路径验收：残差搜索",
@@ -201,12 +203,21 @@ def _group_summary(trials: list[dict[str, Any]]) -> dict[str, Any]:
     diagnostics = [trial for trial in trials if trial.get("forward_valid") is not None]
     constraints = [trial for trial in trials if trial.get("identifiable") is not None]
     counts = Counter(trial["status"] for trial in trials)
+    retained = [trial for trial in executed if trial["status"] != "excluded_observation"]
     result = {
         "planned_count": len(trials), "executed_count": len(executed),
         "ue_count": len({trial["ue_id"] for trial in trials}),
         "numeric_output_count": len(output),
         "output_fraction_all_planned": _fraction(len(output), len(trials)),
         "status_counts": {status: counts[status] for status in sorted(_TRIAL_STATUSES)},
+        "excluded_observation_count": counts["excluded_observation"],
+        "excluded_fraction_all_planned": _fraction(counts["excluded_observation"], len(trials)),
+        "screened_retained_executed_count": len(retained),
+        "output_fraction_screened_retained": _fraction(len(output), len(retained)),
+        "thresholds_screened_retained_m": [{"threshold_m": threshold,
+            "count": sum(trial[f"within_{threshold:g}m"] for trial in retained), "denominator": len(retained),
+            "fraction": _fraction(sum(trial[f"within_{threshold:g}m"] for trial in retained), len(retained))}
+            for threshold in THRESHOLDS_M],
         "unlocalizable_fraction_all_planned":_fraction(counts["unlocalizable"], len(trials)),
         "unlocalizable_reason_counts":dict(Counter(trial.get("unlocalizable_reason", "unknown")
             for trial in trials if trial["status"] == "unlocalizable")),
@@ -418,6 +429,11 @@ def _flatten_precision(cohort, strategy, summary):
                "timeout_fraction_all_planned", "unlocalizable_fraction_all_planned",
                "detection_incomplete_fraction_all_planned", "solver_budget_exhausted_fraction_all_planned")}}
     row.update({f"status_{key}_count": value for key, value in summary["status_counts"].items()})
+    for key in ("excluded_observation_count", "excluded_fraction_all_planned", "screened_retained_executed_count",
+                "output_fraction_screened_retained"):
+        row[key] = summary[key]
+    for item in summary["thresholds_screened_retained_m"]:
+        row[f"within_{item['threshold_m']:g}m_fraction_screened_retained"] = item["fraction"]
     row.update({f"position_error_{key}_m": value for key, value in summary["position_error_m"].items() if key != "count"})
     row["clock_bias_mae_ns"] = summary["clock_bias_mae_ns"]
     for item in summary["thresholds_m"]:
@@ -639,6 +655,8 @@ def create_boundary_report(output_dir, records, points, *, metadata=None) -> dic
         "definitions": {
             "position_error": "二维欧式距离；所有有限数值输出均保留，不按正向检查或可辨识性筛除",
             "output_fraction": "有限位置误差的次数 / 全部冻结计划次数；待运行也保留在分母中",
+            "observation_screen": "排除仅依据观测 MUSIC 峰的完整信号响应相似度；原始请求保留在 trials 中",
+            "screened_retained_denominator": "已执行且未被观测规则排除的次数；包含观测不足、预算退出及失败，不含待运行",
             "latency": "对实际测得值统计并给出次数；待运行或未测量时间不填零",
             "stage_mean": "先累加同一请求的同名阶段，再对该阶段完整执行的请求统计；失败阶段另列",
             "stage_exclusive": "阶段自身耗时；不含已单列的子阶段，避免重复相加",
@@ -654,6 +672,9 @@ def create_boundary_report(output_dir, records, points, *, metadata=None) -> dic
     }
     output_dir.mkdir(parents=True, exist_ok=True)
     _write_csv(output_dir / "trials.csv", [{key: value for key, value in trial.items() if key != "stage_timings"} for trial in trials], empty_fields=_KEYS)
+    _write_csv(output_dir / "excluded_observations.csv", [
+        {key: trial.get(key) for key in (*_KEYS, "input_sha256", "stop_reason", "observation_screen", "result_dir")}
+        for trial in trials if trial["status"] == "excluded_observation"], empty_fields=(*_KEYS, "input_sha256", "stop_reason"))
     _write_csv(output_dir / "stages.csv", stage_rows, empty_fields=(*_KEYS, "name", "status", "elapsed_s", "exclusive_s"))
     _write_csv(output_dir / "per_ue.csv", per_ue, empty_fields=("cohort", "strategy", "ue_id"))
     _write_csv(output_dir / "summary" / "precision.csv", precision_rows, empty_fields=("cohort", "strategy", "planned_count"))

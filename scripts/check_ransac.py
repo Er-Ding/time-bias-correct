@@ -31,8 +31,9 @@ def main():
     command = [sys.executable,"-u","-m","pytest","-q","-p","no:cacheprovider",
                "--junitxml="+str(args.output/"pytest.xml")]
     if args.scope == "focused":
-        command += ["tests/test_standard_music.py","tests/test_music_subspace.py","tests/test_compute.py",
-                    "tests/test_path_detection.py","tests/test_accuracy_fix_integration.py"]
+        command += ["tests/test_ransac_workflow.py", "tests/test_solver.py",
+                    "tests/test_initial_candidates.py", "tests/test_diffraction_workflow.py",
+                    "tests/test_config.py", "tests/test_boundary_report.py", "tests/test_standard_music.py"]
     print(f"[1/2] CPU 测试开始，范围={args.scope}，记录={args.output}", flush=True)
     completed = subprocess.run(command)
     counts = {"tests":0,"failures":0,"errors":0,"skipped":0}

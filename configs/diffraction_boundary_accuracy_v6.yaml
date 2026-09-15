@@ -1,0 +1,15 @@
+# 使用 v6：观测筛选、代表数量上限与 RANSAC；由 run_ransac_experiment.sh 复用 v3 的固定 UE 和原始 CSI。
+generation_config: diffraction_boundary_generation_v6.yaml
+channel_backend: sionna
+pilot_ue_count: 30
+formal_ue_count: 300
+noise_repeats: 5
+random_seed: 20260911
+max_proposals: 100000
+trial_timeout_s: 600.0
+warmup_per_strategy: 5
+timing_snapshots: true
+plots: true
+legal_region:
+  wall_clearance_m: 0.5
+  bs_min_distance_m: 2.0

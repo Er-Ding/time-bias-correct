@@ -10,7 +10,11 @@ import numpy as np
 from .constants import SPEED_OF_LIGHT_M_S
 
 
-def select_cover_members(members, first_index, radius_m, beta_interval_m):
+def select_cover_members(members, first_index, radius_m, beta_interval_m, max_representatives=None):
+    if max_representatives is not None and (isinstance(max_representatives, (bool, np.bool_))
+            or not isinstance(max_representatives, (int, np.integer)) or max_representatives < 1):
+        raise ValueError("绕射簇代表上限必须为正整数或 None")
+    limit = len(members) if max_representatives is None else max_representatives
     if isinstance(radius_m, (bool, np.bool_)) or not np.isfinite(radius_m) or radius_m <= 0:
         raise ValueError("绕射代表点覆盖距离必须为有限正数")
     bounds = np.asarray(beta_interval_m, float)
@@ -71,10 +75,10 @@ def select_cover_members(members, first_index, radius_m, beta_interval_m):
             uncovered[i] = pieces
 
     add(first_index)
-    while float(nearest.max()) > radius_m + 1e-10:
+    while float(nearest.max()) > radius_m + 1e-10 and len(selected) < limit:
         add(int(np.argmax(nearest)))
     reference_count = len(selected)
-    while any(uncovered):
+    while any(uncovered) and len(selected) < limit:
         amounts = [sum(end - start for start, end in pieces) for pieces in uncovered]
         index = int(np.argmax(amounts))
         if index in selected:
@@ -85,9 +89,75 @@ def select_cover_members(members, first_index, radius_m, beta_interval_m):
         "reference_max_nearest_representative_distance_m": float(nearest.max()),
         "reference_coverage_representative_count": reference_count,
         "bias_coverage_extra_representative_count": len(selected) - reference_count,
-        "all_member_valid_bias_intervals_covered": True,
+        "all_member_valid_bias_intervals_covered": not any(uncovered),
+        "representative_max": max_representatives,
+        "representative_limit_reached": len(selected) >= limit and bool(any(uncovered)),
+        "uncovered_member_count": sum(bool(pieces) for pieces in uncovered),
+        "uncovered_member_bias_length_m": float(sum(end - start for pieces in uncovered for start, end in pieces)),
         "bias_interval_m": bounds.tolist(),
         "bias_coverage_rule": "union_of_analytic_quadratic_distance_sublevel_intervals",
         "bias_interval_tolerance_m": interval_tolerance,
         "coverage_scope": "generated_cluster_members_only_not_unsampled_space_or_localization_accuracy",
     }
+
+
+def cap_observation_representatives(representatives, max_count):
+    """每条观测的绕射代表合计上限；先轮流保留各簇中心，再轮流补点。
+
+    簇数本身超过上限时，按原始成员数降序保留，记录全部被删簇。
+    镜面代表不计入此预算。截断后不能沿用截断前的完整覆盖声明。
+    """
+    from collections import defaultdict
+    from dataclasses import replace
+    if max_count is None:
+        return representatives, {"enabled": False}
+    if isinstance(max_count, (bool, np.bool_)) or not isinstance(max_count, (int, np.integer)) or max_count < 1:
+        raise ValueError("每条观测绕射代表上限必须为正整数或 None")
+    observations = defaultdict(lambda: defaultdict(list))
+    for rep in representatives:
+        if rep.point.has_diffraction:
+            observations[rep.point.observation_id][rep.metadata["point_cluster_id"]].append(rep)
+    keep_ids, replacements, records = set(), {}, []
+    for observation, clusters in sorted(observations.items()):
+        ordered = sorted(clusters, key=lambda key: (-len(clusters[key][0].members), key))
+        chosen = []
+        for rank in range(max(map(len, clusters.values()), default=0)):
+            for key in ordered:
+                if rank < len(clusters[key]) and len(chosen) < max_count:
+                    chosen.append(clusters[key][rank])
+            if len(chosen) >= max_count:
+                break
+        ids = {rep.candidate_id for rep in chosen}
+        keep_ids.update(ids)
+        pruned_clusters = []
+        for key, values in clusters.items():
+            kept = [rep for rep in values if rep.candidate_id in ids]
+            if not kept:
+                pruned_clusters.append(key)
+            for rep in kept:
+                metadata = {**rep.metadata, "representative_count": len(kept),
+                            "representative_count_before_observation_cap": len(values),
+                            "observation_representative_max": max_count,
+                            "observation_budget_pruned_cluster_members": len(kept) < len(values)}
+                if len(kept) < len(values):
+                    prior_coverage = {name: metadata.get(name) for name in (
+                        "all_member_valid_bias_intervals_covered", "uncovered_member_count",
+                        "uncovered_member_bias_length_m", "reference_max_nearest_representative_distance_m")}
+                    positions = np.asarray([p.position_m for p in rep.members])
+                    selected_positions = np.asarray([r.point.position_m for r in kept])
+                    reference_gap = np.linalg.norm(positions[:, None] - selected_positions[None, :], axis=2).min(axis=1).max()
+                    metadata.update(all_member_valid_bias_intervals_covered=False,
+                                    coverage_revalidated_after_observation_cap=False,
+                                    coverage_before_observation_cap=prior_coverage,
+                                    reference_max_nearest_representative_distance_m=float(reference_gap),
+                                    uncovered_member_count=None, uncovered_member_bias_length_m=None)
+                replacements[rep.candidate_id] = replace(rep, metadata=metadata)
+        records.append({"observation_id": observation, "before_count": sum(map(len, clusters.values())),
+                        "after_count": len(chosen), "max_count": max_count,
+                        "dropped_representative_ids": [rep.candidate_id for values in clusters.values()
+                                                       for rep in values if rep.candidate_id not in ids],
+                        "dropped_cluster_ids": sorted(pruned_clusters)})
+    kept = [replacements[rep.candidate_id] if rep.point.has_diffraction else rep
+            for rep in representatives if not rep.point.has_diffraction or rep.candidate_id in keep_ids]
+    return kept, {"enabled": True, "per_observation_max": max_count,
+                  "rule": "cluster_size_descending_then_round_robin_coverage_order", "observations": records}

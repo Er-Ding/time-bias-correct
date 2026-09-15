@@ -67,7 +67,7 @@ from .signal import (
     extract_local_music_peaks,
     music_2d_spectrum,
 )
-from .solver import CandidateTrajectory, SolverConfig, SolverError, SolverBudgetError, solve_position_and_bias
+from .solver import CandidateTrajectory, SolverConfig, SolverError, SolverBudgetError, RansacSearchError, solve_position_and_bias
 from .localization_status import NO_POSITION_STATUSES
 from .timing import mark, register_synchronizer, stage
 
@@ -80,7 +80,8 @@ class LocalizationUnavailable(RuntimeError):
         super().__init__(reason)
         self.result = {
             "status": status, "reason": reason,
-            "output_type": "no_unique_position" if status == "unlocalizable" else "no_position_computation_incomplete",
+            "output_type": ("excluded_by_observation_screen" if status == "excluded_observation" else
+                            "no_unique_position" if status == "unlocalizable" else "no_position_computation_incomplete"),
             "mu_m": None, "clock_bias_s": None,
             "sigma_m2": None, "distance_bias_m": None, "diagnostics": diagnostics,
         }
@@ -1203,11 +1204,17 @@ def _build_observation_samples(
     return nominal_samples, per_repetition
 
 
-def _solver_config(localization_config: dict[str, Any]) -> SolverConfig:
+def _solver_config(localization_config: dict[str, Any], random_seed: int = 0) -> SolverConfig:
+    ransac = localization_config.get("ransac", {})
     return SolverConfig(
         huber_delta=float(localization_config["huber_delta_m"]),
         max_iterations=int(localization_config["max_iterations"]),
         max_seed_pairs=int(localization_config.get("max_seed_pairs", 100000)),
+        method=localization_config.get("solver_method", "exhaustive"),
+        ransac_max_trials=int(ransac.get("max_trials", 2048)),
+        ransac_inlier_distance_m=float(ransac.get("inlier_distance_m", 2.0)),
+        ransac_max_refinements=int(ransac.get("max_refinements", 24)),
+        ransac_seed=int(random_seed),
     )
 
 
@@ -1710,6 +1717,21 @@ def _localize_locked_impl(
             raise LocalizationUnavailable(
                 "insufficient_reliable_paths", detection_diagnostics)
         signal_subspace_rank = len(detection.peaks)
+    standard_music = not detector_options["enabled"]
+    feature_extraction = {
+        "method": "standard_music" if standard_music else "residual_csi_validation",
+        "peak_count_source": (
+            "observed_signal_subspace_rank" if standard_music and automatic_subspace
+            else "configured_num_paths" if standard_music else "residual_csi_validation"
+        ),
+        "peak_limit": num_paths if standard_music and not automatic_subspace else None,
+        "configured_num_paths": num_paths,
+        "iterative_residual_detection": detector_options["enabled"],
+        "csi_source": "original_observed_csi",
+        "local_refinement": "original_csi_music_grid" if standard_music else "joint_csi_refit",
+        "path_count_is_guaranteed": False,
+    }
+    progress["payloads"].setdefault("music_peaks", {}).update(feature_extraction=feature_extraction)
     try:
         prepared = computer.prepare(
             measurement.csi_observed,
@@ -1723,22 +1745,37 @@ def _localize_locked_impl(
             diagonal_loading=float(music_config["diagonal_loading"]),
         )
     except SubspaceSelectionError as error:
-        progress["payloads"]["music_peaks"] = {"subspace_selection": error.diagnostics}
+        progress["payloads"]["music_peaks"].update(subspace_selection=error.diagnostics)
         raise LocalizationUnavailable("music_noise_reference_unresolved",
-            {"music_subspace_selection": error.diagnostics}, status="detection_incomplete") from error
+            {"music_subspace_selection": error.diagnostics,
+             "music_feature_extraction": feature_extraction,
+             "requested_music_peak_count": feature_extraction["peak_limit"],
+             "nominal_music_peak_count": 0}, status="detection_incomplete") from error
     subspace_diagnostics = prepared.subspace_diagnostics
     signal_subspace_rank = subspace_diagnostics["signal_rank"]
-    progress["payloads"].setdefault("music_peaks", {}).update(subspace_selection=subspace_diagnostics)
+    # 标准 MUSIC 直接从原观测的谱取峰。自动模式用观测得到的维数作为
+    # 峰数上限，不能在关闭残差检测后退回旧 num_paths=3，也不受六条预算限制。
+    requested_peak_count = signal_subspace_rank if standard_music and automatic_subspace else num_paths
+    coarse_peak_limit = None if automatic_subspace and detector_options["enabled"] else requested_peak_count
+    feature_extraction["peak_limit"] = requested_peak_count if standard_music else None
+    music_diagnostics = {
+        "music_signal_subspace_rank": signal_subspace_rank,
+        "music_subspace_selection": subspace_diagnostics,
+        "requested_music_peak_count": requested_peak_count,
+        "music_feature_extraction": feature_extraction,
+    }
+    progress["payloads"].setdefault("music_peaks", {}).update(
+        subspace_selection=subspace_diagnostics, feature_extraction=feature_extraction)
     if automatic_subspace and signal_subspace_rank == 0:
         raise LocalizationUnavailable("no_signal_subspace_above_threshold",
-                                     {"music_subspace_selection": subspace_diagnostics})
+                                     {**music_diagnostics, "nominal_music_peak_count": 0})
     with stage('coarse_music_total'):
         with stage('T03_coarse_spectrum'):
             spectrum = prepared.spectrum(aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid)
         with stage('T04_coarse_peaks'):
             coarse_peaks = detection.peaks if detection is not None else extract_local_music_peaks(
                 spectrum, aoa_grid_rad=aoa_grid, delay_grid_s=delay_grid,
-                max_peaks=None if automatic_subspace and detector_options["enabled"] else num_paths,
+                max_peaks=coarse_peak_limit,
                 minimum_relative_height=0.0,
                 minimum_separation_bins=_separation_bins(music_config),
             )
@@ -1758,7 +1795,7 @@ def _localize_locked_impl(
         progress["payloads"]["music_peaks"].update(
             path_detection=detection.diagnostics, music_proposals=[asdict(p) for p in music_proposals],
             nominal=[asdict(p) for p in detection.peaks])
-        diagnostics = {"music_subspace_selection": subspace_diagnostics,
+        diagnostics = {**music_diagnostics,
                        "path_detection": detection.diagnostics,
                        "nominal_music_peak_count": len(detection.peaks)}
         stop = detection.diagnostics["stop_reason"]
@@ -1773,6 +1810,7 @@ def _localize_locked_impl(
         coarse_peaks = detection.peaks
     peak_output = {
         "subspace_selection": subspace_diagnostics,
+        "feature_extraction": feature_extraction,
         "music_proposals": [asdict(p) for p in music_proposals] if automatic_subspace else [],
         "workflow": workflow_for_config(config),
         "note": "谱值用于候选搜索，不是经过校准的路径概率；不对观测 CSI 额外加噪",
@@ -1793,7 +1831,10 @@ def _localize_locked_impl(
     progress["completed_steps"].append("02_music")
     mark_stage("music_observed")
     if len(coarse_peaks) < 2:
-        raise RuntimeError(f"二维 MUSIC 只找到 {len(coarse_peaks)} 个搜索区域，无法联合求解")
+        raise LocalizationUnavailable("insufficient_music_peaks", {
+            **music_diagnostics, "nominal_music_peak_count": len(coarse_peaks),
+            "coarse_music_peaks": [asdict(peak) for peak in coarse_peaks],
+        })
 
     progress["failed_step"] = "03_spectrum_sampling"
     with stage('spectrum_processing_total'):
@@ -1817,8 +1858,28 @@ def _localize_locked_impl(
     }
     progress["completed_steps"].append("03_spectrum_sampling")
     mark_stage("spectrum_sampling")
+    from .observation_screen import screen_music_observation
+    with stage("T07_observation_screen"):
+        screening = screen_music_observation(nominal_peaks,
+            num_antennas=measurement.csi_observed.shape[-2],
+            antenna_spacing_m=measurement.antenna_spacing_m,
+            carrier_frequency_hz=measurement.carrier_frequency_hz,
+            frequencies_hz=measurement.subcarrier_frequencies_hz,
+            settings=music_config.get("observation_screen", {}))
+    peak_output["observation_screen"] = screening
+    music_diagnostics["observation_screen"] = screening
+    if screening["excluded"]:
+        raise LocalizationUnavailable("near_identical_music_responses", {
+            **music_diagnostics, "nominal_music_peak_count": len(nominal_peaks),
+            "nominal_music_peaks": [asdict(peak) for peak in nominal_peaks],
+        }, status="excluded_observation")
     if len(nominal_peaks) < 2:
-        raise RuntimeError(f"细谱找峰并去重后只有 {len(nominal_peaks)} 条路径，无法联合求解")
+        raise LocalizationUnavailable("insufficient_music_peaks_after_refinement", {
+            **music_diagnostics, "nominal_music_peak_count": len(nominal_peaks),
+            "coarse_music_peak_count": len(coarse_peaks),
+            "nominal_music_peaks": [asdict(peak) for peak in nominal_peaks],
+            "sampling": sampled.diagnostics,
+        })
 
     progress["failed_step"] = "04_initial_candidates"
     reference_bias_s = float(localization_config["initial_reference_bias_s"])
@@ -1862,6 +1923,8 @@ def _localize_locked_impl(
                              float(localization_config["bias_max_s"]) * SPEED_OF_LIGHT_M_S),
             return_diagnostics=True,
             allow_mixed_references=full_bias,
+            diffraction_cluster_representative_max=localization_config.get("diffraction_cluster_representative_max"),
+            diffraction_representative_max=localization_config.get("diffraction_representative_max"),
         )
     representatives = clustering.representatives
     progress["payloads"]["representative_points"] = {
@@ -1896,15 +1959,23 @@ def _localize_locked_impl(
     if (localization_config.get("require_identifiable_solution", False)
             and len({t.observation_id for t in representative_trajectories}) < 2):
         raise LocalizationUnavailable("insufficient_observations_after_clustering", {
+            **music_diagnostics,
             "path_detection":detection.diagnostics if detection else None,
             "nominal_music_peak_count":len(nominal_peaks), "point_clustering":clustering.diagnostics,
             "initial_candidate_count":len(initial.points),"representative_point_count":len(representatives)})
     with stage('T12_solver'):
         try:
-            central = solve_position_and_bias(representative_trajectories, _solver_config(localization_config))
+            central = solve_position_and_bias(representative_trajectories,
+                _solver_config(localization_config, int(config["project"]["random_seed"])), scene=scene)
+        except RansacSearchError as error:
+            raise LocalizationUnavailable("ransac_search_budget_exhausted", {
+                **music_diagnostics, "solver_reason": str(error), "search": error.diagnostics,
+                "nominal_music_peak_count": len(nominal_peaks), "point_clustering": clustering.diagnostics,
+            }, status="solver_budget_exhausted") from error
         except SolverBudgetError as error:
             if localization_config.get("require_identifiable_solution", False):
                 raise LocalizationUnavailable("solver_pair_budget_exhausted", {
+                    **music_diagnostics,
                     "solver_reason": str(error), "candidate_pair_count": error.pair_count,
                     "max_seed_pairs": error.max_seed_pairs, "pair_search_started": False,
                     "path_detection": detection.diagnostics if detection else None,
@@ -1913,7 +1984,7 @@ def _localize_locked_impl(
             raise
         except SolverError as error:
             if localization_config.get("require_identifiable_solution", False):
-                raise LocalizationUnavailable("no_solvable_joint_candidate", {"solver_reason":str(error),
+                raise LocalizationUnavailable("no_solvable_joint_candidate", {**music_diagnostics, "solver_reason":str(error),
                     "path_detection":detection.diagnostics if detection else None,
                     "nominal_music_peak_count":len(nominal_peaks),"point_clustering":clustering.diagnostics}) from error
             raise
@@ -1945,9 +2016,7 @@ def _localize_locked_impl(
             **asdict(central.diagnostics),
             "stage_timings_s": stage_timings,
             "stage_timing_scope": "输入验证到正向检查；不含文件发布及独立评估",
-            "music_signal_subspace_rank": signal_subspace_rank,
-            "music_subspace_selection": subspace_diagnostics,
-            "requested_music_peak_count": num_paths,
+            **music_diagnostics,
             "unambiguous_delay_period_s": unambiguous_delay_period_s,
             "nominal_music_peak_count": len(nominal_peaks),
             "spectrum_sample_count": len(sampled.samples),
@@ -1963,7 +2032,7 @@ def _localize_locked_impl(
                 "position_radius_m": float(localization_config["candidate_cluster_radius_m"]),
                 "grouping": clustering.diagnostics["grouping_rule"],
                 "representative": (
-                    "diffraction_members_with_continuous_bias_coverage"
+                    "diffraction_members_with_recorded_bias_coverage_and_optional_count_limits"
                     if (config["scene"].get("max_diffractions", 0)
                         and localization_config.get("diffraction_representative_policy", "coverage") == "coverage")
                     else "actual_member_medoid"

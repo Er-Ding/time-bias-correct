@@ -1,5 +1,14 @@
 # 时间偏差校正的二维多径定位
 
+新增入口 `run_ransac_experiment.sh` 使用 **v6 观测筛选、绕射代表上限与 RANSAC**，
+仍使用标准 MUSIC。算法参数、排除比例口径及后台管理命令见
+[RANSAC v6](/data/zhujun/differt_projects/time-bias-correct/docs/ransac_v6.md)。
+
+原固定 CSI 重跑入口 `run_music_rerun.sh` 默认使用 **v5 标准 MUSIC 直接读峰**：
+从原始 CSI 计算子空间和谱，以自动估计的信号维数作为峰数上限，关闭逐次残差拟合与验收。
+CPU 检查入口为 `run_standard_music_check.sh`。参数、流程边界和后台运行命令见
+[标准 MUSIC v5](/data/zhujun/differt_projects/time-bias-correct/docs/standard_music_v5.md)。
+
 针对定位大误差的修复版提供 `run_accuracy_fixes.sh`：从观测 CSI 检验有效路径，
 保留整个时间偏差区间内的反射/绕射候选，并将约束不足记为无法定位。
 开关、验收及新一轮 30 UE × 5 噪声实验见

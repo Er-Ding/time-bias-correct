@@ -329,6 +329,8 @@ def cluster_initial_candidate_points(
     diffraction_representative_policy: str = "coverage",
     beta_interval_m: tuple[float, float] | None = None,
     allow_mixed_references: bool = False,
+    diffraction_cluster_representative_max: int | None = None,
+    diffraction_representative_max: int | None = None,
 ) -> list[RepresentativeCandidatePoint] | InitialCandidateClusteringResult:
     """同一来源峰、完整传播顺序内，对参考位置进行确定性 DBSCAN 聚类。
 
@@ -458,6 +460,7 @@ def cluster_initial_candidate_points(
                     if diffraction_representative_policy == "coverage":
                         selected_indices, coverage = select_cover_members(
                             members, members.index(representative), diffraction_coverage_distance_m, beta_interval_m,
+                            max_representatives=diffraction_cluster_representative_max,
                         )
                     else:
                         selected_indices, coverage = [members.index(representative)], {
@@ -512,6 +515,12 @@ def cluster_initial_candidate_points(
             "noise_point_count": int(np.count_nonzero(labels < 0)),
             "noise_sample_ids": [group[index].sample_id for index in np.flatnonzero(labels < 0)],
         })
+    from .representative_cover import cap_observation_representatives
+    with stage("T10_representatives"):
+        representatives, budget_diagnostics = cap_observation_representatives(representatives, diffraction_representative_max)
+    selected_samples = {(rep.point.observation_id, rep.point.sample_id) for rep in representatives}
+    for member in memberships:
+        member["is_representative"] = (member["observation_id"], member["sample_id"]) in selected_samples
     result = InitialCandidateClusteringResult(representatives, noise_points, memberships, {
         "algorithm": "dbscan",
         "eps_m": float(position_radius_m),
@@ -529,6 +538,8 @@ def cluster_initial_candidate_points(
         "input_point_count": len(points),
         "cluster_count": cluster_count,
         "representative_count": len(representatives),
+        "diffraction_cluster_representative_max": diffraction_cluster_representative_max,
+        "diffraction_representative_budget": budget_diagnostics,
         "core_point_count": sum(row["role"] == "core" for row in memberships),
         "border_point_count": sum(row["role"] == "border" for row in memberships),
         "noise_point_count": len(noise_points),

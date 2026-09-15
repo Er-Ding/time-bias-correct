@@ -65,6 +65,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "frequency_subarray_size": 32,
         "diagonal_loading": 1e-8,
         "path_detection": {"enabled": False},
+        "observation_screen": {"enabled": False, "max_response_correlation": 0.995},
     },
     "localization": {
         "bias_min_s": -80e-9,
@@ -79,6 +80,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "huber_delta_m": 0.75,
         "max_iterations": 20,
         "max_seed_pairs": 100000,
+        "solver_method": "exhaustive",
+        "ransac": {"max_trials": 2048, "inlier_distance_m": 2.0, "max_refinements": 24},
+        "diffraction_cluster_representative_max": None,
+        "diffraction_representative_max": None,
         # DBSCAN 的邻域距离 eps，允许一个连续簇的总跨度超过此值。
         "candidate_cluster_radius_m": 1.5,
         "candidate_cluster_min_samples": 5,
@@ -138,6 +143,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "frequency_subarray_size",
             "diagonal_loading",
             "path_detection",
+            "observation_screen",
         }
     ),
     "localization": frozenset(
@@ -157,6 +163,10 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "huber_delta_m",
             "max_iterations",
             "max_seed_pairs",
+            "solver_method",
+            "ransac",
+            "diffraction_cluster_representative_max",
+            "diffraction_representative_max",
         }
     ),
     "output": frozenset({"root"}),
@@ -450,6 +460,25 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
     _positive_integer("diffraction_directions_per_sample", localization.get("diffraction_directions_per_sample", 4))
     if localization.get("diffraction_representative_policy", "coverage") not in {"single", "coverage"}:
         raise ValueError("diffraction_representative_policy 只能为 single 或 coverage")
+    for name in ("diffraction_cluster_representative_max", "diffraction_representative_max"):
+        if localization.get(name) is not None:
+            _positive_integer(name, localization[name])
+    if localization.get("solver_method", "exhaustive") not in {"exhaustive", "ransac"}:
+        raise ValueError("solver_method 只能为 exhaustive 或 ransac")
+    ransac = localization.get("ransac", {})
+    if not isinstance(ransac, Mapping) or set(ransac) - {"max_trials", "inlier_distance_m", "max_refinements"}:
+        raise ValueError("ransac 含未知参数或不是字典")
+    for name, default in (("max_trials", 2048), ("max_refinements", 24)):
+        _positive_integer("ransac." + name, ransac.get(name, default))
+    _positive_float("ransac.inlier_distance_m", ransac.get("inlier_distance_m", 2.0))
+    screen = config["music"].get("observation_screen", {})
+    if not isinstance(screen, Mapping) or set(screen) - {"enabled", "max_response_correlation"}:
+        raise ValueError("observation_screen 含未知参数或不是字典")
+    if not isinstance(screen.get("enabled", False), bool):
+        raise ValueError("observation_screen.enabled 必须为布尔值")
+    correlation = _positive_float("max_response_correlation", screen.get("max_response_correlation", 0.995))
+    if correlation > 1:
+        raise ValueError("max_response_correlation 不能超过 1")
     _positive_float("diffraction_coverage_distance_m", localization.get("diffraction_coverage_distance_m", 1.0))
     angle_tolerance = _positive_float("diffraction_angle_tolerance_deg", localization.get("diffraction_angle_tolerance_deg", 3.0))
     if angle_tolerance >= 90:
@@ -502,7 +531,7 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
     selection = subspace_settings(music.get("subspace_selection", {}))
     from .path_detection import detection_settings
     path_detection = detection_settings(music.get("path_detection", {}))
-    if num_paths < 2 and not path_detection["enabled"]:
+    if num_paths < 2 and not path_detection["enabled"] and selection["mode"] == "fixed":
         raise ValueError("联合位置与偏差估计至少需要两条 MUSIC 路径")
     if localization.get("candidate_bias_mode", "reference") not in {"reference", "full_interval"}:
         raise ValueError("candidate_bias_mode 必须为 reference 或 full_interval")

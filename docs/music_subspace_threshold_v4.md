@@ -80,3 +80,30 @@ bash /data/zhujun/differt_projects/time-bias-correct/run_music_subspace_check.sh
 ```
 
 该任务已经结束；停止命令会返回结束记录，不会停止其他任务。第一次沙箱内启动没有结束记录；后续阈值和测试记录路径修正前的失败验收目录均保留，不能把它们误认为完成的定位实验。
+
+## 固定 CSI 重跑定位实验
+
+入口为 `/data/zhujun/differt_projects/time-bias-correct/run_music_rerun.sh`。实验配置是 `configs/diffraction_boundary_accuracy_v4.yaml`，其中引用 `configs/diffraction_boundary_generation_v4.yaml` 的 MUSIC 设置。旧 `run_accuracy_fixes.sh` 默认仍引用 v3，不能直接用它的默认参数验证本次修改。该重跑脚本目前默认使用 v5；复核本节历史 v4 流程时，必须像下方命令一样显式指定 v4 实验配置。
+
+重跑沿用 `/data/zhujun/differt_projects/time-bias-correct/outputs/diffraction_boundary_v3` 中的 30 个 UE、每点 5 份 CSI 和随机种子，两种策略各重新计算 150 次定位。程序核对源文件摘要后引用原数据，新结果写入独立目录；源目录须保留。以下 GPU 列表仅为填写示例，启动前改成本次允许使用的编号。
+
+```bash
+cd /data/zhujun/differt_projects/time-bias-correct
+MUSIC_RERUN_CONFIG_PATH=/data/zhujun/differt_projects/time-bias-correct/configs/diffraction_boundary_accuracy_v4.yaml \
+MUSIC_RERUN_GPU_IDS=0,1,2,3,4,5,6,7 \
+MUSIC_RERUN_OUTPUT_ROOT=/data/zhujun/differt_projects/time-bias-correct/outputs/diffraction_boundary_music_v4_20260914_01 \
+bash /data/zhujun/differt_projects/time-bias-correct/run_music_rerun.sh
+
+# 实时日志：内部使用 tail -n 100 -F，先打印完整日志路径。
+bash /data/zhujun/differt_projects/time-bias-correct/run_music_rerun.sh log /data/zhujun/differt_projects/time-bias-correct/outputs/diffraction_boundary_music_v4_20260914_01
+
+# 查看实际任务、结束记录和退出码。
+bash /data/zhujun/differt_projects/time-bias-correct/run_music_rerun.sh status /data/zhujun/differt_projects/time-bias-correct/outputs/diffraction_boundary_music_v4_20260914_01
+
+# 核对进程身份后停止整项任务及子进程。
+bash /data/zhujun/differt_projects/time-bias-correct/run_music_rerun.sh stop /data/zhujun/differt_projects/time-bias-correct/outputs/diffraction_boundary_music_v4_20260914_01
+```
+
+任务通过 `nohup` 和 `setsid` 在后台执行，关闭终端或 SSH 断线不会停止任务；查看日志时 `Ctrl+C` 只退出查看。实际日志与运行记录在 `/data/zhujun/differt_projects/time-bias-correct/outputs/diffraction_boundary_music_v4_20260914_01/run_records/<启动时间_编号>/`，启动器打印完整路径，并保存到该输出目录的 `latest_run.txt`。每次重新实验更换输出目录，避免混用旧结果。
+
+最终误差、用时与两种策略的对照报告位于输出目录的 `pilot/report/`。这轮仍保留 6 条路径验收上限和 10 万对候选上限，仅更换 MUSIC 流程；本入口的添加不表示已启动或完成该轮实验。

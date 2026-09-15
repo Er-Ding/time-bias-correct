@@ -425,6 +425,8 @@ def trial_record(point: dict, repeat: int, strategy: str, payload: dict, observa
             "progress_path":payload.get("progress_path"),
             "accepted_path_count":diagnostics.get("nominal_music_peak_count"),
             "path_detection_diagnostics":diagnostics.get("path_detection"),
+            "observation_screen": diagnostics.get("observation_screen"),
+            "solver_search": diagnostics.get("search"),
             "position_error_m": error, "clock_bias_error_ns": abs(float(bias) - truth_bias) * 1e9 if bias is not None else None,
             "localization_seconds": localization_seconds, "checked_seconds": checked_seconds,
             "failed_online_seconds": failed_online, "processing_seconds": payload.get("processing_seconds"),

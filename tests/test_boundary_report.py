@@ -80,7 +80,25 @@ def test_computation_budgets_are_separate_from_unlocalizable(tmp_path):
     assert group["latency_seconds"]["localization_seconds"]["all_measured_requests"]["count"] == 4
 
 
-@pytest.mark.parametrize("status", ["unlocalizable", "detection_incomplete", "solver_budget_exhausted"])
+def test_observation_exclusions_keep_original_denominator_and_retained_failures(tmp_path):
+    records = [_record(position_error_m=.2),
+               _record(1, status="excluded_observation", stop_reason="near_identical_music_responses",
+                       observation_screen={"excluded":True,"excluded_pairs":[{"response_correlation":.999}]}),
+               _record(2, status="unlocalizable")]
+    summary = create_boundary_report(tmp_path, records, [_point(repeats=4)], metadata={"plots":False})
+    group = next(g for g in summary["groups"] if g["strategy"] == "single")
+    assert group["planned_count"] == 4
+    assert group["output_fraction_all_planned"] == .25
+    assert group["excluded_observation_count"] == 1
+    assert group["screened_retained_executed_count"] == 2
+    assert group["output_fraction_screened_retained"] == .5
+    assert group["thresholds_screened_retained_m"][0]["denominator"] == 2
+    assert group["thresholds_screened_retained_m"][0]["fraction"] == .5
+    assert len(_rows(tmp_path/"excluded_observations.csv")) == 1
+    assert len(_rows(tmp_path/"trials.csv")) == 8
+
+
+@pytest.mark.parametrize("status", ["unlocalizable", "detection_incomplete", "solver_budget_exhausted", "excluded_observation"])
 def test_no_position_status_cannot_publish_numeric_error(tmp_path, status):
     with pytest.raises(ValueError, match="无位置输出"):
         create_boundary_report(tmp_path, [_record(status=status, position_error_m=.1)],

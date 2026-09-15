@@ -42,6 +42,13 @@ class SolverBudgetError(SolverError):
         )
 
 
+class RansacSearchError(SolverError):
+    """有限次抽样没有找到合法共识，不能据此证明物理上无法定位。"""
+    def __init__(self, diagnostics):
+        self.diagnostics = diagnostics
+        super().__init__("RANSAC 抽样预算内没有得到可辨识且稳定的共识解")
+
+
 def _as_readonly_vector2(value: Sequence[float], name: str) -> Array:
     array = np.asarray(value, dtype=float)
     if array.shape != (2,):
@@ -161,9 +168,15 @@ class SolverConfig:
     missing_observation_penalty: float | None = None
     covariance_floor: float = 1e-10
     downweight_threshold: float = 0.999
+    method: str = "exhaustive"
+    ransac_max_trials: int = 2048
+    ransac_inlier_distance_m: float = 2.0
+    ransac_max_refinements: int = 24
+    ransac_seed: int = 0
 
     def __post_init__(self) -> None:
         positive_values = {
+            "ransac_inlier_distance_m": self.ransac_inlier_distance_m,
             "huber_delta": self.huber_delta,
             "tolerance": self.tolerance,
             "rank_tolerance": self.rank_tolerance,
@@ -179,6 +192,8 @@ class SolverConfig:
         if not 0.0 < self.downweight_threshold <= 1.0:
             raise ValueError("downweight_threshold 必须位于 (0, 1] 内")
         integer_values = {
+            "ransac_max_trials": self.ransac_max_trials,
+            "ransac_max_refinements": self.ransac_max_refinements,
             "max_iterations": self.max_iterations,
             "max_irls_iterations": self.max_irls_iterations,
             "max_seeds": self.max_seeds,
@@ -191,6 +206,10 @@ class SolverConfig:
                 raise ValueError(f"{name} 必须是正整数")
             if value < 1:
                 raise ValueError(f"{name} 必须是正整数")
+        if self.method not in {"exhaustive", "ransac"}:
+            raise ValueError("method 必须为 exhaustive 或 ransac")
+        if isinstance(self.ransac_seed, (bool, np.bool_)) or not isinstance(self.ransac_seed, (int, np.integer)) or self.ransac_seed < 0:
+            raise ValueError("ransac_seed 必须为非负整数")
         if self.missing_observation_penalty is not None:
             penalty = self.missing_observation_penalty
             if not np.isfinite(penalty) or penalty < 0.0:
@@ -214,6 +233,7 @@ class SolverDiagnostics:
     unused_observations: tuple[Hashable, ...]
     robust_weights: Mapping[Hashable, float]
     joint_covariance: Array = field(repr=False)
+    search: Mapping[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         covariance = _as_readonly_array(
@@ -650,6 +670,7 @@ def _estimate_covariance(
 def solve_position_and_bias(
     candidates: Iterable[CandidateTrajectory],
     config: SolverConfig | None = None,
+    *, scene=None,
 ) -> SolverResult:
     """联合估计二维 UE 位置和公共距离偏差。
 
@@ -668,6 +689,9 @@ def solve_position_and_bias(
     """
 
     config = config or SolverConfig()
+    if config.method == "ransac":
+        from .ransac_solver import solve_ransac
+        return solve_ransac(candidates, config, scene=scene)
     groups = _group_candidates(candidates)
     seeds = _make_seeds(groups, config)
     if not seeds:
