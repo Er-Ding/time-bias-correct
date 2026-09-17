@@ -312,7 +312,12 @@ def _validate_boundary_channel_setup(manifest: Mapping[str, Any], stage: str) ->
     _assert_same_path(scene_artifacts.get("scene_json"), manifest_scene["path"], "公开设置场景产物")
     model = _require_mapping(manifest.get("rt_model"), "边界实验 rt_model")
     propagation = _require_mapping(setup.get("propagation"), "公开设置传播规则")
-    _require_exact_keys(propagation, {"max_reflections", "max_diffractions"}, "公开设置传播规则 ")
+    policy_fields = {"diffraction_position"} if "diffraction_position" in propagation else set()
+    _require_exact_keys(propagation, {"max_reflections", "max_diffractions"} | policy_fields, "公开设置传播规则 ")
+    from .path_policy import validate_diffraction_position
+    policy = validate_diffraction_position(propagation.get("diffraction_position", "any"))
+    if policy != manifest["path_selection"].get("diffraction_position", "any"):
+        raise ValueError("公开设置的绕射位置与生成清单不一致")
     if _require_reflection_depth(propagation["max_reflections"], "公开设置反射上限") != model["max_reflections"]:
         raise ValueError("公开设置的反射上限与生成清单不一致")
     if type(propagation["max_diffractions"]) is not int or propagation["max_diffractions"] not in (0, 1):
@@ -575,6 +580,10 @@ def validate_generation_manifest_envelope(
         "local_angle_min_rad",
         "local_angle_max_rad",
     }
+    if "diffraction_position" in path_selection:
+        from .path_policy import validate_diffraction_position
+        validate_diffraction_position(path_selection["diffraction_position"])
+        required_selection_fields.add("diffraction_position")
     stage_count_fields = (
         {
             "total_sionna_path_count",
@@ -720,6 +729,8 @@ def validate_localization_input_contract(
         "max_depth" if stage == "sionna_rt_to_deepmimo_v4" else "max_reflections"
     )
     configured_diffractions = scene_config.get("max_diffractions", 0)
+    if scene_config.get("diffraction_position", "any") != manifest["path_selection"].get("diffraction_position", "any"):
+        raise ValueError("生成清单的绕射位置与公开定位配置不一致")
     if isinstance(configured_diffractions, bool) or configured_diffractions not in (0, 1):
         raise ValueError("公开定位配置只允许 0 或 1 次绕射")
     if model["diffraction"] != bool(configured_diffractions):

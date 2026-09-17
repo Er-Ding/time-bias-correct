@@ -91,6 +91,22 @@ def test_csi_pipeline_never_calls_legacy_spatial_stages_and_publishes_new_manife
     assert result["scientific_validation_status"]=="not_validated"
 
 
+def test_negative_observed_delay_survives_full_csi_to_position_pipeline(tmp_path):
+    import time_bias_localization.pipeline as pipeline
+    config = small_config(tmp_path)
+    config["simulation"]["clock_bias_s"] = -50e-9
+    config["music"].update(delay_min_s=-80e-9, delay_max_s=140e-9)
+    scene = pipeline.prepare_scene(config, tmp_path)
+    bundle = pipeline.generate_data(config, scene_json=scene["scene_json"], output_root=tmp_path)
+    result = pipeline.localize(localization_config_view(config), scene_json=scene["scene_json"],
+                               online_input=bundle["online_npz"], output_root=tmp_path)
+    peaks = json.loads((tmp_path / "localization/music_peaks.json").read_text())["nominal"]
+    assert any(peak["delay_s"] < 0 for peak in peaks)
+    assert result["status"] == "success"
+    assert np.linalg.norm(np.asarray(result["mu_m"]) - config["simulation"]["ue_position_m"]) < .15
+    assert abs(result["clock_bias_s"] + 50e-9) < 1e-9
+
+
 def test_unavailable_csi_run_keeps_continuous_workflow_and_diagnostics(tmp_path, monkeypatch):
     import time_bias_localization.pipeline as pipeline
     import time_bias_localization.continuous_pipeline as continuous

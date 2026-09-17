@@ -106,7 +106,7 @@ def _process_music_spectrum(
             raise ValueError(f"{name} 必须严格递增且至少包含两个坐标")
     if angles[0] < -np.pi / 2 or angles[-1] > np.pi / 2:
         raise ValueError("局部 AOA 搜索范围必须位于 [-pi/2, pi/2]")
-    if delays[0] < 0:
+    if generate_samples and delays[0] < 0:
         raise ValueError("观测时延搜索范围必须非负")
     if not np.isfinite(bs_boresight_rad):
         raise ValueError("bs_boresight_rad 必须为有限数")

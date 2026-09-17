@@ -122,7 +122,7 @@ def test_settings_fail_early(settings: dict) -> None:
     ("num_sources", 0), ("num_sources", True),
     ("frequency_subarray_size", 13),
     ("diagonal_loading", -0.1), ("carrier_frequency_hz", 0),
-    ("antenna_spacing_m", -1), ("delay_grid_s", [-1e-9, 0]),
+    ("antenna_spacing_m", -1), ("delay_grid_s", [float("nan"), 0]),
     ("delay_grid_s", [0, 0]), ("aoa_grid_rad", [0.1, 0]),
     ("aoa_grid_rad", [-2.0, 0]),
 ])

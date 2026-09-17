@@ -57,6 +57,7 @@ def build_continuous_problem(config, scene, nominal_peaks, source_indices, bs_po
         bank = build_hypothesis_bank(scene, bs_position_m, observations,
             max_reflections=int(config["scene"]["max_reflections"]),
             max_diffractions=int(config["scene"].get("max_diffractions", 0)),
+            diffraction_position=config["scene"].get("diffraction_position", "any"),
             max_hypotheses=settings["max_hypotheses"],
             max_enumerated_sequences=settings["max_enumerated_sequences"],
             aoa_gate_rad=math.radians(settings["aoa_gate_deg"]),

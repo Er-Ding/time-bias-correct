@@ -110,6 +110,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "bev_resolution_m",
             "max_reflections",
             "max_diffractions",
+            "diffraction_position",
         }
     ),
     "radio": frozenset(
@@ -456,6 +457,8 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
         for value in position:
             _finite_float("radio.bs_position_m", value)
     max_diffractions = _nonnegative_integer("max_diffractions", scene.get("max_diffractions", 0))
+    from .path_policy import validate_diffraction_position
+    validate_diffraction_position(scene.get("diffraction_position", "any"))
     if max_diffractions not in (0, 1):
         raise ValueError("当前只支持最多一次绕射")
     _positive_integer("diffraction_directions_per_sample", localization.get("diffraction_directions_per_sample", 4))
@@ -528,13 +531,17 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
         raise ValueError("MUSIC 角度范围必须位于 [-90, 90] 且下界小于上界")
     delay_min = _finite_float("delay_min_s", music["delay_min_s"])
     delay_max = _finite_float("delay_max_s", music["delay_max_s"])
-    if delay_min < 0.0 or delay_min >= delay_max:
-        raise ValueError("MUSIC 时延范围必须非负且下界小于上界")
+    if delay_min >= delay_max:
+        raise ValueError("MUSIC 时延范围下界必须小于上界")
+    if delay_min < 0.0 and localization.get("solver_method") != "continuous":
+        raise ValueError("负观测时延目前仅由连续定位流程支持")
     num_paths = _positive_integer("num_paths", music["num_paths"])
     from .music_subspace import subspace_settings
     selection = subspace_settings(music.get("subspace_selection", {}))
     from .path_detection import detection_settings
     path_detection = detection_settings(music.get("path_detection", {}))
+    if delay_min < 0.0 and path_detection["enabled"]:
+        raise ValueError("负观测时延需要关闭逐路径残差检测，使用原始 CSI 的 MUSIC 峰")
     if num_paths < 2 and not path_detection["enabled"] and selection["mode"] == "fixed":
         raise ValueError("联合位置与偏差估计至少需要两条 MUSIC 路径")
     if localization.get("candidate_bias_mode", "reference") not in {"reference", "full_interval"}:

@@ -243,8 +243,6 @@ class MusicComputer:
         )
         aoa_grid = _as_real_vector("aoa_grid_rad", aoa_grid_rad)
         delay_grid = _as_real_vector("delay_grid_s", delay_grid_s)
-        if np.any(delay_grid < 0.0):
-            raise ValueError("delay_grid_s 必须为非负时延")
         if np.any(np.diff(delay_grid) <= 0.0):
             raise ValueError("delay_grid_s 必须严格递增")
         if np.any(np.diff(aoa_grid) <= 0.0):
@@ -468,8 +466,8 @@ class PreparedMusic:
         delays = _as_real_vector("delay_grid_s", delay_grid_s)
         if np.any(np.diff(angles) <= 0):
             raise ValueError("aoa_grid_rad 必须严格递增")
-        if np.any(delays < 0) or np.any(np.diff(delays) <= 0):
-            raise ValueError("delay_grid_s 必须为非负且严格递增的时延")
+        if np.any(np.diff(delays) <= 0):
+            raise ValueError("delay_grid_s 必须为严格递增的观测时延")
         computer = self._computer
         with computer._device if computer._device is not None else nullcontext():
             spatial, frequency = computer._steering(
@@ -493,8 +491,6 @@ class PreparedMusic:
         delays = _as_real_vector("delay_s", delay_s)
         if angles.shape != delays.shape:
             raise ValueError("aoa_rad 与 delay_s 必须为等长向量")
-        if np.any(delays < 0):
-            raise ValueError("delay_s 必须为非负时延")
         # 与全局 MUSIC 使用同一局部角度、天线方向和相位约定。
         spatial_host = ula_steering_vector(
             angles, num_bs_antennas=self._spatial_size,

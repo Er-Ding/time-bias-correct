@@ -385,6 +385,7 @@ def extract_planar_uplink_csi(
     vertical_tolerance_m: float,
     max_reflections: int,
     max_diffractions: int = 0,
+    diffraction_position: str = "any",
     bs_boresight_rad: float = 0.0,
     local_angle_min_rad: float = -math.pi / 2.0,
     local_angle_max_rad: float = math.pi / 2.0,
@@ -451,6 +452,9 @@ def extract_planar_uplink_csi(
     planar_valid &= reflection_order <= int(max_reflections)
     planar_valid &= diffraction_order <= int(max_diffractions)
     planar_valid &= np.all(np.isin(interactions, (0, 1, 8)), axis=0)
+    from .path_policy import uplink_path_mask
+    policy_mask = uplink_path_mask(interactions, diffraction_position)
+    planar_valid &= policy_mask
     for path_index in range(num_paths):
         active = active_interactions[:, path_index]
         if not np.any(active):
@@ -497,6 +501,8 @@ def extract_planar_uplink_csi(
     csi = path_coefficients[:, valid] @ phase
     metadata = {
         "retained_mask": valid,
+        "diffraction_position": np.asarray(diffraction_position),
+        "diffraction_position_mask": policy_mask,
         "planar_retained_mask_before_front_filter": planar_valid,
         "front_facing_angle_mask": front_facing_angle_mask,
         "absolute_delays_s": absolute_delays,
@@ -531,7 +537,7 @@ def _path_selection_summary(path_metadata: dict[str, np.ndarray]) -> dict[str, A
     )
     if retained.shape != planar.shape or retained.shape != front.shape:
         raise ValueError("路径筛选掩码形状必须一致")
-    return {
+    selection = {
         "rule": "planar_height_and_order_then_front_facing_local_angle_window",
         "front_facing_only": bool(
             np.asarray(path_metadata.get("front_facing_only", True)).item()
@@ -550,6 +556,10 @@ def _path_selection_summary(path_metadata: dict[str, np.ndarray]) -> dict[str, A
         "front_facing_angle_path_count": int(np.sum(front)),
         "retained_path_count_after_front_filter": int(np.sum(retained)),
     }
+    policy = str(np.asarray(path_metadata.get("diffraction_position", "any")).item())
+    if policy != "any":
+        selection["diffraction_position"] = policy
+    return selection
 
 
 def _dataset_with_scene(dataset: Any) -> Any:

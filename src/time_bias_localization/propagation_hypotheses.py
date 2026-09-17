@@ -277,6 +277,7 @@ def build_hypothesis_bank(
     *,
     max_reflections: int = 2,
     max_diffractions: int = 1,
+    diffraction_position: str = "any",
     max_hypotheses: int = 4096,
     max_enumerated_sequences: int = 50000,
     aoa_gate_rad: float | None = None,
@@ -288,6 +289,8 @@ def build_hypothesis_bank(
     角度门限是显式工程范围，不是噪声统计保证。范围筛选使用整个地图
     的距离下界和上界，不用已知 UE、注入噪声、旧候选点或代表方向。
     """
+    from .path_policy import validate_diffraction_position
+    validate_diffraction_position(diffraction_position)
     if (isinstance(max_reflections, bool) or not isinstance(max_reflections, int)
             or max_reflections not in (0, 1, 2)):
         raise ValueError("连续模型支持 0、1 或 2 次反射")
@@ -359,6 +362,9 @@ def build_hypothesis_bank(
             queue.append((family, iter(iterator)))
         if max_diffractions:
             for before_order in range(order + 1):
+                # 内部顺序为 UE→BS；BS→UE 的末次绕射对应这里的首次交互。
+                if diffraction_position == "last_from_bs" and before_order != 0:
+                    continue
                 after_order = order - before_order
                 count = (len(edges) * _sequence_count(len(walls), before_order)
                          * _sequence_count(len(walls), after_order))
@@ -429,6 +435,7 @@ def build_hypothesis_bank(
                    else "max_enumerated_sequences")
     report = {
         "max_reflections": max_reflections, "max_diffractions": max_diffractions,
+        "diffraction_position": diffraction_position,
         "max_hypotheses": max_hypotheses, "max_enumerated_sequences": max_enumerated_sequences,
         "aoa_gate_rad": aoa_gate_rad, "beta_interval_m": beta_interval_m,
         "length_gate_sigma": length_gate_sigma,

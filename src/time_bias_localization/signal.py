@@ -351,8 +351,7 @@ def music_2d_spectrum(
     snapshots = _prepare_music_input(csi, frequencies.size)
     aoa_grid = _as_real_vector("aoa_grid_rad", aoa_grid_rad)
     delay_grid = _as_real_vector("delay_grid_s", delay_grid_s)
-    if np.any(delay_grid < 0.0):
-        raise ValueError("delay_grid_s 必须为非负时延")
+    # 带公共时间偏置的观测时延可以为负；几何传播时延仍要求非负。
     if np.any(np.diff(delay_grid) <= 0.0):
         raise ValueError("delay_grid_s 必须严格递增")
     if np.any(np.diff(aoa_grid) <= 0.0):

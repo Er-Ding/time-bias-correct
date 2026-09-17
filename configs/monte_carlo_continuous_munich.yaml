@@ -1,0 +1,100 @@
+# ========================= 实验参数区 =========================
+experiment:
+  sample_count: 1000                 # 最终接受的有路径位置数；单路径点也保留
+  max_proposals: 100000              # 防止无覆盖配置无限补采
+  random_seed: 20260915
+  bias_min_ns: -50.0                 # 每个位置独立均匀抽取，一条 CSI 内所有路径共用
+  bias_max_ns: 50.0
+  workers: 4                        # 连续定位 CPU 进程数；RT 在指定的一张 GPU 上运行
+  trial_timeout_s: 1800.0            # 单点超时保留为结果，不补采
+  channel_backend: sionna
+  plots: true
+  legal_region:
+    wall_clearance_m: 0.5
+    bs_min_distance_m: 2.0
+# 采样范围内排除原始网格顶面覆盖区、墙体附近和基站附近，沿用露天定位场景。
+project:
+  random_seed: 20260915
+compute:
+  backend: numpy
+  device_id: 0
+  batch_size: 4
+  angle_chunk_size: 32
+scene:
+  source: sionna_builtin
+  name: munich
+  bounds_m: [-100.0, 160.0, -80.0, 180.0]
+  localization_bounds_m: [-100.0, 160.0, -80.0, 180.0]
+  fixed_height_m: 1.5
+  bev_resolution_m: 0.1
+  max_reflections: 2
+  max_diffractions: 1
+  diffraction_position: last_from_bs # BS→UE：LoS、R、RR、D、RD、RRD
+  vertical_path_tolerance_m: 0.1
+radio:
+  carrier_hz: 3.5e9
+  bandwidth_hz: 400.0e6
+  num_subcarriers: 512
+  num_bs_antennas: 12
+  antenna_spacing_wavelength: 0.5
+  bs_boresight_deg: -45.0
+  front_facing_only: true
+  num_snapshots: 1
+  snr_db: 35.0                      # 每样本按其信号功率设置噪声，实现相同目标 SNR
+simulation:
+  bs_position_m: [20.0, 50.0]
+  ue_position_m: [50.0, 50.0]       # 配置校验占位；实验会替换为随机接受的位置
+  clock_bias_s: 0.0                # 配置校验占位；实验会替换为每样本抽取的偏置
+  samples_per_source: 2000000
+  max_num_paths_per_source: 100000
+music:
+  num_paths: 3                     # 自动模式不使用真值指定路径数
+  signal_subspace_rank: 6
+  subspace_selection:
+    mode: eigenvalue_threshold
+    noise_reference: median
+    threshold_ratio: 6.0
+  angle_min_deg: -89.0
+  angle_max_deg: 89.0
+  angle_step_deg: 1.0
+  delay_min_s: -8.0e-8             # 覆盖带负时钟偏置的观测时延
+  delay_max_s: 1.15e-6             # 整个搜索窗小于子载波对应的 1.28 us 周期
+  delay_step_s: 1.0e-9
+  min_angle_separation_deg: 5.0
+  min_delay_separation_s: 3.0e-9
+  spectrum_sampling:
+    aoa_half_width_grid_steps: 1.5
+    delay_half_width_grid_steps: 1.5
+    local_grid_points_per_axis: 25
+  spatial_subarray_size: 8
+  frequency_subarray_size: 64
+  diagonal_loading: 1.0e-8
+  path_detection:
+    enabled: false
+  observation_screen:
+    enabled: true
+    max_response_correlation: 0.995
+localization:
+  solver_method: continuous
+  require_identifiable_solution: true
+  candidate_bias_mode: full_interval
+  bias_min_s: -8.0e-8
+  bias_max_s: 8.0e-8
+  continuous:
+    angle_scale_deg: 1.0
+    length_scale_m: 0.75
+    max_hypotheses: 4096
+    max_enumerated_sequences: 50000
+    aoa_gate_deg: 5.0
+    length_gate_sigma: 5.0
+    max_starts: 96
+    max_iterations: 80
+    max_association_iterations: 8
+    max_seed_combinations: 20000
+    huber_delta: 2.0
+    unmatched_cost: 16.0
+    max_residual_norm: 5.0
+    min_observations: 2
+    max_condition_number: 100000000.0
+output:
+  root: outputs/monte_carlo_munich_1000_20260915_01

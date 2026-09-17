@@ -25,6 +25,7 @@ from .diffraction import enumerate_paths
 from .provenance import artifact_record, canonical_json_sha256, generation_bundle_id
 from .scene import Scene2D, make_synthetic_room, preprocess_sionna_triangle_mesh
 from .signal import apply_common_delay_bias, synthesize_ula_csi
+from .path_policy import uplink_path_mask
 from .sionna_generation import (
     _path_selection_summary, _save_real_bundle, _sionna_runtime_info,
     _validate_reverse_scene_consistency, _write_json_atomic, extract_planar_uplink_csi,
@@ -221,6 +222,9 @@ class BoundaryChannel:
                                propagation={"max_reflections": self.config["scene"]["max_reflections"],
                                             "max_diffractions": self.config["scene"].get("max_diffractions", 0)},
                                rt_parameters=self.rt_params)
+        policy = self.config["scene"].get("diffraction_position", "any")
+        if policy != "any":
+            self.provenance["propagation"]["diffraction_position"] = policy
         self.setup_json = _write_json_atomic(self.setup_root / "channel_setup.json", self.provenance)
 
     def _compute(self, position_m: np.ndarray, seed: int) -> tuple[np.ndarray, dict[str, np.ndarray]]:
@@ -272,7 +276,10 @@ class BoundaryChannel:
             raise ValueError("冻结几何信道后不能改变无线配置；仅可改变噪声强度")
         if list(cfg["simulation"]["bs_position_m"]) != self.provenance["bs_position_m"]:
             raise ValueError("冻结几何信道后不能改变 BS 位置")
-        if {"max_reflections": cfg["scene"]["max_reflections"], "max_diffractions": cfg["scene"].get("max_diffractions", 0)} != self.provenance["propagation"]:
+        propagation = {"max_reflections": cfg["scene"]["max_reflections"], "max_diffractions": cfg["scene"].get("max_diffractions", 0)}
+        if cfg["scene"].get("diffraction_position", "any") != "any":
+            propagation["diffraction_position"] = cfg["scene"]["diffraction_position"]
+        if propagation != self.provenance["propagation"]:
             raise ValueError("冻结几何信道后不能改变传播模型")
         root = Path(output_root).resolve()
         root.mkdir(parents=True, exist_ok=False)
@@ -359,6 +366,9 @@ class SyntheticFixtureChannel(BoundaryChannel):
         local_angles = np.asarray([global_to_local_aoa(angle, boresight) for angle in global_angles])
         low, high = math.radians(float(cfg["music"]["angle_min_deg"])), math.radians(float(cfg["music"]["angle_max_deg"]))
         retained = (local_angles >= low) & (local_angles <= high)
+        policy = cfg["scene"].get("diffraction_position", "any")
+        policy_mask = uplink_path_mask(interactions, policy)
+        retained &= policy_mask
         delays = np.asarray([path.delay_s for path in all_paths])
         amplitudes = np.asarray(cfg["simulation"].get("path_amplitudes", [1.0]), dtype=float)
         if amplitudes.size == 0 or np.any(~np.isfinite(amplitudes)) or np.any(amplitudes < 0):
@@ -374,6 +384,7 @@ class SyntheticFixtureChannel(BoundaryChannel):
         else:
             csi = np.zeros((int(radio["num_bs_antennas"]), len(self.frequencies_hz)), dtype=complex)
         metadata = {"retained_mask": retained, "planar_retained_mask_before_front_filter": np.ones(n, dtype=bool),
+                    "diffraction_position": np.asarray(policy), "diffraction_position_mask": policy_mask,
                     "front_facing_angle_mask": (local_angles >= low) & (local_angles <= high),
                     "absolute_delays_s": delays, "aoa_global_rad": global_angles, "aoa_local_rad": local_angles,
                     "interaction_order": np.sum(interactions != 0, axis=0), "reflection_order": np.sum(interactions == 1, axis=0),
@@ -450,6 +461,7 @@ class SionnaBoundaryChannel(BoundaryChannel):
             paths, self.frequencies_hz, fixed_height_m=float(cfg["scene"]["fixed_height_m"]),
             vertical_tolerance_m=float(cfg["scene"]["vertical_path_tolerance_m"]),
             max_reflections=int(cfg["scene"]["max_reflections"]), max_diffractions=int(cfg["scene"].get("max_diffractions", 0)),
+            diffraction_position=cfg["scene"].get("diffraction_position", "any"),
             bs_boresight_rad=math.radians(float(radio["bs_boresight_deg"])),
             local_angle_min_rad=math.radians(float(cfg["music"]["angle_min_deg"])),
             local_angle_max_rad=math.radians(float(cfg["music"]["angle_max_deg"])),
