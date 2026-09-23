@@ -119,6 +119,55 @@ def _window_gap(lower, upper):
     return np.maximum(lower, np.maximum(-upper, 0.))
 
 
+def _fully_hidden_walls_from_receiver(walls, receiver):
+    """给出整段墙被同一挡墙遮住的充分证据，不需要 UE 位置或角度采样。
+
+    从接收点到目标墙的两个端点都严格穿过同一挡墙时，整段目标墙位于
+    该挡墙的凸阴影区域内，不可能成为 BS 一侧的末次反射墙。只覆盖
+    一部分、或必须靠多面墙共同遮住的情况保守保留。端点留出余量，
+    不把擦边、共线或数值不确定情况当成可排除的证据。
+    """
+    keys = tuple(sorted(walls))
+    points = np.asarray([[walls[key].start_m, walls[key].end_m] for key in keys], float).reshape(-1, 2, 2)
+    vectors = points[:, 1] - points[:, 0]
+    offsets = points[:, 0] - receiver
+    numerator = offsets[:, 0] * vectors[:, 1] - offsets[:, 1] * vectors[:, 0]
+    hidden = {}
+    for index, key in enumerate(keys):
+        rays = points[index] - receiver
+        denominator = rays[:, None, 0] * vectors[None, :, 1] - rays[:, None, 1] * vectors[None, :, 0]
+        nonparallel = np.abs(denominator) > 1e-10
+        distance_fraction = np.zeros_like(denominator)
+        wall_fraction = np.zeros_like(denominator)
+        np.divide(numerator[None, :], denominator, out=distance_fraction, where=nonparallel)
+        np.divide(offsets[None, :, 0] * rays[:, None, 1] - offsets[None, :, 1] * rays[:, None, 0],
+                  denominator, out=wall_fraction, where=nonparallel)
+        covers_both = np.all(nonparallel & (distance_fraction > 1e-6) & (distance_fraction < 1 - 1e-6)
+                            & (wall_fraction > 1e-6) & (wall_fraction < 1 - 1e-6), axis=0)
+        covers_both[index] = False
+        blockers = np.flatnonzero(covers_both)
+        if len(blockers):
+            hidden[key] = keys[int(blockers[0])]
+    return hidden
+
+
+def _receiver_geometry_failure(interactions, walls, receiver, hidden_walls):
+    """只拒绝对所有 UE 位置均不成立的 BS 端几何，逐点路径检查仍保留。"""
+    if not interactions or interactions[-1][0] != "reflection":
+        return None
+    if interactions[-1][1] in hidden_walls:
+        return "last_wall_fully_hidden_from_bs"
+    if len(interactions) >= 2 and interactions[-2][0] == "reflection":
+        previous, last = walls[interactions[-2][1]], walls[interactions[-1][1]]
+        receiver_side = float((receiver - last.start) @ last.normal)
+        if abs(receiver_side) > 1e-8:
+            previous_sides = np.asarray([previous.start - last.start, previous.end - last.start]) @ last.normal
+            # 反射的入射段和出射段必须在反射墙的同一侧。
+            if np.all(previous_sides * np.sign(receiver_side) < -1e-8):
+                return "previous_wall_on_opposite_side_of_last_wall"
+    return None
+
+
 def _receiver_window_catalogs(walls, edges, bs, observations, max_order, gate):
     """从 BS 一侧展开有限墙段；输出按观测公平排序的连续角域候选。
 
@@ -323,6 +372,8 @@ def build_hypothesis_bank(
     walls = {wall.wall_id: wall for wall in scene.walls}
     if len(walls) != len(scene.walls):
         raise ValueError("公共地图的墙编号必须唯一")
+    hidden_walls = _fully_hidden_walls_from_receiver(walls, bs) if max_reflections else {}
+    receiver_geometry_rejections = {}
     edges = ({edge.edge_id: edge for edge in diffraction_edges(scene)}
              if max_diffractions else {})
 
@@ -394,6 +445,11 @@ def build_hypothesis_bank(
         queue.append((family, iterator))
         family["enumerated_sequences"] += 1
         attempts += 1
+        geometry_failure = _receiver_geometry_failure(interactions, walls, bs, hidden_walls)
+        if geometry_failure is not None:
+            family["excluded_by_fixed_geometry"] += 1
+            receiver_geometry_rejections[geometry_failure] = receiver_geometry_rejections.get(geometry_failure, 0) + 1
+            continue
         try:
             hypothesis = _make_hypothesis_formula(scene, bs, interactions, walls, edges,
                                                   validate_fixed_leg=False)
@@ -445,7 +501,14 @@ def build_hypothesis_bank(
         "excluded_by_receiver_angle_domain": pruned,
         "angle_admissible_sequences": total-pruned,
         "receiver_angle_preselection": window_report,
-        "enumeration_budget_scope": "continuous_function_constructions_after_separately_counted_angle_preselection",
+        "receiver_geometry_preselection": {
+            "uses_ue_position": False, "uses_angle_sampling": False,
+            "fully_hidden_wall_count": len(hidden_walls),
+            "blocking_wall_by_hidden_wall": hidden_walls,
+            "rejected_sequence_counts": receiver_geometry_rejections,
+            "scope": "sufficient_impossibility_checks_before_function_construction",
+        },
+        "enumeration_budget_scope": "candidate_sequences_after_angle_preselection_including_fixed_geometry_rejections",
         "complete_within_configured_orders": unsearched == 0,
         "budget_exhausted": unsearched > 0, "stop_reason": stop_reason,
         "enumeration_policy": ("round_robin_families_and_observations_with_finite_unfolded_wall_windows"

@@ -15,7 +15,7 @@ import numpy as np
 
 from .diffraction import (
     InteractionSequence, diffraction_edges, rebuild_path, reflection_leg,
-    shadow_directions,
+    shadow_directions, _wall_lookup,
 )
 from .raytrace2d import (
     GeometricPath2D, _backtrack_reflection_points, _segment_visible,
@@ -207,7 +207,7 @@ def _make_hypothesis_formula(scene, bs_position_m, interactions, walls, edges,
 
 
 def _leg_failure(scene, source, receiver, wall_ids, source_walls=(), receiver_walls=()):
-    lookup = {wall.wall_id: wall for wall in scene.walls}
+    lookup = _wall_lookup(scene)
     points = _backtrack_reflection_points(source, receiver, [lookup[key] for key in wall_ids])
     if points is None:
         return "reflection_outside_wall_or_wrong_order", None

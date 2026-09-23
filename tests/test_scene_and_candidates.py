@@ -121,12 +121,10 @@ def test_sionna_triangle_slice_does_not_connect_disjoint_components(tmp_path) ->
     assert scene.source == "sionna_exported_triangle_mesh"
     assert {wall.source_object for wall in scene.walls} == {"two_disjoint_walls"}
     assert [wall.wall_id for wall in scene.walls] == [
-        "sionna_0000_000000",
-        "sionna_0000_000001",
-        "sionna_0000_000002",
-        "sionna_0000_000003",
+        "merged_sionna_0000_000000",
+        "merged_sionna_0000_000002",
     ]
-    assert max(wall.length_m for wall in scene.walls) <= 0.5 + 1e-12
+    np.testing.assert_allclose([wall.length_m for wall in scene.walls], [1., 1.])
     assert all(
         ray_segment_intersection((2.0, -1.0), (0.0, 1.0), wall) is None
         for wall in scene.walls

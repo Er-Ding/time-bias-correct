@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from hashlib import sha256
 from io import BytesIO
@@ -1788,6 +1788,12 @@ def _localize_locked_impl(
     # 峰数上限，不能在关闭残差检测后退回旧 num_paths=3，也不受六条预算限制。
     requested_peak_count = signal_subspace_rank if standard_music and automatic_subspace else num_paths
     coarse_peak_limit = None if automatic_subspace and detector_options["enabled"] else requested_peak_count
+    # 边界伪峰会占用峰名额。开启剔除时先多提取若干个，过滤后再截断回原名额，
+    # 让被挤掉但仍在余量内的真实路径补回来。
+    from .spurious_peaks import spurious_peak_filter_settings as _spurious_settings
+    spurious_settings = _spurious_settings(music_config.get("spurious_peak_filter"))
+    if spurious_settings["enabled"] and coarse_peak_limit is not None:
+        coarse_peak_limit += spurious_settings["peak_margin"]
     feature_extraction["peak_limit"] = requested_peak_count if standard_music else None
     music_diagnostics = {
         "music_signal_subspace_rank": signal_subspace_rank,
@@ -1882,8 +1888,33 @@ def _localize_locked_impl(
         )
     nominal_peaks = sampled.refined_peaks
     nominal_source_indices = sampled.refined_peak_source_indices
+    # 端射边界伪峰会占用峰名额，挤掉真实路径。判据与依据见 spurious_peaks 模块。
+    from .spurious_peaks import filter_boundary_mirror_peaks
+    filtered = filter_boundary_mirror_peaks(
+        nominal_peaks, nominal_source_indices, aoa_grid_rad=aoa_grid,
+        settings=spurious_settings,
+        keep_count=requested_peak_count if spurious_settings["enabled"] else None)
+    nominal_peaks = list(filtered.peaks)
+    nominal_source_indices = list(filtered.source_indices)
+    if not continuous and nominal_source_indices != sampled.refined_peak_source_indices:
+        retained_ids = {f"music_path_{index:02d}" for index in nominal_source_indices}
+        records = [row for row in sampled.records if row["observation_id"] in retained_ids]
+        samples = [sample for sample in sampled.samples if sample.observation_id in retained_ids]
+        sampled = replace(sampled, samples=samples, records=records,
+            regions=[row for row in sampled.regions if row["observation_id"] in retained_ids],
+            refined_peaks=nominal_peaks, refined_peak_source_indices=nominal_source_indices,
+            diagnostics={**sampled.diagnostics, "num_peaks": len(nominal_peaks),
+                "refined_peak_source_indices": nominal_source_indices,
+                "total_samples": len(samples),
+                "monte_carlo_samples": sum(row["sampling_kind"] != "nominal" for row in records),
+                "nominal_samples": sum(row["sampling_kind"] == "nominal" for row in records),
+                "unresolved_window_peak_source_indices": [index for index in
+                    sampled.diagnostics.get("unresolved_window_peak_source_indices", [])
+                    if index in nominal_source_indices]})
+    music_diagnostics["spurious_peak_filter"] = filtered.report
     peak_output["nominal"] = [asdict(peak) for peak in nominal_peaks]
     peak_output["nominal_source_indices"] = nominal_source_indices
+    peak_output["spurious_peak_filter"] = filtered.report
     if continuous:
         peak_output["refinement"] = sampled.diagnostics
         peak_output["sampling_performed"] = False
@@ -1907,26 +1938,54 @@ def _localize_locked_impl(
             settings=music_config.get("observation_screen", {}))
     peak_output["observation_screen"] = screening
     music_diagnostics["observation_screen"] = screening
-    if screening["excluded"]:
-        raise LocalizationUnavailable("near_identical_music_responses", {
-            **music_diagnostics, "nominal_music_peak_count": len(nominal_peaks),
-            "nominal_music_peaks": [asdict(peak) for peak in nominal_peaks],
-        }, status="excluded_observation")
-    if len(nominal_peaks) < 2:
-        raise LocalizationUnavailable("insufficient_music_peaks_after_refinement", {
-            **music_diagnostics, "nominal_music_peak_count": len(nominal_peaks),
-            "coarse_music_peak_count": len(coarse_peaks),
-            "nominal_music_peaks": [asdict(peak) for peak in nominal_peaks],
-            "sampling": sampled.diagnostics,
-        })
+    # 镜像角歧义组不再停整份样本：求解层按组枚举角度分支。没有触发对时保持原行为。
+    branch_groups = (screening["ambiguity_groups"]
+                     if screening["ambiguity_policy"] == "enumerate_branches" else [])
+    if not branch_groups:
+        if screening["excluded"]:
+            raise LocalizationUnavailable("near_identical_music_responses", {
+                **music_diagnostics, "nominal_music_peak_count": len(nominal_peaks),
+                "nominal_music_peaks": [asdict(peak) for peak in nominal_peaks],
+            }, status="excluded_observation")
+        if len(nominal_peaks) < 2:
+            raise LocalizationUnavailable("insufficient_music_peaks_after_refinement", {
+                **music_diagnostics, "nominal_music_peak_count": len(nominal_peaks),
+                "coarse_music_peak_count": len(coarse_peaks),
+                "nominal_music_peaks": [asdict(peak) for peak in nominal_peaks],
+                "sampling": sampled.diagnostics,
+            })
 
     if continuous:
-        from .continuous_pipeline import run_continuous_from_peaks
-        progress["failed_step"] = "04_continuous_functions_and_solution"
-        result, continuous_payloads, _bank, _solver_settings = run_continuous_from_peaks(
-            config, scene, nominal_peaks, nominal_source_indices,
-            measurement.bs_position_m, measurement.bs_boresight_rad,
-            run_id=localization_run_id, artifact_callback=progress["payloads"].update)
+        from .continuous_pipeline import run_continuous_from_peaks, run_continuous_with_angle_branches
+        if branch_groups:
+            # 筛选报告中的编号指向分支选择前的峰；回放时必须保留这一份输入。
+            peak_output["nominal_before_angle_branches"] = peak_output["nominal"]
+            peak_output["nominal_source_indices_before_angle_branches"] = nominal_source_indices
+            progress["failed_step"] = "04_continuous_angle_branches"
+            selection = run_continuous_with_angle_branches(
+                config, scene, nominal_peaks, nominal_source_indices, branch_groups,
+                measurement.bs_position_m, measurement.bs_boresight_rad,
+                run_id=localization_run_id, artifact_callback=progress["payloads"].update)
+            music_diagnostics["angle_branch_search"] = selection.report
+            peak_output["angle_branch_search"] = selection.report
+            if selection.result is None:
+                raise LocalizationUnavailable(
+                    selection.report["failure_reason"] or "angle_branch_search_failed",
+                    {**music_diagnostics, "nominal_music_peak_count": len(nominal_peaks),
+                     "nominal_music_peaks": [asdict(peak) for peak in nominal_peaks],
+                     "branch_selection_rule": "no_branch_had_enough_observations"})
+            kept = selection.report["branches"][selection.report["selected_branch"]]["kept_peak_positions"]
+            nominal_peaks = [nominal_peaks[index] for index in kept]
+            nominal_source_indices = [nominal_source_indices[index] for index in kept]
+            peak_output["nominal"] = [asdict(peak) for peak in nominal_peaks]
+            peak_output["nominal_source_indices"] = nominal_source_indices
+            result, continuous_payloads = selection.result, selection.payloads
+        else:
+            progress["failed_step"] = "04_continuous_functions_and_solution"
+            result, continuous_payloads, _bank, _solver_settings = run_continuous_from_peaks(
+                config, scene, nominal_peaks, nominal_source_indices,
+                measurement.bs_position_m, measurement.bs_boresight_rad,
+                run_id=localization_run_id, artifact_callback=progress["payloads"].update)
         progress["payloads"].update(continuous_payloads)
         progress["payloads"]["result"] = result
         progress["completed_steps"].extend([

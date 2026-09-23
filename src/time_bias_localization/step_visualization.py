@@ -213,7 +213,7 @@ def _export_legacy_steps(plt, run, directory: Path, row: dict) -> None:
     for i, snapshot in enumerate(csi):
         fig, axes = plt.subplots(1, 2, figsize=(9, 3.5), layout="constrained")
         for ax, values, title in zip(axes, (np.abs(snapshot), np.angle(snapshot)), ("幅度", "相位 / rad")):
-            im = ax.pcolormesh(frequencies, np.arange(snapshot.shape[0]), values, shading="auto", cmap="viridis")
+            im = ax.pcolormesh(frequencies, np.arange(snapshot.shape[0]), values, shading="auto", cmap="viridis", rasterized=True)
             ax.set(xlabel="子载波基带频率 / MHz", ylabel="BS 阵元编号", title=title)
             fig.colorbar(im, ax=ax)
         fig.suptitle(f"01  在线 CSI，快照 {i}")
@@ -229,7 +229,8 @@ def _export_legacy_steps(plt, run, directory: Path, row: dict) -> None:
         spectrum, angles, delays = data["spectrum"], np.degrees(data["aoa_grid_rad"]), data["delay_grid_s"] * 1e9
     fig, ax = plt.subplots(figsize=(7.2, 5), layout="constrained")
     relative = 10 * np.log10(np.maximum(spectrum / spectrum.max(), 1e-12))
-    im = ax.pcolormesh(delays, angles, relative, shading="auto", cmap="viridis", vmin=-60, vmax=0)
+    # 热图按 300 dpi 嵌入；文字、坐标和峰标记仍可编辑，避免逐格矢量化产生数十 GB。
+    im = ax.pcolormesh(delays, angles, relative, shading="auto", cmap="viridis", vmin=-60, vmax=0, rasterized=True)
     fig.colorbar(im, ax=ax, label="相对 MUSIC 谱 / dB（非概率）")
     for i, peak in enumerate(peaks["nominal"]):
         xy = [peak["delay_s"] * 1e9, np.degrees(peak["aoa_rad"])]
@@ -347,7 +348,7 @@ def _export_csi(plt, run, folder):
     for i, snapshot in enumerate(csi):
         fig, axes = plt.subplots(1, 2, figsize=(9, 3.5), layout="constrained")
         for ax, values, title in zip(axes, (np.abs(snapshot), np.angle(snapshot)), ("幅度", "相位 / rad")):
-            im = ax.pcolormesh(frequencies, np.arange(snapshot.shape[0]), values, shading="auto", cmap="viridis")
+            im = ax.pcolormesh(frequencies, np.arange(snapshot.shape[0]), values, shading="auto", cmap="viridis", rasterized=True)
             ax.set(xlabel="子载波基带频率 / MHz", ylabel="BS 阵元编号", title=title)
             fig.colorbar(im, ax=ax)
         fig.suptitle(f"01  接收到的带噪 CSI，快照 {i}")
@@ -374,7 +375,7 @@ def _export_music(plt, run, folder):
         spectrum, angles, delays = data["spectrum"], np.degrees(data["aoa_grid_rad"]), data["delay_grid_s"] * 1e9
     relative = 10 * np.log10(np.maximum(spectrum / max(float(spectrum.max()), np.finfo(float).tiny), 1e-12))
     fig, ax = plt.subplots(figsize=(7.2, 5), layout="constrained")
-    im = ax.pcolormesh(delays, angles, relative, shading="auto", cmap="viridis", vmin=-60, vmax=0)
+    im = ax.pcolormesh(delays, angles, relative, shading="auto", cmap="viridis", vmin=-60, vmax=0, rasterized=True)
     fig.colorbar(im, ax=ax, label=("粗搜索 MUSIC 谱 / dB（非概率）" if fine else "相对 MUSIC 谱 / dB（非概率）"))
     for i, peak in zip(indices, peaks["nominal"], strict=True):
         xy = [peak["delay_s"] * 1e9, np.degrees(peak["aoa_rad"])]
@@ -413,7 +414,7 @@ def _export_spectrum_samples(plt, run, folder):
         delays = np.asarray(region["delay_grid_s"]) * 1e9
         relative = 10 * np.log10(np.maximum(spectrum / max(float(spectrum.max()), np.finfo(float).tiny), 1e-12))
         fig, ax = plt.subplots(figsize=(7.2, 5), layout="constrained")
-        im = ax.pcolormesh(delays, angles, relative, shading="auto", cmap="viridis", vmin=-40, vmax=0)
+        im = ax.pcolormesh(delays, angles, relative, shading="auto", cmap="viridis", vmin=-40, vmax=0, rasterized=True)
         fig.colorbar(im, ax=ax, label="局部 MUSIC 谱 / dB（非概率）")
         for nominal, marker, color, label in [(False, ".", "#F2F2F2", "连续谱面采样"),
                                                (True, "*", "#FFB000", "粗网格初始峰")]:
@@ -441,7 +442,7 @@ def _export_spectrum_samples(plt, run, folder):
         if fine:
             probabilities = np.asarray(region["cell_probabilities"], dtype=float)
             fig, ax = plt.subplots(figsize=(7.2, 5), layout="constrained")
-            im = ax.pcolormesh(delays, angles, probabilities, shading="flat", cmap="viridis")
+            im = ax.pcolormesh(delays, angles, probabilities, shading="flat", cmap="viridis", rasterized=True)
             fig.colorbar(im, ax=ax, label="每个网格单元的采样概率")
             ax.scatter(region["nominal_delay_s"] * 1e9, np.degrees(region["nominal_aoa_local_rad"]),
                        marker="*", s=95, color="#FFB000", edgecolors="black", linewidths=.4,

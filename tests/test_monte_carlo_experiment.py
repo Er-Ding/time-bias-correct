@@ -32,12 +32,20 @@ def small_config(tmp_path):
 
 
 def test_defaults_match_agreed_experiment():
-    settings, config = load_settings(Path(__file__).parents[1] / "configs/monte_carlo_continuous_munich.yaml")
+    path = Path(__file__).parents[1] / "configs/monte_carlo_continuous_munich.yaml"
+    settings, config = load_settings(path)
     assert settings["sample_count"] == 1000
     assert (settings["bias_min_ns"], settings["bias_max_ns"]) == (-50., 50.)
     assert config["radio"]["snr_db"] == 35.
     assert config["scene"]["diffraction_position"] == "last_from_bs"
     assert config["music"]["delay_min_s"] < 0
+    gpu_settings, gpu_config = load_settings(path, compute_backend="cuda")
+    assert gpu_settings == settings
+    assert gpu_config["compute"]["backend"] == "cuda"
+    gpu_config["compute"]["backend"] = config["compute"]["backend"]
+    assert gpu_config == config  # 设备覆盖不改变观测、采样或求解参数。
+    with pytest.raises(ValueError, match="compute.backend"):
+        load_settings(path, compute_backend="typo")
 
 
 def test_resample_only_illegal_or_zero_paths_and_keep_single_path(tmp_path, monkeypatch):

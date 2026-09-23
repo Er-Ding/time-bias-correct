@@ -108,6 +108,9 @@ def test_batch_result_loader_and_tamper_rejection(generated, tmp_path, monkeypat
     import time_bias_localization.step_visualization as step_module
     generated_figures = []
     def capture(plt, fig, directory, name):
+        from matplotlib.collections import QuadMesh
+        assert all(item.get_rasterized() for ax in fig.axes for item in ax.collections
+                   if isinstance(item, QuadMesh) and ax.get_label() != "<colorbar>")
         generated_figures.append((directory.name, name))
         plt.close(fig)
     monkeypatch.setattr(step_module, "_save", capture)

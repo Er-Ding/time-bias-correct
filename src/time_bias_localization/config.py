@@ -65,7 +65,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "frequency_subarray_size": 32,
         "diagonal_loading": 1e-8,
         "path_detection": {"enabled": False},
-        "observation_screen": {"enabled": False, "max_response_correlation": 0.995},
+        "observation_screen": {"enabled": False, "max_response_correlation": 0.995,
+                               "ambiguity_policy": "exclude_sample"},
+        "spurious_peak_filter": {"enabled": False, "edge_tolerance_deg": 1.0,
+                                 "delay_tolerance_ns": 5.0, "maximum_spectrum_ratio": 0.5},
     },
     "localization": {
         "bias_min_s": -80e-9,
@@ -82,6 +85,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "max_seed_pairs": 100000,
         "solver_method": "exhaustive",
         "ransac": {"max_trials": 2048, "inlier_distance_m": 2.0, "max_refinements": 24},
+        # 按 MUSIC 峰谱幅值给观测分配不同的噪声尺度。衰减的观测尺度更大、
+        # 权重更小。exponent 为 0 等价于不加权。尺度是经验超参数，不标定为真实噪声。
+        "amplitude_weighting": {"enabled": False, "exponent": 1.0,
+                                "reference": "maximum", "maximum_factor": 10.0},
         "diffraction_cluster_representative_max": None,
         "diffraction_representative_max": None,
         # DBSCAN 的邻域距离 eps，允许一个连续簇的总跨度超过此值。
@@ -145,6 +152,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "diagonal_loading",
             "path_detection",
             "observation_screen",
+            "spurious_peak_filter",
         }
     ),
     "localization": frozenset(
@@ -167,6 +175,7 @@ _LOCALIZATION_SECTION_FIELDS: dict[str, frozenset[str]] = {
             "solver_method",
             "continuous",
             "ransac",
+            "amplitude_weighting",
             "diffraction_cluster_representative_max",
             "diffraction_representative_max",
         }
@@ -479,13 +488,25 @@ def _validate_localization_sections(config: dict[str, Any]) -> None:
         _positive_integer("ransac." + name, ransac.get(name, default))
     _positive_float("ransac.inlier_distance_m", ransac.get("inlier_distance_m", 2.0))
     screen = config["music"].get("observation_screen", {})
-    if not isinstance(screen, Mapping) or set(screen) - {"enabled", "max_response_correlation"}:
+    if not isinstance(screen, Mapping) or set(screen) - {"enabled", "max_response_correlation",
+                                                        "ambiguity_policy"}:
         raise ValueError("observation_screen 含未知参数或不是字典")
     if not isinstance(screen.get("enabled", False), bool):
         raise ValueError("observation_screen.enabled 必须为布尔值")
     correlation = _positive_float("max_response_correlation", screen.get("max_response_correlation", 0.995))
     if correlation > 1:
         raise ValueError("max_response_correlation 不能超过 1")
+    from .observation_screen import AMBIGUITY_POLICIES
+    policy = screen.get("ambiguity_policy", "exclude_sample")
+    if policy not in AMBIGUITY_POLICIES:
+        raise ValueError("observation_screen.ambiguity_policy 只能为 "
+                         + "、".join(AMBIGUITY_POLICIES))
+    if policy == "enumerate_branches" and localization.get("solver_method", "exhaustive") != "continuous":
+        raise ValueError("ambiguity_policy=enumerate_branches 只支持 solver_method=continuous")
+    from .spurious_peaks import spurious_peak_filter_settings
+    spurious_peak_filter_settings(config["music"].get("spurious_peak_filter"))
+    from .amplitude_weighting import amplitude_weighting_settings
+    amplitude_weighting_settings(localization.get("amplitude_weighting"))
     _positive_float("diffraction_coverage_distance_m", localization.get("diffraction_coverage_distance_m", 1.0))
     angle_tolerance = _positive_float("diffraction_angle_tolerance_deg", localization.get("diffraction_angle_tolerance_deg", 3.0))
     if angle_tolerance >= 90:

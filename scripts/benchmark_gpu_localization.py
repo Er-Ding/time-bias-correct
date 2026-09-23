@@ -328,6 +328,7 @@ def _spectrum_arguments(config: dict, measurement) -> dict:
         "spatial_subarray_size": music["spatial_subarray_size"],
         "frequency_subarray_size": music["frequency_subarray_size"],
         "diagonal_loading": music["diagonal_loading"],
+        "subspace_selection": music.get("subspace_selection"),
     }
 
 

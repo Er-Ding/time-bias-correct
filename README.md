@@ -1,5 +1,9 @@
 # 时间偏差校正的二维多径定位
 
+当前连续定位实验、场景修复、代码审查、GPU 实测和结果归档的统一入口见
+[工作区整理记录（2026-09-21）](docs/workspace_review_20260921.md)。
+下文保留各历史方法的用法；旧结果不会因代码或场景修复而自动更新。
+
 新增入口 `run_ransac_experiment.sh` 使用 **v6 观测筛选、绕射代表上限与 RANSAC**，
 仍使用标准 MUSIC。算法参数、排除比例口径及后台管理命令见
 [RANSAC v6](/data/zhujun/differt_projects/time-bias-correct/docs/ransac_v6.md)。

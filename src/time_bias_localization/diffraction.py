@@ -5,12 +5,15 @@
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
+from functools import wraps
 from hashlib import sha256
 from itertools import product
-from functools import lru_cache
 import json
 import math
+from threading import RLock
+from types import MappingProxyType
 from typing import Sequence
 
 import numpy as np
@@ -31,7 +34,44 @@ class DiffractionEdge2D:
     incident_wall_ids: tuple[str, ...]
 
 
-@lru_cache(maxsize=8)
+def _identity_cache(maxsize):
+    """按第一个参数的 id 缓存，并用 ``is`` 校验身份。
+
+    ``lru_cache`` 会哈希全部参数。Scene2D 是冻结数据类且持有全部墙段，
+    哈希一次就要遍历上千面墙；而 ``_wall_lookup`` 在每次 ``reflection_leg``
+    开头被调用，实测因此把约六成求解时间花在哈希上。改用身份键后不再哈希，
+    与 ``raytrace2d._visibility_wall_arrays`` 采用同一种缓存策略。
+
+    缓存同时保留场景对象本身，避免 id 被回收后复用造成的错误命中。
+    """
+    def decorate(function):
+        store: OrderedDict[int, tuple[Scene2D, object]] = OrderedDict()
+        lock = RLock()
+
+        @wraps(function)
+        def wrapper(scene: Scene2D, *args, **kwargs):
+            if args or kwargs:
+                return function(scene, *args, **kwargs)
+            key = id(scene)
+            with lock:
+                cached = store.get(key)
+                if cached is not None and cached[0] is scene:
+                    store.move_to_end(key)
+                    return cached[1]
+            value = function(scene)
+            with lock:
+                store[key] = (scene, value)
+                while len(store) > maxsize:
+                    store.popitem(last=False)
+            return value
+
+        wrapper.cache_clear = store.clear
+        return wrapper
+
+    return decorate
+
+
+@_identity_cache(maxsize=8)
 def diffraction_edges(scene: Scene2D) -> tuple[DiffractionEdge2D, ...]:
     """提取墙线端点；排除共线接缝、多墙交汇和墙段内部的交汇点。"""
     groups: dict[tuple[float, float], list] = {}
@@ -48,10 +88,8 @@ def diffraction_edges(scene: Scene2D) -> tuple[DiffractionEdge2D, ...]:
         if len(walls) > 2:
             continue
         q = np.asarray(point)
-        directions = []
-        for wall in walls:
-            other = wall.end if np.linalg.norm(q - wall.start) < 1e-6 else wall.start
-            directions.append((other - q) / np.linalg.norm(other - q))
+        # 只检查共线，方向正负无关；直接用墙方向，避免短墙端点被容差误认后除零。
+        directions = [wall.tangent for wall in walls]
         if len(walls) == 2 and abs(float(np.dot(*directions))) > 1 - 1e-8:
             continue
         # T 形接点不能作为独立的自由边缘。
@@ -68,9 +106,9 @@ def diffraction_edges(scene: Scene2D) -> tuple[DiffractionEdge2D, ...]:
     return tuple(edges)
 
 
-@lru_cache(maxsize=8)
+@_identity_cache(maxsize=8)
 def _wall_lookup(scene: Scene2D):
-    return {wall.wall_id: wall for wall in scene.walls}
+    return MappingProxyType({wall.wall_id: wall for wall in scene.walls})
 
 
 def shadow_directions(scene: Scene2D, edge: DiffractionEdge2D,

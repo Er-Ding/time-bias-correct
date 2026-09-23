@@ -152,6 +152,7 @@ def test_tiny_crossing_walls_do_not_lose_a_valid_first_reflection():
     assert reflection_leg(scene, source, np.asarray((0., 3e-7)), ('central',),
                           receiver_walls=('receiver',)) is not None
     assert 0 in PrefixGeometry(scene).visible_first_walls(source)
-    actual, _ = get_diffraction_prefixes(scene, source, 2)
-    expected = reference_prefixes(scene, source, 2)
+    with np.errstate(invalid="raise", divide="raise"):
+        actual, _ = get_diffraction_prefixes(scene, source, 2)
+        expected = reference_prefixes(scene, source, 2)
     assert [(p[0], p[1]) for p in actual] == [(p[0], p[1]) for p in expected]

@@ -410,6 +410,83 @@ def _canonical_segment_key(start: np.ndarray, end: np.ndarray, tolerance_m: floa
     return (*a, *b) if a <= b else (*b, *a)
 
 
+def merge_collinear_wall_segments(
+    walls: Sequence[WallSegment], *, tolerance_m: float = 1e-8,
+) -> tuple[WallSegment, ...]:
+    """合并同一对象内共线、重叠或相接的墙段，保留真实间隙。
+
+    三角网格可在同一位置保存朝向相反、切分不同的立面。按端点去重
+    无法消除它们的重叠，必须对直线上的覆盖区间取并集。这里只容许
+    浮点舍入造成的接缝；tolerance_m 不用来填补门洞或合并平行墙。
+    不同对象保持分开，避免抹掉对象/材质边界。原始场景的读取不隐式
+    调用本函数，旧墙编号及对应的历史路径仍可复现。
+    """
+    if not math.isfinite(tolerance_m) or tolerance_m <= 0:
+        raise ValueError("共线检查容差必须是有限正数")
+    if len({wall.wall_id for wall in walls}) != len(walls):
+        raise ValueError("合并前的墙编号必须唯一")
+    if not walls:
+        return ()
+    ordered = sorted(walls, key=lambda wall: (
+        -wall.length_m, tuple(sorted((wall.start_m, wall.end_m))), wall.wall_id))
+    count = len(ordered)
+    origins = np.empty((count, 2))
+    tangents = np.empty((count, 2))
+    lengths = np.empty(count)
+    owners: list[str] = []
+    groups: list[list[WallSegment]] = []
+    for wall in ordered:
+        start, end = map(np.asarray, sorted((wall.start_m, wall.end_m)))
+        tangent = (end - start) / wall.length_m
+        n = len(groups)
+        offset_start, offset_end = start - origins[:n], end - origins[:n]
+        cross_start = offset_start[:, 0] * tangents[:n, 1] - offset_start[:, 1] * tangents[:n, 0]
+        cross_end = offset_end[:, 0] * tangents[:n, 1] - offset_end[:, 1] * tangents[:n, 0]
+        cross_direction = tangent[0] * tangents[:n, 1] - tangent[1] * tangents[:n, 0]
+        compatible = (np.maximum(np.abs(cross_start), np.abs(cross_end)) <= tolerance_m)
+        compatible &= np.abs(cross_direction) * np.maximum(lengths[:n], wall.length_m) <= tolerance_m
+        compatible &= np.asarray([owner == wall.source_object for owner in owners], dtype=bool)
+        matches = np.flatnonzero(compatible)
+        if len(matches):
+            groups[int(matches[0])].append(wall)
+        else:
+            origins[n], tangents[n], lengths[n] = start, tangent, wall.length_m
+            owners.append(wall.source_object)
+            groups.append([wall])
+
+    merged: list[WallSegment] = []
+    for index, group in enumerate(groups):
+        origin, tangent = origins[index], tangents[index]
+        intervals = []
+        for wall in group:
+            start, end = wall.start, wall.end
+            lo, hi = float((start - origin) @ tangent), float((end - origin) @ tangent)
+            if lo > hi:
+                lo, hi, start, end = hi, lo, end, start
+            intervals.append((lo, hi, wall.wall_id, start, end, wall))
+        intervals.sort(key=lambda interval: interval[:3])
+        coordinate_scale = max(1., *(abs(value) for wall in group
+                                     for point in (wall.start_m, wall.end_m) for value in point))
+        roundoff_m = min(tolerance_m, 64 * np.finfo(float).eps * coordinate_scale)
+        components: list[list] = []
+        for interval in intervals:
+            if not components or interval[0] > components[-1][1] + roundoff_m:
+                components.append([interval[0], interval[1], interval[3], interval[4], [interval[5]]])
+            else:
+                component = components[-1]
+                component[4].append(interval[5])
+                if interval[1] > component[1]:
+                    component[1], component[3] = interval[1], interval[4]
+        for _, _, start, end, members in components:
+            if len(members) == 1:
+                merged.append(members[0])
+            else:
+                merged.append(WallSegment(
+                    wall_id="merged_" + min(wall.wall_id for wall in members),
+                    start_m=tuple(start), end_m=tuple(end), source_object=owners[index]))
+    return tuple(sorted(merged, key=lambda wall: wall.wall_id))
+
+
 def _triangle_horizontal_slice(
     triangle_m: np.ndarray,
     *,
@@ -466,8 +543,8 @@ def preprocess_sionna_triangle_mesh(
 ) -> Scene2D:
     """从 Sionna 原始三角网格在固定高度截取二维墙线。
 
-    这里直接切原始三角形，不对连通组件求凸包，也不会用两个不相邻顶点
-    虚构跨越凹口或分离组件的墙。``object_vertex_ranges`` 使用
+    先切原始三角形，再合并共线的相接/重叠交线。不对连通组件求凸包，
+    不跨越凹口或分离组件。``object_vertex_ranges`` 使用
     ``sionna_exporter`` 写出的 ``对象名 -> [起始顶点, 结束顶点)`` 约定。
     """
 
@@ -485,7 +562,8 @@ def preprocess_sionna_triangle_mesh(
         raise ValueError("Sionna faces 不能为空")
     if int(np.min(face_indices)) < 0 or int(np.max(face_indices)) >= len(vertices):
         raise ValueError("Sionna faces 含有越界顶点编号")
-    if plane_tolerance_m <= 0.0 or dedup_tolerance_m <= 0.0:
+    if (not math.isfinite(plane_tolerance_m) or not math.isfinite(dedup_tolerance_m)
+            or plane_tolerance_m <= 0.0 or dedup_tolerance_m <= 0.0):
         raise ValueError("平面容差和去重容差必须为正数")
 
     object_names: list[str] = []
@@ -506,7 +584,6 @@ def preprocess_sionna_triangle_mesh(
             object_names.append(str(object_name))
 
     walls: list[WallSegment] = []
-    seen: set[tuple[int, ...]] = set()
     for face_index, vertex_indices in enumerate(face_indices):
         triangle = vertices[vertex_indices]
         if float(np.ptp(triangle[:, 2])) < min_wall_height_m:
@@ -525,12 +602,8 @@ def preprocess_sionna_triangle_mesh(
         if segment is None:
             continue
         start, end = segment
-        if float(np.linalg.norm(end - start)) < min_wall_length_m:
+        if float(np.linalg.norm(end - start)) <= _GEOMETRY_EPS:
             continue
-        key = _canonical_segment_key(start, end, dedup_tolerance_m)
-        if key in seen:
-            continue
-        seen.add(key)
 
         owners = vertex_owner[vertex_indices]
         owner_index = int(owners[0]) if np.all(owners == owners[0]) else -1
@@ -575,6 +648,13 @@ def preprocess_sionna_triangle_mesh(
         and max(wall.start_m[1], wall.end_m[1]) >= y_min
         and min(wall.start_m[1], wall.end_m[1]) <= y_max
     ]
+    # 在原来选定的范围内合并，避免把区域外的其它三角片段额外带入地图。
+    # 先还原完整墙面，再限制最短墙长；三角面切分处的小片段不能先删，
+    # 否则会在原本连续的墙上人为造出缝隙。最多使用 1e-8 m 的共线容差，
+    # 原来的毫米端点量化不再负责判断两面墙是否相同。
+    walls = [wall for wall in merge_collinear_wall_segments(
+        walls, tolerance_m=min(dedup_tolerance_m, 1e-8))
+        if wall.length_m >= min_wall_length_m]
     if not walls:
         raise ValueError("裁剪区域内没有可用的 Sionna 原始墙线")
 

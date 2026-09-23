@@ -28,7 +28,7 @@ def seed_for(seed: int, index: int, purpose: int) -> int:
     return int(np.random.SeedSequence([seed, index, purpose]).generate_state(1)[0])
 
 
-def load_settings(path: Path, *, sample_count=None, workers=None, backend=None) -> tuple[dict, dict]:
+def load_settings(path: Path, *, sample_count=None, workers=None, backend=None, compute_backend=None) -> tuple[dict, dict]:
     raw = yaml.safe_load(path.read_text())
     settings = dict(raw.get("experiment", {}))
     defaults = dict(sample_count=1000, max_proposals=100000, random_seed=20260915,
@@ -61,6 +61,8 @@ def load_settings(path: Path, *, sample_count=None, workers=None, backend=None) 
     config = load_config(path)
     config.pop("experiment", None)
     config.pop("_config_path", None)  # 完整生成配置的路径不进入定位子进程。
+    if compute_backend is not None:
+        config["compute"]["backend"] = compute_backend
     config["project"]["random_seed"] = settings["random_seed"]
     if config["localization"]["solver_method"] != "continuous":
         raise ValueError("本实验只支持连续定位流程")
@@ -479,9 +481,11 @@ def main() -> None:
     parser.add_argument("--samples", type=int)
     parser.add_argument("--workers", type=int)
     parser.add_argument("--rt-backend", choices=("sionna", "synthetic_fixture"))
+    parser.add_argument("--compute-backend", choices=("numpy", "cuda"), help="MUSIC 计算设备；不改变射线追踪设备或连续求解模型")
     parser.add_argument("--prepare-only", action="store_true", help="只完成采样和 CSI；相同参数再次运行可继续定位")
     args = parser.parse_args()
-    settings, config = load_settings(args.config, sample_count=args.samples, workers=args.workers, backend=args.rt_backend)
+    settings, config = load_settings(args.config, sample_count=args.samples, workers=args.workers,
+                                    backend=args.rt_backend, compute_backend=args.compute_backend)
     root = args.output.resolve()
     root.mkdir(parents=True, exist_ok=True)
     with (root / ".experiment.lock").open("w") as lock:

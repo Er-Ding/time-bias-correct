@@ -74,6 +74,9 @@ music:
   observation_screen:
     enabled: true
     max_response_correlation: 0.995
+    # 阵列前后镜像角（θ 与 180°−θ）不可分辨时，不再停整份样本；
+    # 每组只留一个成员，由求解器枚举角度分支并按代价选优。
+    ambiguity_policy: enumerate_branches
 localization:
   solver_method: continuous
   require_identifiable_solution: true
